@@ -59,6 +59,7 @@ model:
     audio_proj_dim: 512
     audio_proj_hidden: 384
     # length extrapolation, see WavTTS.yaml for what each knob does
+    attn_mode: full
     rope_type: yarn
     yarn_scale: 2.0
     yarn_native_ctx: 3000

@@ -98,7 +98,8 @@ class DiT(nn.Module):
         audio_proj_hidden: int | None = None,
         # length extrapolation (see wavtts/model/rope.py); defaults reproduce the
         # original vanilla-RoPE behaviour exactly
-        rope_type: str = "default",  # "default" | "yarn"
+        attn_mode: str = "full",  # "full" | "bidir_causal" | "bidir_causal_split"
+        rope_type: str = "default",  # "default" | "yarn" | "none" (NoPE)
         yarn_scale: float = 1.0,  # s during training; s' at inference via set_yarn_scale
         yarn_native_ctx: int = 3000,  # frames the architecture is expected to cover unaided
         yarn_alpha: float = 1.0,
@@ -120,7 +121,11 @@ class DiT(nn.Module):
             audio_proj_hidden=audio_proj_hidden,
         )
 
-        if rope_type == "default":
+        if rope_type == "none":
+            # NoPE: no positional encoding at all. Only meaningful with a causal
+            # attn_mode, which is then the sole thing that tells a token where it is.
+            self.rotary_embed = None
+        elif rope_type == "default":
             self.rotary_embed = RotaryEmbedding(dim_head)
         elif rope_type == "yarn":
             self.rotary_embed = YaRNRotaryEmbedding(
@@ -156,6 +161,7 @@ class DiT(nn.Module):
                     attn_mask_enabled=attn_mask_enabled,
                     logn_ref_len=logn_ref_len,
                     attn_temperature=yarn_attention_factor(yarn_scale) if rope_type == "yarn" else 1.0,
+                    attn_mode=attn_mode,
                 )
                 for _ in range(depth)
             ]
@@ -299,7 +305,9 @@ class DiT(nn.Module):
         # its token order but is told it spans a longer stretch, so short training audio
         # still exercises the rotations only long audio would produce
         max_len = rpe_max_len(self.rpe, seq_len, self.rpe_length_scale, self.yarn_native_ctx) if self.rpe != "off" else 0
-        if self.training and max_len > seq_len:
+        if self.rotary_embed is None:
+            rope = None  # NoPE: position comes from the causal mask alone
+        elif self.training and max_len > seq_len:
             rope = self.rotary_embed(
                 randomized_positions(h.shape[0], seq_len, max_len, h.device, per_sample=self.rpe_per_sample)
             )

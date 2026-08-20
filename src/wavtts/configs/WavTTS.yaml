@@ -71,7 +71,14 @@ model:
     # length extrapolation — Randomized YaRN (arXiv:2606.23687) + entropy invariance.
     # Training data tops out at 2979 frames (29.8 s); s=2 trains the YaRN spectrum for
     # 60 s and inference at s'=4 reaches 120 s. rope_type: default disables all of it.
-    rope_type: yarn          # default | yarn
+    # attention shape. "full" is ordinary bidirectional attention. The two causal modes
+    # exist for the NoPE experiment: with rope_type: none the causal mask is the only
+    # thing that breaks permutation symmetry, so it becomes the position signal
+    # (Kazemnejad et al. 2023). "bidir_causal" gives every head both directions and sums
+    # them (same attention FLOPs as full); "bidir_causal_split" gives half the heads the
+    # past and half the future (half the FLOPs).
+    attn_mode: full          # full | bidir_causal | bidir_causal_split
+    rope_type: yarn          # default | yarn | none
     yarn_scale: 2.0          # s during training; set s' at inference
     yarn_native_ctx: 3000    # frames (30 s) the architecture should cover unaided
     yarn_alpha: 1.0          # dims turning < alpha times over native_ctx: full interpolation

@@ -327,7 +327,12 @@ class AttnProcessor:
         attn_mask_enabled: bool = True,
         logn_ref_len: int | None = None,  # entropy-invariant scaling reference; None disables
         attn_temperature: float = 1.0,  # YaRN attention factor, 1.0 disables
+        attn_mode: str = "full",  # "full" | "bidir_causal" | "bidir_causal_split"
     ):
+        if attn_mode not in ("full", "bidir_causal", "bidir_causal_split"):
+            raise ValueError(f"Unknown attn_mode: {attn_mode!r}")
+        if attn_mode != "full" and attn_backend != "torch":
+            raise ValueError(f"attn_mode={attn_mode!r} needs attn_backend='torch'")
         if attn_backend == "flash_attn":
             assert is_package_available("flash_attn"), "Please install flash-attn first."
 
@@ -336,6 +341,7 @@ class AttnProcessor:
         self.attn_mask_enabled = attn_mask_enabled
         self.logn_ref_len = logn_ref_len
         self.attn_temperature = attn_temperature
+        self.attn_mode = attn_mode
 
     def _logit_scale(self, seq_len: int) -> float:
         """Multiplier folded into the query, i.e. the attention temperature.
@@ -356,6 +362,82 @@ class AttnProcessor:
         if self.attn_temperature != 1.0:
             scale *= self.attn_temperature**2
         return scale
+
+    def _logn_factor(self, visible: torch.Tensor) -> torch.Tensor:
+        """Per-query entropy-invariant multiplier for a given count of visible keys.
+
+        The scalar form above assumes every query softmaxes over the same `n`. Under a
+        causal mask it does not: query `i` sees `i + 1` keys looking back and
+        `lens - i` looking forward, so the count — and the entropy it implies — is a
+        vector. Same clamp at 1 and same reference as the scalar form.
+        """
+        return (visible.clamp(min=2.0).log() / math.log(self.logn_ref_len)).clamp(min=1.0)
+
+    def _bidir_causal(self, query, key, value, mask, base_scale):
+        """Causal attention run over the past and over the future, then recombined.
+
+        With no positional encoding the causal mask is the only thing that breaks
+        permutation symmetry, and it is what lets the model recover position at all
+        (Kazemnejad et al., 2023): a query can tell where it sits from how much it can
+        see. Running the mask both ways restores the bidirectional context a
+        non-autoregressive denoiser needs, while each direction keeps that signal.
+
+        `bidir_causal` gives every head both directions and sums them, matching the
+        attention budget of full attention. `bidir_causal_split` gives the first half
+        of the heads the past and the second half the future, halving it.
+
+        Entropy invariance is applied per query from each direction's own visible
+        count, folded into the query rows since `scaled_dot_product_attention` only
+        takes a scalar `scale`.
+
+        ponytail: neither variant can weight past against future per query — each
+        direction is separately normalized, so the split is fixed. A learnable per-head
+        gate would make it static-but-tunable; only a single softmax over both sides
+        would make it content-dependent, and that is plain full attention, which
+        destroys the position signal this is built on.
+        """
+        n, heads = query.shape[-2], query.shape[1]
+        idx = torch.arange(n, device=query.device)
+        lens = mask.sum(-1) if mask is not None else torch.full((query.shape[0],), n, device=query.device)
+
+        q_fwd, q_bwd = query, query
+        if self.logn_ref_len:
+            # looking back, query i sees keys 0..i; looking forward, keys i..lens-1
+            fwd = self._logn_factor((idx + 1).float())[None, None, :, None]
+            bwd = self._logn_factor((lens[:, None] - idx[None, :]).float())[:, None, :, None]
+            q_fwd, q_bwd = query * fwd, query * bwd
+
+        if self.attn_mode == "bidir_causal_split":
+            if heads % 2:
+                raise ValueError(f"bidir_causal_split needs an even head count, got {heads}")
+            h = heads // 2
+            sl_f, sl_b = slice(0, h), slice(h, heads)
+        else:
+            sl_f = sl_b = slice(None)
+
+        def past(q, k, v, m):
+            if m is None:
+                return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=base_scale)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=m, scale=base_scale)
+
+        def future(q, k, v, m):
+            if m is None:
+                # reversing turns "future" into "past", so the fast causal kernel serves
+                # both directions; padding would lead the reversed sequence, hence the
+                # explicit mask whenever there is any
+                return past(q.flip(-2), k.flip(-2), v.flip(-2), None).flip(-2)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=m, scale=base_scale)
+
+        if mask is not None:
+            keep = mask[:, None, None, :]
+            causal = idx[:, None] >= idx[None, :]
+            m_fwd, m_bwd = keep & causal, keep & causal.T
+        else:
+            m_fwd = m_bwd = None
+
+        out_fwd = past(q_fwd[:, sl_f], key[:, sl_f], value[:, sl_f], m_fwd)
+        out_bwd = future(q_bwd[:, sl_b], key[:, sl_b], value[:, sl_b], m_bwd)
+        return torch.cat((out_fwd, out_bwd), dim=1) if sl_f != sl_b else out_fwd + out_bwd
 
     def __call__(
         self,
@@ -401,7 +483,15 @@ class AttnProcessor:
         # scaling the query would allocate another [b, h, n, d] tensor in every block
         softmax_scale = self._logit_scale(query.shape[-2]) / math.sqrt(head_dim)
 
-        if self.attn_backend == "torch":
+        if self.attn_mode != "full":
+            # entropy invariance is per query here, so it rides on the query instead of
+            # the scalar scale; keep the YaRN temperature (if any) in the scalar
+            temp = self.attn_temperature**2 if self.attn_temperature != 1.0 else 1.0
+            attn_mask = mask if self.attn_mask_enabled else None
+            x = self._bidir_causal(query, key, value, attn_mask, temp / math.sqrt(head_dim))
+            x = x.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+
+        elif self.attn_backend == "torch":
             # mask. e.g. inference got a batch with different target durations, mask out the padding
             if self.attn_mask_enabled and mask is not None:
                 attn_mask = mask
@@ -570,6 +660,7 @@ class DiTBlock(nn.Module):
         attn_mask_enabled=True,
         logn_ref_len=None,
         attn_temperature=1.0,
+        attn_mode="full",
     ):
         super().__init__()
 
@@ -581,6 +672,7 @@ class DiTBlock(nn.Module):
                 attn_mask_enabled=attn_mask_enabled,
                 logn_ref_len=logn_ref_len,
                 attn_temperature=attn_temperature,
+                attn_mode=attn_mode,
             ),
             dim=dim,
             heads=heads,
