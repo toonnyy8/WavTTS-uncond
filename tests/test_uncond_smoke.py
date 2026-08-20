@@ -351,12 +351,12 @@ def test_randomized_positions_sorted_unique_and_in_range():
 
     torch.manual_seed(0)
     pos = randomized_positions(batch=4, seq_len=50, max_len=500, device=torch.device("cpu"))
-    assert pos.shape == (1, 50)  # broadcast over the batch, so freqs stay [1, n, d]
+    assert pos.shape == (4, 50)
     assert (pos[:, 1:] > pos[:, :-1]).all()  # strictly increasing: order preserved, no repeats
     assert pos.min() >= 0 and pos.max() < 500
-    per_sample = randomized_positions(4, 50, 500, torch.device("cpu"), per_sample=True)
-    assert per_sample.shape == (4, 50)
-    assert not torch.equal(per_sample[0], per_sample[1])
+    assert not torch.equal(pos[0], pos[1])  # independent draw per sample, the default
+    shared = randomized_positions(4, 50, 500, torch.device("cpu"), per_sample=False)
+    assert shared.shape == (1, 50)  # one draw broadcast over the batch, freqs stay [1, n, d]
     # no room to spread -> plain contiguous positions
     tight = randomized_positions(batch=2, seq_len=50, max_len=50, device=torch.device("cpu"))
     assert torch.equal(tight[0], torch.arange(50))

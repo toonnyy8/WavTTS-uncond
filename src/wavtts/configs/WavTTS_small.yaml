@@ -63,7 +63,7 @@ model:
     yarn_beta: 32.0
     rpe: relative
     rpe_length_scale: 1.0
-    rpe_per_sample: False  # one draw per batch (paper); True is the reference impl, costs [b,n,d] freqs
+    rpe_per_sample: True   # independent draw per sample (reference impl); False is one draw per batch
     logn_ref_len: 3000
   waveform:
     target_sample_rate: 16000

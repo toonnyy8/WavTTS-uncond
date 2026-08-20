@@ -71,7 +71,7 @@ model:
     yarn_beta: 32.0          # dims turning > beta times: pure extrapolation
     rpe: relative            # off | relative (L_t = k * clip length) | absolute (k * native_ctx)
     rpe_length_scale: 1.0    # initial k; optim.rpe_curriculum advances it
-    rpe_per_sample: False    # one draw per batch (paper); True is the reference impl's per-sample draw
+    rpe_per_sample: True     # independent draw per sample (reference impl); False is one draw per batch
     logn_ref_len: 3000       # entropy-invariant attention scaling reference; null disables
   waveform:
     target_sample_rate: 16000

@@ -114,7 +114,7 @@ def randomized_positions(
     seq_len: int,
     max_len: int,
     device: torch.device,
-    per_sample: bool = False,
+    per_sample: bool = True,
 ) -> torch.Tensor:
     """Sorted samples of `seq_len` unique positions from [0, max_len).
 
@@ -122,16 +122,19 @@ def randomized_positions(
     relative distance the attention sees — span a range the raw sequence never would.
     Falls back to contiguous positions when there is no room to spread.
 
-    `per_sample` draws independently per batch element, which is what the reference
+    `per_sample` draws independently per batch element, as the reference
     implementation does; the paper's text (and Ruoss et al.) draw one set per batch.
-    One set keeps the frequency tensor at [1, n, d] so every block broadcasts it,
-    instead of carrying a [b, n, d] copy through 28 layers' worth of cos/sin.
+    Per-sample costs a [b, n, d] frequency tensor instead of [1, n, d] through every
+    block's cos/sin — measured at 88 MiB against 22 GiB, since frame-budget batching
+    caps `b * n` and the two can never be large at once.
     """
     if max_len <= seq_len:
         return torch.arange(seq_len, device=device).expand(batch, seq_len)
 
     draws = batch if per_sample else 1
-    positions = torch.stack([torch.randperm(max_len, device=device)[:seq_len] for _ in range(draws)])
+    # argsort of uniform noise is a permutation, so this is `draws` independent
+    # randperms in one kernel instead of a Python loop over them
+    positions = torch.rand(draws, max_len, device=device).argsort(dim=-1)[:, :seq_len]
     return positions.sort(dim=-1).values
 
 

@@ -106,7 +106,7 @@ class DiT(nn.Module):
         yarn_beta: float = 32.0,
         rpe: str = "off",  # "off" | "relative" | "absolute"; training only
         rpe_length_scale: float = 1.0,  # curriculum value, advanced by the trainer
-        rpe_per_sample: bool = False,  # one position draw per sample (reference impl) vs per batch (paper)
+        rpe_per_sample: bool = True,  # one position draw per sample (reference impl) vs per batch (paper)
         logn_ref_len: int | None = None,  # entropy-invariant attention scaling; None disables
     ):
         super().__init__()
