@@ -82,45 +82,30 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 | `ckpts.log_samples_secs` | [5, 15, 30, 60] | one clip length per seed; 60 s is past the 30 s training maximum |
 | `ckpts.spk_ckpt_path` | null | ECAPA (WavLM-large) ckpt enabling `gen/spk_sim_self` |
 
-### Length extrapolation
+### Position encoding
 
-Training clips top out at 29.8 s, so generating longer needs help. Two mechanisms,
-both trained in rather than bolted on at inference, both off by `rope_type: default`:
+There is no positional encoding (NoPE). Attention runs one causal pass over the past and
+one over the future and concatenates them, so a query infers where it sits from how much
+it can see ([Kazemnejad et al. 2023](https://arxiv.org/abs/2305.19466)). Local relative
+position still comes from the input embedding's `ConvPositionEmbedding` (61-frame
+receptive field, 610 ms); the masks supply everything beyond that.
 
-**Randomized YaRN** ([arXiv:2606.23687](https://arxiv.org/abs/2606.23687)) — YaRN
-frequencies at a fixed scale `s` during training, randomized positional encoding
-(`randperm(L_t)[:n].sort()` instead of `arange(n)`, training only), and a length
-curriculum that grows `L_t` over the run. A short clip keeps its token order but is
-told it spans a longer stretch, so it exercises rotations only long audio would
-produce. Inference runs plain YaRN at `s'`, and `s' > s` reaches past `s · native_ctx`:
-`s=2, s'=4` covers 120 s.
-
-Unlike the paper's text corpora, our clips span 0.3–30 s, so a fixed `L_t` would
-stretch a median 4.5 s clip ~13× while barely touching a 30 s one. In waveform
-modelling relative position *is* physical time — pitch period, formant transitions —
-so `rpe: relative` sets `L_t = k · clip length` for a constant stretch instead.
-`rpe: absolute` restores the paper's literal behaviour.
+The two directions are normalized by separate softmaxes, so `to_out` learns a static
+weighting between past and future rather than a content-dependent one. That is the price
+of the position signal: a single softmax spanning both sides is plain full attention,
+which is permutation-equivariant and carries no position at all. Concatenating rather
+than summing doubles the output projection's input width — one extra `inner_dim × dim`
+block per layer — so the projection can weight the directions per channel.
 
 **Entropy invariance** — softmax entropy grows with the number of keys, so logits are
-scaled by `max(1, log(n) / log(logn_ref_len))`. The clamp matters: the job is to sharpen
+scaled by `max(1, log(n) / log(logn_ref_len))`. Under a causal mask the visible count
+differs per query — `i + 1` looking back, `lens - i` looking forward — so the multiplier
+is a vector folded into the query rows. The clamp matters: the job is to sharpen
 attention on sequences longer than the reference, never to flatten it on shorter ones.
-Trained in, because this model's clips already span two orders of magnitude of `n`; the
-model learns the relationship rather than extrapolating it at inference.
-
-```bash
-uv run python src/wavtts/infer/sample_uncond.py \
-  --ckpt ckpts/.../model_last.pt --duration_sec 120 --yarn_scale 4
-```
 
 | Key | Default | Meaning |
 |---|---|---|
-| `arch.rope_type` | yarn | `default` \| `yarn` — `default` disables everything below |
-| `arch.yarn_scale` | 2.0 | `s` during training |
-| `arch.yarn_native_ctx` | 3000 | frames (30 s) the architecture should cover unaided |
-| `arch.rpe` | relative | `off` \| `relative` (`L_t = k ·` clip length) \| `absolute` (`k · native_ctx`) |
-| `arch.rpe_per_sample` | True | independent position draw per sample (reference impl) vs one per batch (paper) |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
-| `optim.rpe_curriculum` | `[[0,1.0],[20000,1.25],[40000,1.5],[60000,2.0]]` | `[update, k]` milestones |
 
 ### Monitoring
 

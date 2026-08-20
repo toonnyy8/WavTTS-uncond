@@ -93,7 +93,6 @@ class Trainer:
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
         log_per_updates: int = 1,  # scalar logging interval (loss/lr), in updates
-        rpe_curriculum: list | None = None,  # [[update, length_scale], ...]; None leaves it fixed
         log_samples: bool = False,
         log_samples_seeds: list[int] | None = None,  # fixed seeds: clips comparable across checkpoints
         log_samples_secs: list[float] | None = None,  # one length per seed; the ladder past
@@ -110,8 +109,6 @@ class Trainer:
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         self.log_per_updates = max(1, int(log_per_updates))
-        self.rpe_curriculum = sorted([[int(u), float(k)] for u, k in rpe_curriculum]) if rpe_curriculum else None
-        self._rpe_length_scale = None
         self.log_samples = log_samples
         self.log_samples_seeds = list(log_samples_seeds) if log_samples_seeds is not None else [0, 1, 2, 3]
         self.log_samples_secs = pair_sample_lengths(self.log_samples_seeds, log_samples_secs)
@@ -191,30 +188,6 @@ class Trainer:
     @property
     def is_main(self):
         return self.accelerator.is_main_process
-
-    def _advance_rpe_curriculum(self, update):
-        """Step the randomized-position sampling range to its value for this update.
-
-        The paper grows the range per epoch; our epochs are ~1.2k updates out of a
-        multi-100k-update run, so the milestones are keyed on updates instead. The
-        ablation in the paper attributes up to 18.3 points to having a curriculum at
-        all, so the shape matters more than the units.
-        """
-        if not self.rpe_curriculum:
-            return
-
-        length_scale = next(
-            (k for u, k in reversed(self.rpe_curriculum) if update >= u), self.rpe_curriculum[0][1]
-        )
-        if length_scale == self._rpe_length_scale:
-            return
-
-        self._rpe_length_scale = length_scale
-        self.accelerator.unwrap_model(self.model).transformer.set_rpe_length_scale(length_scale)
-        if self.is_main:
-            print(f"\nRPE length curriculum: length_scale -> {length_scale} at update {update}")
-            if self.logger == "tensorboard":
-                self.writer.add_scalar("rpe_length_scale", length_scale, update)
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -416,7 +389,6 @@ class Trainer:
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint()
         global_update = start_update
-        self._advance_rpe_curriculum(global_update)  # a resume must not restart the curriculum
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
@@ -468,7 +440,6 @@ class Trainer:
                         self.ema_model.update()
 
                     global_update += 1
-                    self._advance_rpe_curriculum(global_update)
                     progress_bar.update(1)
                     progress_bar.set_postfix(
                         update=str(global_update), 

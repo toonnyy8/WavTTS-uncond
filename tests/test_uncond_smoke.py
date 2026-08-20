@@ -366,136 +366,6 @@ def test_sample_seed_is_isolated_and_deterministic():
     assert torch.equal(out1, out2)  # same seed, same clip
 
 
-def test_yarn_inv_freq_interpolates_only_slow_dims():
-    from wavtts.model.rope import yarn_inv_freq
-
-    dim, base, native = 72, 10000.0, 3000
-    vanilla = yarn_inv_freq(dim, base, 1.0, native)
-    scaled = yarn_inv_freq(dim, base, 4.0, native)
-
-    # highest-frequency dims extrapolate untouched, lowest are divided by the full scale
-    assert torch.allclose(scaled[0], vanilla[0])
-    assert torch.allclose(scaled[-1], vanilla[-1] / 4.0)
-    # and the ramp between is monotone in how much interpolation each dim receives
-    ratio = vanilla / scaled
-    assert torch.all(ratio[1:] >= ratio[:-1] - 1e-6)
-    assert torch.allclose(yarn_inv_freq(dim, base, 1.0, native), 1.0 / base ** (torch.arange(0, dim, 2) / dim))
-
-
-def test_yarn_attention_factor():
-    from wavtts.model.rope import yarn_attention_factor
-
-    assert yarn_attention_factor(1.0) == 1.0  # no scaling, no temperature change
-    assert yarn_attention_factor(4.0) == pytest.approx(0.1 * torch.tensor(4.0).log().item() + 1.0)
-
-
-def test_randomized_positions_sorted_unique_and_in_range():
-    from wavtts.model.rope import randomized_positions
-
-    torch.manual_seed(0)
-    pos = randomized_positions(batch=4, seq_len=50, max_len=500, device=torch.device("cpu"))
-    assert pos.shape == (4, 50)
-    assert (pos[:, 1:] > pos[:, :-1]).all()  # strictly increasing: order preserved, no repeats
-    assert pos.min() >= 0 and pos.max() < 500
-    assert not torch.equal(pos[0], pos[1])  # independent draw per sample, the default
-    shared = randomized_positions(4, 50, 500, torch.device("cpu"), per_sample=False)
-    assert shared.shape == (1, 50)  # one draw broadcast over the batch, freqs stay [1, n, d]
-    # no room to spread -> plain contiguous positions
-    tight = randomized_positions(batch=2, seq_len=50, max_len=50, device=torch.device("cpu"))
-    assert torch.equal(tight[0], torch.arange(50))
-
-
-def test_rpe_max_len_modes():
-    from wavtts.model.rope import rpe_max_len
-
-    assert rpe_max_len("relative", seq_len=455, length_scale=2.0, native_ctx=3000) == 910
-    assert rpe_max_len("relative", seq_len=2979, length_scale=2.0, native_ctx=3000) == 5958
-    assert rpe_max_len("absolute", seq_len=455, length_scale=2.0, native_ctx=3000) == 6000
-    with pytest.raises(ValueError):
-        rpe_max_len("nope", seq_len=1, length_scale=1.0, native_ctx=1)
-
-
-def _yarn_dit(**overrides):
-    from wavtts.model.backbones.dit import DiT
-
-    kwargs = dict(
-        dim=64,
-        depth=2,
-        heads=2,
-        dim_head=32,
-        ff_mult=2,
-        wav_frame_len=160,
-        rope_type="yarn",
-        yarn_scale=2.0,
-        yarn_native_ctx=100,
-        logn_ref_len=100,
-    )
-    kwargs.update(overrides)
-    return DiT(**kwargs)
-
-
-def test_yarn_dit_forward_and_extrapolates_past_native_ctx():
-    from wavtts.model.backbones.dit import STATE_CLEAN
-
-    torch.manual_seed(0)
-    dit = _yarn_dit()
-    _reinit_nonzero(dit)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-
-    for num_samples in (1600, 160 * 400):  # 10 frames, then 4x the 100-frame native ctx
-        out = dit(x=torch.randn(2, num_samples), state=state, time=torch.tensor(0.5))
-        assert out.shape == (2, num_samples)
-        assert torch.isfinite(out).all()
-
-
-def test_rpe_is_training_only_and_changes_output():
-    from wavtts.model.backbones.dit import STATE_CLEAN
-
-    torch.manual_seed(0)
-    dit = _yarn_dit(rpe="relative", rpe_length_scale=2.0)
-    _reinit_nonzero(dit)
-    x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-
-    dit.eval()
-    with torch.no_grad():
-        assert torch.equal(dit(x=x, state=state, time=torch.tensor(0.5)), dit(x=x, state=state, time=torch.tensor(0.5)))
-
-    dit.train()
-    with torch.no_grad():
-        a = dit(x=x, state=state, time=torch.tensor(0.5))
-        b = dit(x=x, state=state, time=torch.tensor(0.5))
-    assert not torch.allclose(a, b)  # fresh random positions every training forward
-
-
-def test_set_yarn_scale_retunes_freqs_and_temperature():
-    torch.manual_seed(0)
-    dit = _yarn_dit()
-    before = dit.rotary_embed.inv_freq.clone()
-
-    dit.set_yarn_scale(4.0)
-    assert not torch.allclose(dit.rotary_embed.inv_freq, before)
-    assert dit.transformer_blocks[0].attn.processor.attn_temperature == pytest.approx(
-        0.1 * torch.tensor(4.0).log().item() + 1.0
-    )
-
-    with pytest.raises(ValueError):
-        _yarn_dit(rope_type="default").set_yarn_scale(4.0)
-
-
-def test_logn_scaling_sharpens_but_never_flattens():
-    from wavtts.model.modules import AttnProcessor
-
-    proc = AttnProcessor(logn_ref_len=100)
-    assert proc._logit_scale(100) == pytest.approx(1.0)  # at the reference length, a no-op
-    assert proc._logit_scale(400) > 1.0  # longer than the reference -> sharper logits
-    # clamped below the reference: flattening a short clip's softmax is not the job,
-    # and unclamped it would push a 25-key softmax toward uniform
-    assert proc._logit_scale(25) == pytest.approx(1.0)
-    assert proc._logit_scale(2) == pytest.approx(1.0)
-    assert AttnProcessor()._logit_scale(4000) == 1.0  # disabled by default
-
-
 def test_logn_reaches_the_attention_softmax():
     from wavtts.model.backbones.dit import STATE_CLEAN, DiT
 
@@ -524,38 +394,6 @@ def test_log_samples_secs_pairs_with_seeds():
     assert pair_sample_lengths([0, 1, 2, 3], [5]) == [5, 5, 5, 5]  # pads: no seed left bare
     assert pair_sample_lengths([0, 1], [5, 15, 30, 60]) == [5, 15]  # extras dropped
     assert pair_sample_lengths([0, 1], None) == [5.0, 5.0]
-
-
-def test_rpe_curriculum_steps_on_updates():
-    from wavtts.model.trainer import Trainer
-
-    trainer = object.__new__(Trainer)
-    trainer.rpe_curriculum = [[0, 1.0], [10, 1.5], [20, 2.0]]
-    trainer._rpe_length_scale = None
-    seen = []
-    trainer.accelerator = type(
-        "A", (), {"unwrap_model": staticmethod(lambda m: m), "is_main_process": False}
-    )()
-    trainer.model = type("M", (), {"transformer": type("T", (), {"set_rpe_length_scale": seen.append})()})()
-
-    for update in range(0, 25):
-        trainer._advance_rpe_curriculum(update)
-    assert seen == [1.0, 1.5, 2.0]  # steps once per milestone, never per update
-
-
-def test_default_config_rope_is_unchanged_when_disabled():
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
-
-    torch.manual_seed(0)
-    plain = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
-    torch.manual_seed(0)
-    explicit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rope_type="default", rpe="off")
-    x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-    with torch.no_grad():
-        assert torch.equal(
-            plain(x=x, state=state, time=torch.tensor(0.5)), explicit(x=x, state=state, time=torch.tensor(0.5))
-        )
 
 
 def test_rng_state_survives_checkpoint_roundtrip(tmp_path):
@@ -606,32 +444,23 @@ def test_mel_figure():
 def _nope_dit(**overrides):
     from wavtts.model.backbones.dit import DiT
 
-    kwargs = dict(
-        dim=64,
-        depth=2,
-        heads=2,
-        dim_head=32,
-        ff_mult=2,
-        wav_frame_len=160,
-        rope_type="none",
-        attn_mode="bidir_causal",
-        logn_ref_len=100,
-    )
+    kwargs = dict(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, logn_ref_len=100)
     kwargs.update(overrides)
     return DiT(**kwargs)
 
 
-def test_nope_builds_no_rotary_embedding():
+def test_no_positional_encoding_is_built():
+    """Guard against a rotary embedding creeping back in."""
     dit = _nope_dit()
-    assert dit.rotary_embed is None
+    names = [n for n, _ in dit.named_modules()] + [n for n, _ in dit.named_buffers()]
+    assert not any("rotary" in n or "inv_freq" in n or "freqs" in n for n in names)
 
 
-@pytest.mark.parametrize("mode", ["bidir_causal", "bidir_causal_split"])
-def test_bidir_causal_dit_runs_and_is_position_sensitive(mode):
+def test_dit_is_position_sensitive():
     from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
-    dit = _nope_dit(attn_mode=mode).eval()
+    dit = _nope_dit().eval()
     _reinit_nonzero(dit)
     x = torch.randn(1, 160 * 20)
     state = torch.full((1,), STATE_CLEAN, dtype=torch.long)
@@ -645,14 +474,14 @@ def test_bidir_causal_dit_runs_and_is_position_sensitive(mode):
     assert not torch.allclose(out, rev.view(1, 20, 160).flip(1).reshape(1, -1), atol=1e-4)
 
 
-def test_only_the_causal_modes_break_permutation_equivariance():
+def test_bidir_causal_breaks_permutation_equivariance():
     """The control that makes the test above meaningful.
 
-    Full attention with no rope is permutation-equivariant, so it carries no position
-    at all; the causal modes are not. (In the assembled DiT this is not the whole story
-    — `ConvPositionEmbedding` in the input embedding already supplies local relative
-    position over a 61-frame window whatever `rope_type` says. So NoPE here means
-    "local position from the conv, long-range position from the mask", not "none".)
+    Full attention with no rope is permutation-equivariant, so it carries no position at
+    all; the bidirectional causal pair is not. (In the assembled DiT this is not the whole
+    story — `ConvPositionEmbedding` in the input embedding already supplies local relative
+    position over a 61-frame window. So NoPE here means "local position from the conv,
+    long-range position from the mask", not "none".)
     """
     from wavtts.model.modules import AttnProcessor
 
@@ -661,31 +490,27 @@ def test_only_the_causal_modes_break_permutation_equivariance():
     q, k, v = (torch.randn(1, h, n, d) for _ in range(3))
     perm = torch.randperm(n)
 
-    full = AttnProcessor(attn_mode="full")
     with torch.no_grad():
         ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)
         permuted = torch.nn.functional.scaled_dot_product_attention(
             q[:, :, perm], k[:, :, perm], v[:, :, perm], scale=1.0
         )
-    assert full.attn_mode == "full"
     assert torch.allclose(ref[:, :, perm], permuted, atol=1e-5)
 
-    causal = AttnProcessor(attn_mode="bidir_causal")
-    out = causal._bidir_causal(q, k, v, None, 1.0)
-    out_perm = causal._bidir_causal(q[:, :, perm], k[:, :, perm], v[:, :, perm], None, 1.0)
+    proc = AttnProcessor()
+    out = proc._bidir_causal(q, k, v, None, 1.0)
+    out_perm = proc._bidir_causal(q[:, :, perm], k[:, :, perm], v[:, :, perm], None, 1.0)
     assert not torch.allclose(out[:, :, perm], out_perm, atol=1e-4)
 
 
 def test_forward_stream_cannot_see_the_future():
-    """Split mode: the past-facing heads must ignore anything after their own position."""
+    """The past half of each head's output must ignore anything after its own position."""
     from wavtts.model.modules import AttnProcessor
 
     torch.manual_seed(0)
-    proc = AttnProcessor(attn_mode="bidir_causal_split")
+    proc = AttnProcessor()
     n, h, d = 6, 2, 4
-    q = torch.randn(1, h, n, d)
-    k = torch.randn(1, h, n, d)
-    v = torch.randn(1, h, n, d)
+    q, k, v = (torch.randn(1, h, n, d) for _ in range(3))
     out = proc._bidir_causal(q, k, v, None, 1.0)
 
     k2, v2 = k.clone(), v.clone()
@@ -693,17 +518,17 @@ def test_forward_stream_cannot_see_the_future():
     v2[:, :, -1] += 10.0
     out2 = proc._bidir_causal(q, k2, v2, None, 1.0)
 
-    fwd_head, bwd_head = 0, h // 2
-    # the past-facing head is untouched everywhere except at the perturbed frame itself
-    assert torch.allclose(out[0, fwd_head, :-1], out2[0, fwd_head, :-1], atol=1e-5)
-    # the future-facing head sees it from every position
-    assert not torch.allclose(out[0, bwd_head, 0], out2[0, bwd_head, 0], atol=1e-4)
+    past, future = slice(0, d), slice(d, 2 * d)
+    # the past-facing channels are untouched everywhere except at the perturbed frame
+    assert torch.allclose(out[0, :, :-1, past], out2[0, :, :-1, past], atol=1e-5)
+    # the future-facing ones see it from every position
+    assert not torch.allclose(out[0, :, 0, future], out2[0, :, 0, future], atol=1e-4)
 
 
 def test_logn_factor_uses_the_per_query_visible_count():
     from wavtts.model.modules import AttnProcessor
 
-    proc = AttnProcessor(attn_mode="bidir_causal", logn_ref_len=100)
+    proc = AttnProcessor(logn_ref_len=100)
     visible = torch.tensor([1.0, 2.0, 50.0, 100.0, 400.0])
     f = proc._logn_factor(visible)
     # clamped at 1 below the reference, exactly 1 at it, above 1 past it — never flatten
@@ -719,7 +544,7 @@ def test_bidir_causal_masked_path_matches_the_unpadded_one():
     from wavtts.model.modules import AttnProcessor
 
     torch.manual_seed(0)
-    proc = AttnProcessor(attn_mode="bidir_causal", logn_ref_len=4)
+    proc = AttnProcessor(logn_ref_len=4)
     n, real, h, d = 8, 5, 2, 4
     q, k, v = (torch.randn(1, h, n, d) for _ in range(3))
     mask = torch.zeros(1, n, dtype=torch.bool)
@@ -730,46 +555,14 @@ def test_bidir_causal_masked_path_matches_the_unpadded_one():
     assert torch.allclose(padded[:, :, :real], trimmed, atol=1e-5)
 
 
-def test_bidir_causal_rejects_flash_backend():
-    from wavtts.model.modules import AttnProcessor
-
-    with pytest.raises(ValueError, match="needs attn_backend"):
-        AttnProcessor(attn_mode="bidir_causal", attn_backend="flash_attn")
-
-
-def test_bidir_causal_split_needs_even_heads():
-    from wavtts.model.modules import AttnProcessor
-
-    proc = AttnProcessor(attn_mode="bidir_causal_split")
-    q, k, v = (torch.randn(1, 3, 4, 2) for _ in range(3))
-    with pytest.raises(ValueError, match="even head count"):
-        proc._bidir_causal(q, k, v, None, 1.0)
-
-
-def test_bidir_causal_concatenates_and_split_does_not():
-    """Shape contract: shared heads emit 2*head_dim, split heads emit head_dim."""
+def test_bidir_causal_concatenates_the_two_directions():
+    """Shape contract: each head emits 2*head_dim, and `to_out` is widened to match."""
     from wavtts.model.modules import AttnProcessor
 
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 4, 6, 8) for _ in range(3))
-    shared = AttnProcessor(attn_mode="bidir_causal")._bidir_causal(q, k, v, None, 1.0)
-    split = AttnProcessor(attn_mode="bidir_causal_split")._bidir_causal(q, k, v, None, 1.0)
-    assert shared.shape == (1, 4, 6, 16)  # [b, h, n, 2*d]
-    assert split.shape == (1, 4, 6, 8)  # [b, h, n, d]
+    assert AttnProcessor()._bidir_causal(q, k, v, None, 1.0).shape == (1, 4, 6, 16)  # [b, h, n, 2*d]
 
-
-def test_only_shared_bidir_widens_the_output_projection():
-    """The parameter cost of concat is real and lands only on `bidir_causal`."""
-    from wavtts.model.backbones.dit import DiT
-
-    def params(mode):
-        torch.manual_seed(0)
-        d = DiT(
-            dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160,
-            rope_type="none", attn_mode=mode,
-        )
-        return sum(p.numel() for p in d.parameters())
-
-    full, split, shared = params("full"), params("bidir_causal_split"), params("bidir_causal")
-    assert split == full  # equal-parameter ablation against the RoPE model
-    assert shared == full + 2 * 64 * 64  # one extra dim x dim block per layer
+    dit = _nope_dit()
+    attn = dit.transformer_blocks[0].attn
+    assert attn.to_out[0].in_features == attn.inner_dim * 2

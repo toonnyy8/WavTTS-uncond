@@ -1,6 +1,6 @@
-# Length-extrapolation experiment: Randomized YaRN + entropy invariance.
+# NoPE + bidirectional causal attention, with entropy-invariant attention scaling.
 # model.name differs from the baseline run so checkpoints and TB logs stay separate —
-# the two are not resume-compatible (vanilla RoPE stores rotary_embed.inv_freq, YaRN does not).
+# the two are not resume-compatible (the output projection is twice as wide here).
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -26,13 +26,9 @@ optim:
   grad_accumulation_steps: 6  # 6 x 3200 = 19200 frames/update; cheaper than activation checkpointing here
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
-  # RPE length curriculum: [update, k]. k=1.0 is contiguous positions, so the model
-  # learns ordinary speech first and only then meets stretched ones. Held at 1.0
-  # through the 20k warmup; the paper's ablation shows the ramp itself is what works.
-  rpe_curriculum: [[0, 1.0], [20000, 1.25], [40000, 1.5], [60000, 2.0]]
 
 model:
-  name: WavTTS_Uncond_Large_YaRN  # model name
+  name: WavTTS_Uncond_Large_NoPE  # model name
   backbone: DiT
   cfm:
     prediction: x_pred         # flow | x_pred
@@ -61,31 +57,14 @@ model:
     dropout: 0.0
     ff_mult: 4
     qk_norm: null  # null | rms_norm
-    pe_attn_head: null
-    attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
     checkpoint_activations: False  # recompute activations and save memory for extra compute
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
-    # length extrapolation — Randomized YaRN (arXiv:2606.23687) + entropy invariance.
-    # Training data tops out at 2979 frames (29.8 s); s=2 trains the YaRN spectrum for
-    # 60 s and inference at s'=4 reaches 120 s. rope_type: default disables all of it.
-    # attention shape. "full" is ordinary bidirectional attention. The two causal modes
-    # exist for the NoPE experiment: with rope_type: none the causal mask is the only
-    # thing that breaks permutation symmetry, so it becomes the position signal
-    # (Kazemnejad et al. 2023). "bidir_causal" gives every head both directions and sums
-    # them (same attention FLOPs as full); "bidir_causal_split" gives half the heads the
-    # past and half the future (half the FLOPs).
-    attn_mode: full          # full | bidir_causal | bidir_causal_split
-    rope_type: yarn          # default | yarn | none
-    yarn_scale: 2.0          # s during training; set s' at inference
-    yarn_native_ctx: 3000    # frames (30 s) the architecture should cover unaided
-    yarn_alpha: 1.0          # dims turning < alpha times over native_ctx: full interpolation
-    yarn_beta: 32.0          # dims turning > beta times: pure extrapolation
-    rpe: relative            # off | relative (L_t = k * clip length) | absolute (k * native_ctx)
-    rpe_length_scale: 1.0    # initial k; optim.rpe_curriculum advances it
-    rpe_per_sample: True     # independent draw per sample (reference impl); False is one draw per batch
+    # There is no positional encoding (NoPE). Attention runs one causal pass over the
+    # past and one over the future and concatenates them, so position is whatever a
+    # query can infer from how much it can see (Kazemnejad et al. 2023).
     logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
                              # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. At 3000
                              # every training clip sat below 1 and it never sharpened at all
@@ -100,9 +79,7 @@ ckpts:
   log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
   log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
   # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
-  # p95, 30s the training maximum, 60s = yarn_scale * native_ctx -- the first length
-  # that is genuine extrapolation. 120s needs s'=4 at inference; do that offline with
-  # sample_uncond.py --yarn_scale 4 rather than inside the training loop.
+  # p95, 30s the training maximum, 60s is genuine extrapolation.
   log_samples_secs: [5, 15, 30, 60]
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
   save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
