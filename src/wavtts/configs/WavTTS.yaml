@@ -65,8 +65,10 @@ model:
     audio_proj_dim: 1024
     audio_proj_hidden: 768
     # length extrapolation — Randomized YaRN (arXiv:2606.23687) + entropy invariance.
-    # Training data tops out at 2979 frames (29.8 s); s=2 trains the YaRN spectrum for
-    # 60 s and inference at s'=4 reaches 120 s. rope_type: default disables all of it.
+    # Training data tops out at 2979 frames (29.8 s). s=4 matches rpe_gamma: the
+    # augmentation puts the longest clip's positions out to 4 * 2979 = 11916, so the
+    # YaRN spectrum is tuned for the range actually trained on (4 * 3000 = 120 s).
+    # Inference at s' > 4 reaches past that. rope_type: default disables all of it.
     # attention shape. "full" is ordinary bidirectional attention. The two causal modes
     # exist for the NoPE experiment: with rope_type: none the causal mask is the only
     # thing that breaks permutation symmetry, so it becomes the position signal
@@ -75,7 +77,8 @@ model:
     # past and half the future (half the FLOPs).
     attn_mode: full          # full | bidir_causal | bidir_causal_split
     rope_type: yarn          # default | yarn | none
-    yarn_scale: 2.0          # s during training; set s' at inference
+    yarn_scale: 4.0          # s during training; set s' at inference. Keep in step with
+                             # rpe_gamma -- that is what decides the positions s must cover
     yarn_native_ctx: 3000    # frames (30 s) the architecture should cover unaided
     yarn_alpha: 1.0          # dims turning < alpha times over native_ctx: full interpolation
     yarn_beta: 32.0          # dims turning > beta times: pure extrapolation
@@ -96,9 +99,10 @@ ckpts:
   log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
   log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
   # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
-  # p95, 30s the training maximum, 60s = yarn_scale * native_ctx -- the first length
-  # that is genuine extrapolation. 120s needs s'=4 at inference; do that offline with
-  # sample_uncond.py --yarn_scale 4 rather than inside the training loop.
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # 60s sits inside the trained spectrum (s=4 covers 120s), so it tests the model, not
+  # the frequencies. Past 120s needs s' > 4; do that offline with sample_uncond.py
+  # --yarn_scale rather than inside the training loop.
   log_samples_secs: [5, 15, 30, 60]
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
   save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090

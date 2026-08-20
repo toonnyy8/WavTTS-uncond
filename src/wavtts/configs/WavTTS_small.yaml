@@ -59,7 +59,7 @@ model:
     # length extrapolation, see WavTTS.yaml for what each knob does
     attn_mode: full
     rope_type: yarn
-    yarn_scale: 2.0
+    yarn_scale: 4.0        # matched to rpe_gamma; see WavTTS.yaml
     yarn_native_ctx: 3000
     yarn_alpha: 1.0
     yarn_beta: 32.0

@@ -92,7 +92,7 @@ frequencies at a fixed scale `s` during training, plus randomized positional enc
 (`randperm(L_t)[:n].sort()` instead of `arange(n)`, training only). A short clip keeps
 its token order but is told it spans a longer stretch, so it exercises rotations only
 long audio would produce. Inference runs plain YaRN at `s'`, and `s' > s` reaches past
-`s · native_ctx`: `s=2, s'=4` covers 120 s.
+`s · native_ctx`: `s=4` covers 120 s, and `s' > 4` reaches past it.
 
 Two deviations from the paper.
 
@@ -120,13 +120,13 @@ model learns the relationship rather than extrapolating it at inference.
 
 ```bash
 uv run python src/wavtts/infer/sample_uncond.py \
-  --ckpt ckpts/.../model_last.pt --duration_sec 120 --yarn_scale 4
+  --ckpt ckpts/.../model_last.pt --duration_sec 240 --yarn_scale 8
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `arch.rope_type` | yarn | `default` \| `yarn` — `default` disables everything below |
-| `arch.yarn_scale` | 2.0 | `s` during training |
+| `arch.yarn_scale` | 4.0 | `s` during training; keep in step with `rpe_gamma` |
 | `arch.yarn_native_ctx` | 3000 | frames (30 s) the architecture should cover unaided |
 | `arch.rpe_gamma` | 4.0 | per-sample stretch bound: `L_t ~ U[n, n·γ]`; `1.0` disables |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
