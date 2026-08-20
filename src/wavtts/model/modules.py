@@ -396,10 +396,9 @@ class AttnProcessor:
                 query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
                 key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
-        # attention temperature, folded into the query so both backends inherit it
-        logit_scale = self._logit_scale(query.shape[-2])
-        if logit_scale != 1.0:
-            query = query * logit_scale
+        # attention temperature, folded into the softmax scale rather than the query:
+        # scaling the query would allocate another [b, h, n, d] tensor in every block
+        softmax_scale = self._logit_scale(query.shape[-2]) / math.sqrt(head_dim)
 
         if self.attn_backend == "torch":
             # mask. e.g. inference got a batch with different target durations, mask out the padding
@@ -409,7 +408,9 @@ class AttnProcessor:
                 attn_mask = attn_mask.expand(batch_size, attn.heads, query.shape[-2], key.shape[-2])
             else:
                 attn_mask = None
-            x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+            x = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )
             x = x.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
         elif self.attn_backend == "flash_attn":
@@ -428,11 +429,12 @@ class AttnProcessor:
                     k_cu_seqlens,
                     q_max_seqlen_in_batch,
                     k_max_seqlen_in_batch,
+                    softmax_scale=softmax_scale,
                 )
                 x = pad_input(x, indices, batch_size, q_max_seqlen_in_batch)
                 x = x.reshape(batch_size, -1, attn.heads * head_dim)
             else:
-                x = flash_attn_func(query, key, value, dropout_p=0.0, causal=False)
+                x = flash_attn_func(query, key, value, dropout_p=0.0, causal=False, softmax_scale=softmax_scale)
                 x = x.reshape(batch_size, -1, attn.heads * head_dim)
 
         x = x.to(query.dtype)

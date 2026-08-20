@@ -450,6 +450,27 @@ def test_logn_scaling_is_length_dependent():
     assert AttnProcessor()._logit_scale(4000) == 1.0  # disabled by default
 
 
+def test_logn_reaches_the_attention_softmax():
+    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+
+    # 10 frames against a 100-frame reference: scale is log(10)/log(100) = 0.5, well off 1.0
+    common = dict(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
+    torch.manual_seed(0)
+    off = DiT(**common)
+    torch.manual_seed(0)
+    on = DiT(**common, logn_ref_len=100)
+    _reinit_nonzero(off)
+    torch.manual_seed(0)
+    _reinit_nonzero(on)
+
+    x = torch.randn(2, 1600)
+    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
+    with torch.no_grad():
+        a = off(x=x, state=state, time=torch.tensor(0.5))
+        b = on(x=x, state=state, time=torch.tensor(0.5))
+    assert not torch.allclose(a, b)  # folded into the softmax scale, it must still bite
+
+
 def test_rpe_curriculum_steps_on_updates():
     from wavtts.model.trainer import Trainer
 

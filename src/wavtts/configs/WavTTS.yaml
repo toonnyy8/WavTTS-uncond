@@ -1,3 +1,7 @@
+# Length-extrapolation experiment: Randomized YaRN + entropy invariance.
+# model.name differs from the baseline run so checkpoints and TB logs stay separate —
+# the two are not resume-compatible (vanilla RoPE stores rotary_embed.inv_freq, YaRN does not).
+#
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS.yaml
@@ -28,7 +32,7 @@ optim:
   rpe_curriculum: [[0, 1.0], [20000, 1.25], [40000, 1.5], [60000, 2.0]]
 
 model:
-  name: WavTTS_Uncond_Large  # model name
+  name: WavTTS_Uncond_Large_YaRN  # model name
   backbone: DiT
   cfm:
     prediction: x_pred         # flow | x_pred

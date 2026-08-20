@@ -301,12 +301,14 @@ class DiT(nn.Module):
         # randomized positional encoding is a training-time augmentation: the clip keeps
         # its token order but is told it spans a longer stretch, so short training audio
         # still exercises the rotations only long audio would produce
-        if self.rpe != "off" and self.training:
-            max_len = rpe_max_len(self.rpe, seq_len, self.rpe_length_scale, self.yarn_native_ctx)
+        max_len = rpe_max_len(self.rpe, seq_len, self.rpe_length_scale, self.yarn_native_ctx) if self.rpe != "off" else 0
+        if self.training and max_len > seq_len:
             rope = self.rotary_embed(
                 randomized_positions(h.shape[0], seq_len, max_len, h.device, per_sample=self.rpe_per_sample)
             )
         else:
+            # no room to spread (curriculum still at k=1) or inference: contiguous positions,
+            # and a [1, n, d] freqs every block broadcasts instead of a per-sample copy
             rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if self.long_skip_connection is not None:
