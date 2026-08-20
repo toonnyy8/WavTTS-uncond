@@ -202,6 +202,43 @@ sample(duration, *, batch=1, steps=32, cfg_strength=2.0,
 - CFG 負分支用 `mixed` 是本設計的核心假設：`(v_clean − v_mixed)` 方向近似
   「單語者純度」梯度。若實驗顯示引導過強造成 artifacts，可下調 `cfg_strength`
   或改 `negative="null"` 做傳統 CFG 對照。
+
+### 負分支選擇：自我限制性質（2026-08-20 補記）
+
+標準 CFG 的引導項是**分類器梯度**：
+
+```
+v_clean + w·(v_clean − v_null) = v_clean + w·∇log p(clean | x)
+```
+
+`null` 是真正的邊際分佈（`state_drop_prob` 不分 clean/mixed 均勻 drop，
+所以 `p_null ≈ 0.5·p_clean + 0.5·p_mixed`）。當 x 已明確落在 clean 區域時
+`p(clean|x) → 1`、梯度飽和趨近 0、`v_null → v_clean`，**引導自動熄火**。
+這是 CFG 穩定的關鍵性質。
+
+負樣本版本則是**似然比梯度**：
+
+```
+v_clean + w·(v_clean − v_mixed) = v_clean + w·∇log [ p(x|clean) / p(x|mixed) ]
+```
+
+這一項不熄火。x 越深入 clean 區域、離 mixed 流形越遠，`∇log p(x|mixed)` 反而
+越強地指回 mixed 流形，減掉它等於越推越用力，可能衝出 clean 流形——
+與 negative prompt 在高權重下過飽和是同一個機制。
+
+反向的權衡：正因為 `null` 是 50% clean 的混合物，`v_clean − v_null` 對
+「語者不一致」這個特定失效模式的推力較弱，要同樣強度就得開大 `w`，
+而大 `w` 有自己的 artifact。兩邊都有代價。
+
+**決定**：不引入三分支加權形式
+`v = v_clean + w·(v_clean − v_null) + w_neg·(v_clean − v_mixed)`。
+它雖然能保留主引導的自我限制性質、又補上針對性的抗混合推力，但多一個
+需要獨立調參的旋鈕，而且推論成本 +50%（packed forward 從 2b 變 3b）。
+要加強度就調 `w`。
+
+`negative` 的選擇是**純推論期決定**，三個 state 與混合增強對任何變體都必要，
+訓練不受影響。同一個 checkpoint 用 `--negative mixed` 與 `--negative null`
+搭配同一組 seed 即可直接 A/B。
 - `p_mix=0.5` 給負分支足夠的訓練訊號；若 clean 品質受影響可降至 0.3。
   overlap 與 concat 各教一件事（不疊音／不換人），`p_concat` 可依實驗調整比重；
   concat 型態與語者漂移失效模式最直接對應。
