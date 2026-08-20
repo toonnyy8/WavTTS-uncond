@@ -20,6 +20,13 @@ from wavtts.model.modules import (
     DiTBlock,
     TimestepEmbedding,
 )
+from wavtts.model.rope import (
+    YaRNRotaryEmbedding,
+    randomized_positions,
+    rpe_max_len,
+    yarn_attention_factor,
+    yarn_inv_freq,
+)
 
 
 # speech-state conditioning: the only condition this model has
@@ -90,6 +97,17 @@ class DiT(nn.Module):
         use_audio_proj: bool = False,
         audio_proj_dim: int | None = None,
         audio_proj_hidden: int | None = None,
+        # length extrapolation (see wavtts/model/rope.py); defaults reproduce the
+        # original vanilla-RoPE behaviour exactly
+        rope_type: str = "default",  # "default" | "yarn"
+        yarn_scale: float = 1.0,  # s during training; s' at inference via set_yarn_scale
+        yarn_native_ctx: int = 3000,  # frames the architecture is expected to cover unaided
+        yarn_alpha: float = 1.0,
+        yarn_beta: float = 32.0,
+        rpe: str = "off",  # "off" | "relative" | "absolute"; training only
+        rpe_length_scale: float = 1.0,  # curriculum value, advanced by the trainer
+        rpe_per_sample: bool = False,  # one position draw per sample (reference impl) vs per batch (paper)
+        logn_ref_len: int | None = None,  # entropy-invariant attention scaling; None disables
     ):
         super().__init__()
 
@@ -103,7 +121,24 @@ class DiT(nn.Module):
             audio_proj_hidden=audio_proj_hidden,
         )
 
-        self.rotary_embed = RotaryEmbedding(dim_head)
+        if rope_type == "default":
+            self.rotary_embed = RotaryEmbedding(dim_head)
+        elif rope_type == "yarn":
+            self.rotary_embed = YaRNRotaryEmbedding(
+                dim_head, scale=yarn_scale, native_ctx=yarn_native_ctx, alpha=yarn_alpha, beta=yarn_beta
+            )
+        else:
+            raise ValueError(f"Unknown rope_type: {rope_type}")
+
+        self.rope_type = rope_type
+        self.rope_dim_head = dim_head
+        self.yarn_scale = yarn_scale
+        self.yarn_native_ctx = yarn_native_ctx
+        self.yarn_alpha = yarn_alpha
+        self.yarn_beta = yarn_beta
+        self.rpe = rpe
+        self.rpe_length_scale = rpe_length_scale
+        self.rpe_per_sample = rpe_per_sample
 
         self.dim = dim
         self.depth = depth
@@ -120,6 +155,8 @@ class DiT(nn.Module):
                     pe_attn_head=pe_attn_head,
                     attn_backend=attn_backend,
                     attn_mask_enabled=attn_mask_enabled,
+                    logn_ref_len=logn_ref_len,
+                    attn_temperature=yarn_attention_factor(yarn_scale) if rope_type == "yarn" else 1.0,
                 )
                 for _ in range(depth)
             ]
@@ -162,6 +199,29 @@ class DiT(nn.Module):
                 f"wav_frame_len ({self.wav_frame_len}) must equal proj_out_dim ({self.proj_out_dim}) "
                 "for reshape wav front-end."
             )
+
+    def set_rpe_length_scale(self, length_scale: float):
+        """Advance the length curriculum. Called per update by the trainer."""
+        self.rpe_length_scale = float(length_scale)
+
+    def set_yarn_scale(self, scale: float):
+        """Retune YaRN to an inference scale `s'`.
+
+        The paper trains at `s` and infers at `s' >= s`; `s' > s` reaches past
+        `s * native_ctx`. Frequencies and attention temperature both depend on the
+        scale, so both are rebuilt here — no parameters change.
+        """
+        if self.rope_type != "yarn":
+            raise ValueError(f"set_yarn_scale requires rope_type='yarn', got {self.rope_type!r}")
+
+        self.yarn_scale = float(scale)
+        inv_freq = yarn_inv_freq(
+            self.rope_dim_head, 10000.0, self.yarn_scale, self.yarn_native_ctx, self.yarn_alpha, self.yarn_beta
+        )
+        self.rotary_embed.inv_freq = inv_freq.to(self.rotary_embed.inv_freq.device)
+        self.rotary_embed.scale = self.yarn_scale
+        for block in self.transformer_blocks:
+            block.attn.processor.attn_temperature = yarn_attention_factor(self.yarn_scale)
 
     def _wav_to_tokens(
         self,
@@ -238,7 +298,16 @@ class DiT(nn.Module):
 
         t = t + self.state_embed(state)
 
-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        # randomized positional encoding is a training-time augmentation: the clip keeps
+        # its token order but is told it spans a longer stretch, so short training audio
+        # still exercises the rotations only long audio would produce
+        if self.rpe != "off" and self.training:
+            max_len = rpe_max_len(self.rpe, seq_len, self.rpe_length_scale, self.yarn_native_ctx)
+            rope = self.rotary_embed(
+                randomized_positions(h.shape[0], seq_len, max_len, h.device, per_sample=self.rpe_per_sample)
+            )
+        else:
+            rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if self.long_skip_connection is not None:
             residual = h

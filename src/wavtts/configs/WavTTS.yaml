@@ -22,6 +22,10 @@ optim:
   grad_accumulation_steps: 6  # 6 x 3200 = 19200 frames/update; cheaper than activation checkpointing here
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+  # RPE length curriculum: [update, k]. k=1.0 is contiguous positions, so the model
+  # learns ordinary speech first and only then meets stretched ones. Held at 1.0
+  # through the 20k warmup; the paper's ablation shows the ramp itself is what works.
+  rpe_curriculum: [[0, 1.0], [20000, 1.25], [40000, 1.5], [60000, 2.0]]
 
 model:
   name: WavTTS_Uncond_Large  # model name
@@ -57,6 +61,18 @@ model:
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
+    # length extrapolation — Randomized YaRN (arXiv:2606.23687) + entropy invariance.
+    # Training data tops out at 2979 frames (29.8 s); s=2 trains the YaRN spectrum for
+    # 60 s and inference at s'=4 reaches 120 s. rope_type: default disables all of it.
+    rope_type: yarn          # default | yarn
+    yarn_scale: 2.0          # s during training; set s' at inference
+    yarn_native_ctx: 3000    # frames (30 s) the architecture should cover unaided
+    yarn_alpha: 1.0          # dims turning < alpha times over native_ctx: full interpolation
+    yarn_beta: 32.0          # dims turning > beta times: pure extrapolation
+    rpe: relative            # off | relative (L_t = k * clip length) | absolute (k * native_ctx)
+    rpe_length_scale: 1.0    # initial k; optim.rpe_curriculum advances it
+    rpe_per_sample: False    # one draw per batch (paper); True is the reference impl's per-sample draw
+    logn_ref_len: 3000       # entropy-invariant attention scaling reference; null disables
   waveform:
     target_sample_rate: 16000
     wav_frame_len: 160    # 160 @16k = 100Hz

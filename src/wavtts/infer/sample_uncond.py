@@ -52,6 +52,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--out_dir", default="samples_uncond")
     parser.add_argument("--device", default=None, help="cpu | cuda | cuda:N (default: auto)")
+    parser.add_argument(
+        "--yarn_scale",
+        type=float,
+        default=None,
+        help="inference YaRN scale s' (default: the trained s). s' > s reaches past s * native_ctx",
+    )
     args = parser.parse_args(argv)
 
     config_path = args.config or str(files("wavtts").joinpath("configs/WavTTS.yaml"))
@@ -59,6 +65,9 @@ def main(argv: list[str] | None = None):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     model = load_model(args.ckpt, cfg, device)
+    if args.yarn_scale is not None:
+        model.transformer.set_yarn_scale(args.yarn_scale)
+        print(f"YaRN inference scale s'={args.yarn_scale}")
 
     sr = cfg.model.cfm.sample_rate
     duration = int(args.duration_sec * sr)

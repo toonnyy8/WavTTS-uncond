@@ -325,6 +325,8 @@ class AttnProcessor:
         pe_attn_head: int | None = None,  # number of attention head to apply rope, None for all
         attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
+        logn_ref_len: int | None = None,  # entropy-invariant scaling reference; None disables
+        attn_temperature: float = 1.0,  # YaRN attention factor, 1.0 disables
     ):
         if attn_backend == "flash_attn":
             assert is_package_available("flash_attn"), "Please install flash-attn first."
@@ -332,6 +334,27 @@ class AttnProcessor:
         self.pe_attn_head = pe_attn_head
         self.attn_backend = attn_backend
         self.attn_mask_enabled = attn_mask_enabled
+        self.logn_ref_len = logn_ref_len
+        self.attn_temperature = attn_temperature
+
+    def _logit_scale(self, seq_len: int) -> float:
+        """Multiplier folded into the query, i.e. the attention temperature.
+
+        Two independent terms:
+          - entropy invariance (Su, 2021): softmax entropy grows with the number of
+            keys, so `log_m(n)` holds it steady as n moves. Trained in rather than
+            bolted on at inference — this model's clips already span two orders of
+            magnitude of n, so it gets to learn the relationship instead of
+            extrapolating it.
+          - YaRN's attention factor, which the reference applies to query and key
+            alike; squaring it here scales the logits identically.
+        """
+        scale = 1.0
+        if self.logn_ref_len:
+            scale *= math.log(max(seq_len, 2)) / math.log(self.logn_ref_len)
+        if self.attn_temperature != 1.0:
+            scale *= self.attn_temperature**2
+        return scale
 
     def __call__(
         self,
@@ -372,6 +395,11 @@ class AttnProcessor:
             else:
                 query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
                 key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+
+        # attention temperature, folded into the query so both backends inherit it
+        logit_scale = self._logit_scale(query.shape[-2])
+        if logit_scale != 1.0:
+            query = query * logit_scale
 
         if self.attn_backend == "torch":
             # mask. e.g. inference got a batch with different target durations, mask out the padding
@@ -537,6 +565,8 @@ class DiTBlock(nn.Module):
         pe_attn_head=None,
         attn_backend="torch",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
+        logn_ref_len=None,
+        attn_temperature=1.0,
     ):
         super().__init__()
 
@@ -546,6 +576,8 @@ class DiTBlock(nn.Module):
                 pe_attn_head=pe_attn_head,
                 attn_backend=attn_backend,
                 attn_mask_enabled=attn_mask_enabled,
+                logn_ref_len=logn_ref_len,
+                attn_temperature=attn_temperature,
             ),
             dim=dim,
             heads=heads,

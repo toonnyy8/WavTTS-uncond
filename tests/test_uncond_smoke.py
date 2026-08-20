@@ -323,6 +323,165 @@ def test_sample_seed_is_isolated_and_deterministic():
     assert torch.equal(out1, out2)  # same seed, same clip
 
 
+def test_yarn_inv_freq_interpolates_only_slow_dims():
+    from wavtts.model.rope import yarn_inv_freq
+
+    dim, base, native = 72, 10000.0, 3000
+    vanilla = yarn_inv_freq(dim, base, 1.0, native)
+    scaled = yarn_inv_freq(dim, base, 4.0, native)
+
+    # highest-frequency dims extrapolate untouched, lowest are divided by the full scale
+    assert torch.allclose(scaled[0], vanilla[0])
+    assert torch.allclose(scaled[-1], vanilla[-1] / 4.0)
+    # and the ramp between is monotone in how much interpolation each dim receives
+    ratio = vanilla / scaled
+    assert torch.all(ratio[1:] >= ratio[:-1] - 1e-6)
+    assert torch.allclose(yarn_inv_freq(dim, base, 1.0, native), 1.0 / base ** (torch.arange(0, dim, 2) / dim))
+
+
+def test_yarn_attention_factor():
+    from wavtts.model.rope import yarn_attention_factor
+
+    assert yarn_attention_factor(1.0) == 1.0  # no scaling, no temperature change
+    assert yarn_attention_factor(4.0) == pytest.approx(0.1 * torch.tensor(4.0).log().item() + 1.0)
+
+
+def test_randomized_positions_sorted_unique_and_in_range():
+    from wavtts.model.rope import randomized_positions
+
+    torch.manual_seed(0)
+    pos = randomized_positions(batch=4, seq_len=50, max_len=500, device=torch.device("cpu"))
+    assert pos.shape == (1, 50)  # broadcast over the batch, so freqs stay [1, n, d]
+    assert (pos[:, 1:] > pos[:, :-1]).all()  # strictly increasing: order preserved, no repeats
+    assert pos.min() >= 0 and pos.max() < 500
+    per_sample = randomized_positions(4, 50, 500, torch.device("cpu"), per_sample=True)
+    assert per_sample.shape == (4, 50)
+    assert not torch.equal(per_sample[0], per_sample[1])
+    # no room to spread -> plain contiguous positions
+    tight = randomized_positions(batch=2, seq_len=50, max_len=50, device=torch.device("cpu"))
+    assert torch.equal(tight[0], torch.arange(50))
+
+
+def test_rpe_max_len_modes():
+    from wavtts.model.rope import rpe_max_len
+
+    assert rpe_max_len("relative", seq_len=455, length_scale=2.0, native_ctx=3000) == 910
+    assert rpe_max_len("relative", seq_len=2979, length_scale=2.0, native_ctx=3000) == 5958
+    assert rpe_max_len("absolute", seq_len=455, length_scale=2.0, native_ctx=3000) == 6000
+    with pytest.raises(ValueError):
+        rpe_max_len("nope", seq_len=1, length_scale=1.0, native_ctx=1)
+
+
+def _yarn_dit(**overrides):
+    from wavtts.model.backbones.dit import DiT
+
+    kwargs = dict(
+        dim=64,
+        depth=2,
+        heads=2,
+        dim_head=32,
+        ff_mult=2,
+        wav_frame_len=160,
+        rope_type="yarn",
+        yarn_scale=2.0,
+        yarn_native_ctx=100,
+        logn_ref_len=100,
+    )
+    kwargs.update(overrides)
+    return DiT(**kwargs)
+
+
+def test_yarn_dit_forward_and_extrapolates_past_native_ctx():
+    from wavtts.model.backbones.dit import STATE_CLEAN
+
+    torch.manual_seed(0)
+    dit = _yarn_dit()
+    _reinit_nonzero(dit)
+    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
+
+    for num_samples in (1600, 160 * 400):  # 10 frames, then 4x the 100-frame native ctx
+        out = dit(x=torch.randn(2, num_samples), state=state, time=torch.tensor(0.5))
+        assert out.shape == (2, num_samples)
+        assert torch.isfinite(out).all()
+
+
+def test_rpe_is_training_only_and_changes_output():
+    from wavtts.model.backbones.dit import STATE_CLEAN
+
+    torch.manual_seed(0)
+    dit = _yarn_dit(rpe="relative", rpe_length_scale=2.0)
+    _reinit_nonzero(dit)
+    x = torch.randn(2, 1600)
+    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
+
+    dit.eval()
+    with torch.no_grad():
+        assert torch.equal(dit(x=x, state=state, time=torch.tensor(0.5)), dit(x=x, state=state, time=torch.tensor(0.5)))
+
+    dit.train()
+    with torch.no_grad():
+        a = dit(x=x, state=state, time=torch.tensor(0.5))
+        b = dit(x=x, state=state, time=torch.tensor(0.5))
+    assert not torch.allclose(a, b)  # fresh random positions every training forward
+
+
+def test_set_yarn_scale_retunes_freqs_and_temperature():
+    torch.manual_seed(0)
+    dit = _yarn_dit()
+    before = dit.rotary_embed.inv_freq.clone()
+
+    dit.set_yarn_scale(4.0)
+    assert not torch.allclose(dit.rotary_embed.inv_freq, before)
+    assert dit.transformer_blocks[0].attn.processor.attn_temperature == pytest.approx(
+        0.1 * torch.tensor(4.0).log().item() + 1.0
+    )
+
+    with pytest.raises(ValueError):
+        _yarn_dit(rope_type="default").set_yarn_scale(4.0)
+
+
+def test_logn_scaling_is_length_dependent():
+    from wavtts.model.modules import AttnProcessor
+
+    proc = AttnProcessor(logn_ref_len=100)
+    assert proc._logit_scale(100) == pytest.approx(1.0)  # at the reference length, a no-op
+    assert proc._logit_scale(400) > 1.0  # longer than trained -> hotter logits
+    assert proc._logit_scale(25) < 1.0
+    assert AttnProcessor()._logit_scale(4000) == 1.0  # disabled by default
+
+
+def test_rpe_curriculum_steps_on_updates():
+    from wavtts.model.trainer import Trainer
+
+    trainer = object.__new__(Trainer)
+    trainer.rpe_curriculum = [[0, 1.0], [10, 1.5], [20, 2.0]]
+    trainer._rpe_length_scale = None
+    seen = []
+    trainer.accelerator = type(
+        "A", (), {"unwrap_model": staticmethod(lambda m: m), "is_main_process": False}
+    )()
+    trainer.model = type("M", (), {"transformer": type("T", (), {"set_rpe_length_scale": seen.append})()})()
+
+    for update in range(0, 25):
+        trainer._advance_rpe_curriculum(update)
+    assert seen == [1.0, 1.5, 2.0]  # steps once per milestone, never per update
+
+
+def test_default_config_rope_is_unchanged_when_disabled():
+    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+
+    torch.manual_seed(0)
+    plain = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
+    torch.manual_seed(0)
+    explicit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rope_type="default", rpe="off")
+    x = torch.randn(2, 1600)
+    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
+    with torch.no_grad():
+        assert torch.equal(
+            plain(x=x, state=state, time=torch.tensor(0.5)), explicit(x=x, state=state, time=torch.tensor(0.5))
+        )
+
+
 def test_rng_state_survives_checkpoint_roundtrip(tmp_path):
     import random
 
