@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torchdiffeq import odeint
 
-from wavtts.model.backbones.dit import STATE_CLEAN, STATE_MIXED, STATE_NULL
+from wavtts.model.backbones.dit import STATE_CLEAN, STATE_NULL
 from wavtts.model.modules import MelSpectrogramLoss
 from wavtts.model.utils import exists, get_epss_timesteps, lens_to_mask
 
@@ -34,7 +34,7 @@ class CFM(nn.Module):
         mix_lambda_range: tuple[float, float] = (0.3, 0.7),
         concat_point_range: tuple[float, float] = (0.3, 0.7),
         concat_xfade_ms: float = 20.0,
-        state_drop_prob: float = 0.1,
+        state_null_prob: float = 0.5,
         waveform_kwargs: dict = dict(),
         prediction: str = "flow",  # "flow" | "x_pred"
         loss_space: str = "flow",  # "flow" | "v" | "x"
@@ -62,7 +62,7 @@ class CFM(nn.Module):
         self.mix_lambda_range = tuple(mix_lambda_range)
         self.concat_point_range = tuple(concat_point_range)
         self.concat_xfade_ms = concat_xfade_ms
-        self.state_drop_prob = state_drop_prob
+        self.state_null_prob = state_null_prob
 
         # transformer
         self.transformer = transformer
@@ -130,22 +130,23 @@ class CFM(nn.Module):
             denom = denom.unsqueeze(-1)
         return (x_pred - z) / denom
 
-    def _mix_augment(self, x1: float["b nw"], lens: int["b"]):
-        """No-leaky mixing augmentation: content and state label always agree
-        over the whole utterance, and boundaries carry no tell-tale artifacts.
+    def _mix_augment(self, x1: float["b nw"], lens: int["b"], mix_flags: bool["b"]):
+        """No-leaky mixing augmentation, applied to the flagged samples.
 
         overlap: equal-power blend with a batch-roll partner (simultaneous speakers)
         concat:  equal-power crossfade into the partner at a random switch point
                  (temporal speaker switch)
+
+        Mixed samples carry no state of their own — the caller has already labelled
+        them null, so the speaker-inconsistent direction lives inside the
+        unconditional distribution rather than beside it.
         """
         batch, seq_len = x1.shape
         device = x1.device
-        state = torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long)
-        if batch < 2 or self.p_mix <= 0.0:
-            return x1, state  # roll partner would be the sample itself
+        if batch < 2 or not mix_flags.any():
+            return x1  # a batch of one would roll onto itself
 
         partner = x1.roll(1, dims=0)
-        mix_flags = torch.rand(batch, device=device) < self.p_mix
         concat_flags = torch.rand(batch, device=device) < self.p_concat
 
         # overlap: x = sqrt(1-lam)*x1 + sqrt(lam)*partner
@@ -167,11 +168,9 @@ class CFM(nn.Module):
         concat = g_out * x1 + g_in * partner
 
         mixed = torch.where(concat_flags.unsqueeze(-1), concat, overlap)
-        x1 = torch.where(mix_flags.unsqueeze(-1), mixed, x1)
-        state = torch.where(mix_flags, torch.full_like(state, STATE_MIXED), state)
-        # ponytail: batch-roll partner; padding tails dilute mixed labels slightly,
-        # switch to dataset-level pair loading if label purity ever matters.
-        return x1, state
+        # ponytail: batch-roll partner; padding tails dilute the mixed content slightly,
+        # switch to dataset-level pair loading if purity ever matters.
+        return torch.where(mix_flags.unsqueeze(-1), mixed, x1)
 
     def _dpmpp_2m(self, fn, y0, t):
         """DPM-Solver++(2M) multistep, data-prediction form, for the rectified-flow
@@ -213,7 +212,6 @@ class CFM(nn.Module):
         batch: int = 1,
         steps: int = 32,
         cfg_strength: float = 2.0,
-        negative: str = "mixed",  # "mixed" | "null"
         sway_sampling_coef: float | None = None,
         timestep_mapping: str = "sway_sampling",
         timestep_power: float | None = None,
@@ -228,14 +226,7 @@ class CFM(nn.Module):
 
         if solver not in ("euler", "dpmpp"):
             raise ValueError(f"Unknown solver: {solver}")
-        if negative == "mixed":
-            neg_id = STATE_MIXED
-        elif negative == "null":
-            neg_id = STATE_NULL
-        else:
-            raise ValueError(f"Unknown negative: {negative}")
         state = torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long)
-        neg_state = torch.full((batch,), neg_id, device=device, dtype=torch.long)
 
         requested = int(duration)
         aligned = int(math.ceil(requested / self.wav_frame_len) * self.wav_frame_len)
@@ -258,9 +249,10 @@ class CFM(nn.Module):
                 pred = self.transformer(x=x, state=state, time=t)
                 return to_v(pred)
 
-            # negative-sample classifier-free guidance:
-            # push away from the speaker-inconsistent ("mixed") direction
-            pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True, neg_state=neg_state)
+            # classifier-free guidance against the null branch, which carries the
+            # mixing augmentation: the guidance term is a classifier gradient and
+            # self-extinguishes once x is unambiguously clean
+            pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True)
             pred, neg_pred = torch.chunk(pred_cfg, 2, dim=0)
             v_pos = to_v(pred)
             v_neg = to_v(neg_pred)
@@ -315,11 +307,23 @@ class CFM(nn.Module):
             lens = torch.full((batch,), seq_len, device=device, dtype=torch.long)
         mask = lens_to_mask(lens, length=seq_len)
 
-        # no-leaky mixing augmentation + per-sample state labels
-        x1, state = self._mix_augment(inp, lens)
-        if self.state_drop_prob > 0.0:
-            drop = torch.rand(batch, device=device) < self.state_drop_prob
-            state = torch.where(drop, torch.full_like(state, STATE_NULL), state)
+        # The label comes first, the augmentation follows it: a sample is null with
+        # probability state_null_prob, and only null samples may be mixed. So the clean
+        # branch is pure single-speaker speech, while
+        #     p_null = (1 - p_mix) * p_clean + p_mix * p_mixed
+        # and the CFG term (v_clean - v_null) points away from speaker inconsistency
+        # AND saturates to zero once x is unambiguously clean -- p_mixed(x) vanishes
+        # there faster than any mixing weight, for any p_mix < 1. Giving mixed its own
+        # state buys the first property and loses the second: that term pushes harder
+        # the further x gets from the mixed manifold.
+        null_flags = torch.rand(batch, device=device) < self.state_null_prob
+        mix_flags = null_flags & (torch.rand(batch, device=device) < self.p_mix)
+        x1 = self._mix_augment(inp, lens, mix_flags)
+        state = torch.where(
+            null_flags,
+            torch.full((batch,), STATE_NULL, device=device, dtype=torch.long),
+            torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long),
+        )
 
         x1 = x1 * self.latents_scale
 

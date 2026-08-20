@@ -1,4 +1,4 @@
-"""Minimal CLI for unconditional speech sampling with negative-sample CFG."""
+"""Minimal CLI for unconditional speech sampling."""
 
 import argparse
 import os
@@ -47,7 +47,6 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--num", type=int, default=4, help="number of samples to generate")
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--cfg_strength", type=float, default=2.0)
-    parser.add_argument("--negative", choices=["mixed", "null"], default="mixed")
     parser.add_argument("--solver", choices=["euler", "dpmpp"], default="euler")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--out_dir", default="samples_uncond")
@@ -79,7 +78,6 @@ def main(argv: list[str] | None = None):
             batch=args.num,
             steps=args.steps,
             cfg_strength=args.cfg_strength,
-            negative=args.negative,
             seed=args.seed,
             solver=args.solver,
         )

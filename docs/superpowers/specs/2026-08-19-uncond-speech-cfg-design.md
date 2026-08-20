@@ -230,15 +230,46 @@ v_clean + w·(v_clean − v_mixed) = v_clean + w·∇log [ p(x|clean) / p(x|mixe
 「語者不一致」這個特定失效模式的推力較弱，要同樣強度就得開大 `w`，
 而大 `w` 有自己的 artifact。兩邊都有代價。
 
-**決定**：不引入三分支加權形式
+**決定一**：不引入三分支加權形式
 `v = v_clean + w·(v_clean − v_null) + w_neg·(v_clean − v_mixed)`。
 它雖然能保留主引導的自我限制性質、又補上針對性的抗混合推力，但多一個
 需要獨立調參的旋鈕，而且推論成本 +50%（packed forward 從 2b 變 3b）。
 要加強度就調 `w`。
 
-`negative` 的選擇是**純推論期決定**，三個 state 與混合增強對任何變體都必要，
-訓練不受影響。同一個 checkpoint 用 `--negative mixed` 與 `--negative null`
-搭配同一組 seed 即可直接 A/B。
+**決定二**：`mixed` 不再有自己的 state，**併入 `null`**。state 從三個縮為兩個
+（`STATE_CLEAN = 0`、`STATE_NULL = 1`、`NUM_STATES = 2`），`sample()` 與 CLI
+的 `negative` 參數移除。
+
+標籤規則**先決定標籤、再決定增強**，兩個旋鈕因此正交：
+
+1. 每個樣本以 `state_null_prob` 的機率標為 `null`，其餘 `clean`。
+2. **只有 null 樣本**可能被混合增強，機率 `p_mix`。
+
+於是 clean 分支是純粹的單語者語音，而
+`p_null = (1−p_mix)·p_clean + p_mix·p_mixed`。
+預設 `state_null_prob: 0.5`、`p_mix: 0.5` → 標籤剛好各半，null 內部也是
+一半 clean、一半 mixed。
+
+先前的參數化（混合樣本一律 null、再用 `state_drop_prob` 補一些 clean 進 null）
+會讓兩個旋鈕互相綁死：要湊出 50/50 的標籤比例就得解一條方程式，而且
+`p_mix = 0.5, state_drop_prob = 0` 這個看似自然的解會讓 null 裡**只有** mixed，
+退化回被否決的似然比形式。改成上面的兩階段後不會發生這種事。
+
+關鍵在於**自我熄火只需要 null 裡有 clean 成分，不需要它佔多數**：
+x 深入 clean 區域時 `p_mixed(x)/p_clean(x) → 0` 的速度快過任何固定的混合權重，
+所以 `p_null(x) → (1−p_mix)·p_clean(x)`、`∇log p_null → ∇log p_clean`、引導項歸零。
+`p_mix` 只決定熄火發生的深度——大則抗混合推力維持得久、晚熄；小則早熄、溫和。
+`p_mix = 1` 是唯一的退化點（null 只剩 mixed）。
+
+這個安排同時保住兩件事：混合增強提供的語者一致性訊號仍在（藏在 null 裡），
+而引導形式是自我限制的標準 CFG。刪掉混合增強則會兩者皆失——訓練資料只剩單語者語音時
+`p_clean = p_null = p_data`，`v_clean − v_null → 0`，CFG 沒有東西可以放大，
+只剩下 null 因為只看到少量資料而估得較差所產生的殘差（即 Karras 等人的 autoguidance，
+有效但不受控、也不是這裡要的東西）。
+
+`state_drop_prob` 因此被 `state_null_prob` 取代，語意也不同：前者是「額外把標籤
+丟成 null」的補丁，後者是標籤分佈本身；而 `p_mix` 從「多少樣本被混合」變成
+「null 樣本中多少被混合」，也就是決定引導何時熄火的旋鈕。
 - `p_mix=0.5` 給負分支足夠的訓練訊號；若 clean 品質受影響可降至 0.3。
   overlap 與 concat 各教一件事（不疊音／不換人），`p_concat` 可依實驗調整比重；
   concat 型態與語者漂移失效模式最直接對應。

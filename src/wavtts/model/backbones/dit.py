@@ -30,10 +30,9 @@ from wavtts.model.rope import (
 
 
 # speech-state conditioning: the only condition this model has
-STATE_CLEAN = 0  # single consistent speaker
-STATE_MIXED = 1  # speaker-inconsistent (overlap or concat augmentation)
-STATE_NULL = 2  # unconditional
-NUM_STATES = 3
+STATE_CLEAN = 0  # speech
+STATE_NULL = 1  # unconditional, the CFG negative branch
+NUM_STATES = 2
 
 
 # waveform patch embedding
@@ -267,11 +266,10 @@ class DiT(nn.Module):
     def forward(
         self,
         x: float["b nw"],  # noised waveform
-        state: int["b"],  # speech-state condition: STATE_CLEAN / STATE_MIXED / STATE_NULL
+        state: int["b"],  # speech-state condition: STATE_CLEAN / STATE_NULL
         time: float["b"] | float[""],  # time step
         mask: bool["b nw"] | None = None,
-        cfg_infer: bool = False,  # pack positive & negative state forward
-        neg_state: int["b"] | None = None,  # negative branch state for cfg_infer
+        cfg_infer: bool = False,  # pack clean & null state forward
         lens: int["b"] | None = None,
     ):
         if x.ndim != 2:
@@ -289,8 +287,7 @@ class DiT(nn.Module):
         h = self.input_embed(x, audio_mask=mask)
 
         if cfg_infer:  # pack positive & negative state forward: b n d -> 2b n d
-            if neg_state is None:
-                neg_state = torch.full_like(state, STATE_NULL)
+            neg_state = torch.full_like(state, STATE_NULL)
             h = torch.cat((h, h), dim=0)
             t = torch.cat((t, t), dim=0)
             state = torch.cat((state, neg_state), dim=0)

@@ -3,6 +3,8 @@
 日期：2026-08-20
 狀態：已實作並開始訓練（分支 `length-extrapolation`）
 前置文件：[`2026-08-19-uncond-speech-cfg-design.md`](2026-08-19-uncond-speech-cfg-design.md)
+（其中「負分支選擇：自我限制性質」一節記錄了 `mixed` state 併入 `null` 的決定，
+與本文件的長度外推改動同期，但兩者互相獨立）
 
 ## 問題
 

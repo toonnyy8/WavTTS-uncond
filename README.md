@@ -1,35 +1,40 @@
 <div align="center">
   <h1>
-  WavTTS-Uncond: Unconditional Raw-Waveform Speech Generation with Mixed-Speech Negative CFG
+  WavTTS-Uncond: Unconditional Raw-Waveform Speech Generation with a Mixed-Speech Null Branch
   </h1>
 
   <p align="center">
-    <i>A research fork of <a href="https://github.com/cwx-worst-one/WavTTS">WavTTS</a> that turns the zero-shot TTS model into an unconditional speech generator, using speaker-inconsistent "mixed" negatives for classifier-free guidance.</i>
+    <i>A research fork of <a href="https://github.com/cwx-worst-one/WavTTS">WavTTS</a> that turns the zero-shot TTS model into an unconditional speech generator, folding speaker-inconsistent audio into the CFG null branch so guidance points away from it without ever overshooting.</i>
   </p>
 </div>
 
 ## 📖 Introduction
 
-This fork rewrites WavTTS into an **unconditional pure speech generation model** operating directly on raw 16 kHz waveforms with flow matching + DiT. All text and audio-prompt conditioning is removed; the only condition is a 3-value state embedding:
+This fork rewrites WavTTS into an **unconditional pure speech generation model** operating directly on raw 16 kHz waveforms with flow matching + DiT. All text and audio-prompt conditioning is removed; the only condition is a 2-value state embedding:
 
 - `clean` — single, speaker-consistent speech
-- `mixed` — speaker-inconsistent speech (training-time augmentation)
-- `null` — unconditional
+- `null` — the CFG negative branch
 
-**No-leaky mixing augmentation.** During training, a sample becomes `mixed` (prob `p_mix`) by combining it with a batch-roll partner in one of two equal-power forms:
+**The label comes first, the augmentation follows it.** Each sample is labelled `null` with probability `state_null_prob` (0.5), and *only* null samples may be mixed with a batch-roll partner (prob `p_mix`), in one of two equal-power forms:
 
 - **overlap** — whole-utterance blend `√(1−λ)·x + √λ·partner` (simultaneous speakers)
 - **concat** — switch to the partner at a random point with an equal-power cos/sin crossfade (temporal speaker switch)
 
-Content and label always agree over the whole utterance, and crossfading leaves no boundary artifact the model could cheat on — hence "no-leaky".
+Crossfading leaves no boundary artifact the model could cheat on — hence "no-leaky".
 
-**Negative-sample CFG.** At inference, guidance extrapolates away from the speaker-inconsistent direction:
+So the clean branch is pure single-speaker speech, while the null branch models a mixture:
 
 ```
-v = v_clean + w · (v_clean − v_mixed)
+p_null = (1 − p_mix) · p_clean + p_mix · p_mixed
 ```
 
-pushing generation toward single-speaker, speaker-consistent speech. `--negative null` gives conventional CFG as a baseline.
+**Mixed audio has no state of its own** — it lives inside `null`, so ordinary CFG carries the speaker-consistency signal for free:
+
+```
+v = v_clean + w · (v_clean − v_null)
+```
+
+This points away from speaker inconsistency *and* self-extinguishes: where `x` is unambiguously clean, `p_mixed(x)` vanishes faster than any mixing weight, so `∇log p_null → ∇log p_clean` and the guidance term goes to zero — for any `p_mix < 1`. Giving mixed its own state and subtracting it directly would keep the first property and lose the second: that term is a likelihood *ratio* gradient and pushes harder the further `x` gets from the mixed manifold, the mechanism behind negative-prompt oversaturation. `p_mix` only sets how deep into the clean region guidance survives.
 
 Design documents live under [`docs/superpowers/specs/`](docs/superpowers/specs/) with the full rationale, defaults, and known limitations.
 
@@ -69,9 +74,9 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `seed` | 666 | run-level reproducibility (python/torch/cuda + dataset shuffling, cudnn deterministic) |
-| `model.cfm.p_mix` | 0.5 | prob a sample becomes a `mixed` negative |
+| `model.cfm.state_null_prob` | 0.5 | prob a sample is labelled `null`; the rest are `clean` |
+| `model.cfm.p_mix` | 0.5 | among `null` samples, prob of the mixing augmentation |
 | `model.cfm.p_concat` | 0.5 | among mixed: concat (temporal switch) vs overlap |
-| `model.cfm.state_drop_prob` | 0.1 | drop state label to `null` |
 | `ckpts.logger` | tensorboard | `wandb` \| `tensorboard` \| `null` |
 | `ckpts.log_samples_seeds` | [0, 1, 2, 3] | fixed seeds for checkpoint sampling — same clips evolve across training |
 | `ckpts.spk_ckpt_path` | null | ECAPA (WavLM-large) ckpt enabling `gen/spk_sim_self` |
@@ -136,11 +141,10 @@ uv run python src/wavtts/infer/sample_uncond.py \
   --ckpt ckpts/.../model_last.pt \
   --duration_sec 5 --num 4 \
   --steps 32 --cfg_strength 2.0 \
-  --negative mixed \
   --solver euler        # euler | dpmpp (DPM-Solver++(2M))
 ```
 
-Useful flags: `--negative null` (conventional CFG baseline), `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-flow interpolant), `--seed N` (deterministic, does not touch the global RNG), `--device cpu`.
+Useful flags: `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-flow interpolant), `--seed N` (deterministic, does not touch the global RNG), `--device cpu`. Raise `--cfg_strength` for a stronger push away from speaker inconsistency; there is no second guidance weight to tune.
 
 ## ✅ Tests
 

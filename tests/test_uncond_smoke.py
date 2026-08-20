@@ -27,32 +27,32 @@ def test_dit_forward_shape():
     assert torch.isfinite(out).all()
 
 
-def test_dit_cfg_infer_packs_pos_neg():
-    from wavtts.model.backbones.dit import STATE_CLEAN, STATE_MIXED, DiT
+def test_dit_cfg_infer_packs_clean_and_null():
+    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
 
     torch.manual_seed(0)
     dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     _reinit_nonzero(dit)
     x = torch.randn(2, 1600)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-    neg = torch.full((2,), STATE_MIXED, dtype=torch.long)
-    out = dit(x=x, state=state, time=torch.tensor(0.5), cfg_infer=True, neg_state=neg)
+    out = dit(x=x, state=state, time=torch.tensor(0.5), cfg_infer=True)
     assert out.shape == (4, 1600)
-    pos, negp = torch.chunk(out, 2, dim=0)
-    assert not torch.allclose(pos, negp)  # 不同 state 必須產生不同輸出
+    pos, neg = torch.chunk(out, 2, dim=0)
+    assert not torch.allclose(pos, neg)  # 正負分支必須產生不同輸出
 
 
 def test_dit_state_changes_output():
-    from wavtts.model.backbones.dit import STATE_CLEAN, STATE_MIXED, DiT
+    from wavtts.model.backbones.dit import NUM_STATES, STATE_CLEAN, STATE_NULL, DiT
 
+    assert (STATE_CLEAN, STATE_NULL, NUM_STATES) == (0, 1, 2)  # mixed no longer has a state
     torch.manual_seed(0)
     dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     _reinit_nonzero(dit)
     x = torch.randn(1, 1600)
     t = torch.tensor(0.5)
     out_clean = dit(x=x, state=torch.tensor([STATE_CLEAN]), time=t)
-    out_mixed = dit(x=x, state=torch.tensor([STATE_MIXED]), time=t)
-    assert not torch.allclose(out_clean, out_mixed)
+    out_null = dit(x=x, state=torch.tensor([STATE_NULL]), time=t)
+    assert not torch.allclose(out_clean, out_null)
 
 
 def make_model(use_aux_mel_loss=False, **kwargs):
@@ -74,42 +74,94 @@ def make_model(use_aux_mel_loss=False, **kwargs):
     return CFM(transformer=transformer, **defaults)
 
 
-def test_mix_augment_labels_and_content():
-    from wavtts.model.backbones.dit import STATE_CLEAN, STATE_MIXED
-
-    model = make_model(p_mix=1.0)
+def test_mix_augment_applies_only_to_flagged():
+    model = make_model()
     torch.manual_seed(0)
     x = torch.randn(4, 3200)
     lens = torch.full((4,), 3200, dtype=torch.long)
-    x_aug, state = model._mix_augment(x, lens)
-    assert (state == STATE_MIXED).all()
-    assert not torch.allclose(x_aug, x)
 
-    model.p_mix = 0.0
-    x_aug, state = model._mix_augment(x, lens)
-    assert (state == STATE_CLEAN).all()
-    assert torch.equal(x_aug, x)
+    flags = torch.tensor([True, False, True, False])
+    x_aug = model._mix_augment(x, lens, flags)
+    assert not torch.allclose(x_aug[0], x[0])
+    assert torch.equal(x_aug[1], x[1])  # unflagged samples pass through untouched
+    assert torch.equal(x_aug[3], x[3])
+    assert torch.equal(model._mix_augment(x, lens, torch.zeros(4, dtype=torch.bool)), x)
+
+
+def _observed_states(model, batch=4096):
+    from wavtts.model.backbones.dit import STATE_CLEAN
+
+    seen = {}
+    orig_forward = model.transformer.forward
+
+    def spy(*, x, state, **kwargs):
+        seen["state"] = state.clone()
+        seen["x"] = x.clone()
+        # the real backbone on a 4096-sample batch would be absurd; the labels are
+        # decided before it is called, so a zero of the right shape is enough
+        return torch.zeros_like(x)
+
+    model.transformer.forward = spy
+    model(torch.randn(batch, 1600) * 0.1)
+    model.transformer.forward = orig_forward
+    return seen["state"], STATE_CLEAN
+
+
+def test_label_split_is_half_clean_half_null():
+    from wavtts.model.backbones.dit import STATE_CLEAN, STATE_NULL
+
+    model = make_model(state_null_prob=0.5, p_mix=0.5)
+    torch.manual_seed(0)
+    state, _ = _observed_states(model)
+    null_frac = (state == STATE_NULL).float().mean().item()
+    assert null_frac == pytest.approx(0.5, abs=0.03)
+    assert (state == STATE_CLEAN).float().mean().item() == pytest.approx(0.5, abs=0.03)
+
+
+def test_only_null_samples_are_mixed():
+    from wavtts.model.backbones.dit import STATE_NULL
+
+    # the clean branch must stay pure single-speaker speech: a mixed sample labelled
+    # clean would have CFG guiding *toward* speaker inconsistency
+    model = make_model(state_null_prob=0.5, p_mix=1.0)
+    seen = {}
+    orig_mix = model._mix_augment
+
+    def spy_mix(x1, lens, mix_flags):
+        seen["mix"] = mix_flags.clone()
+        return orig_mix(x1, lens, mix_flags)
+
+    model._mix_augment = spy_mix
+    model.transformer.forward = lambda *, x, state, **kw: (
+        seen.__setitem__("state", state.clone()),
+        torch.zeros_like(x),
+    )[1]
+
+    torch.manual_seed(0)
+    model(torch.randn(64, 1600) * 0.1)
+
+    is_null = seen["state"] == STATE_NULL
+    assert is_null.any() and not is_null.all()  # the split actually happened
+    assert not (seen["mix"] & ~is_null).any()  # no clean sample was mixed
+    assert torch.equal(seen["mix"], is_null)  # p_mix=1.0 -> every null sample was
 
 
 def test_mix_augment_concat_prefix_preserved():
-    model = make_model(p_mix=1.0, p_concat=1.0)
+    model = make_model(p_concat=1.0)
     torch.manual_seed(0)
     x = torch.randn(2, 3200)
     lens = torch.full((2,), 3200, dtype=torch.long)
-    x_aug, _state = model._mix_augment(x, lens)
+    x_aug = model._mix_augment(x, lens, torch.ones(2, dtype=torch.bool))
     # 切換點最早在 0.3*3200=960，之前的內容必須原封不動（no leaky：前段就是原語者）
     assert torch.equal(x_aug[:, :900], x[:, :900])
 
 
 def test_mix_augment_batch_of_one_is_noop():
-    from wavtts.model.backbones.dit import STATE_CLEAN
-
-    model = make_model(p_mix=1.0)
+    model = make_model()
     x = torch.randn(1, 3200)
     lens = torch.full((1,), 3200, dtype=torch.long)
-    x_aug, state = model._mix_augment(x, lens)
-    assert torch.equal(x_aug, x)
-    assert (state == STATE_CLEAN).all()
+    x_aug = model._mix_augment(x, lens, torch.ones(1, dtype=torch.bool))
+    assert torch.equal(x_aug, x)  # roll partner would be the sample itself
 
 
 def test_train_step_backward():
@@ -136,15 +188,10 @@ def test_train_step_with_aux_mel_loss():
     loss.backward()
 
 
-@pytest.mark.parametrize(
-    "cfg_strength,negative",
-    [(2.0, "mixed"), (2.0, "null"), (0.0, "mixed")],
-)
-def test_sample_shapes(cfg_strength, negative):
+@pytest.mark.parametrize("cfg_strength", [2.0, 0.0])
+def test_sample_shapes(cfg_strength):
     model = make_model()
-    out, trajectory = model.sample(
-        8000, batch=2, steps=2, cfg_strength=cfg_strength, negative=negative, seed=0
-    )
+    out, trajectory = model.sample(8000, batch=2, steps=2, cfg_strength=cfg_strength, seed=0)
     assert out.shape == (2, 8000)
     assert torch.isfinite(out).all()
     assert trajectory.shape[0] == 3  # steps+1 個時間點
@@ -154,12 +201,6 @@ def test_sample_duration_not_multiple_of_frame_len():
     model = make_model()
     out, _ = model.sample(8123, batch=1, steps=2, seed=0)
     assert out.shape == (1, 8123)
-
-
-def test_sample_rejects_unknown_negative():
-    model = make_model()
-    with pytest.raises(ValueError):
-        model.sample(8000, steps=2, negative="bogus")
 
 
 def test_collate_wav_only():
