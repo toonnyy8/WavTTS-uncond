@@ -744,3 +744,32 @@ def test_bidir_causal_split_needs_even_heads():
     q, k, v = (torch.randn(1, 3, 4, 2) for _ in range(3))
     with pytest.raises(ValueError, match="even head count"):
         proc._bidir_causal(q, k, v, None, 1.0)
+
+
+def test_bidir_causal_concatenates_and_split_does_not():
+    """Shape contract: shared heads emit 2*head_dim, split heads emit head_dim."""
+    from wavtts.model.modules import AttnProcessor
+
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 4, 6, 8) for _ in range(3))
+    shared = AttnProcessor(attn_mode="bidir_causal")._bidir_causal(q, k, v, None, 1.0)
+    split = AttnProcessor(attn_mode="bidir_causal_split")._bidir_causal(q, k, v, None, 1.0)
+    assert shared.shape == (1, 4, 6, 16)  # [b, h, n, 2*d]
+    assert split.shape == (1, 4, 6, 8)  # [b, h, n, d]
+
+
+def test_only_shared_bidir_widens_the_output_projection():
+    """The parameter cost of concat is real and lands only on `bidir_causal`."""
+    from wavtts.model.backbones.dit import DiT
+
+    def params(mode):
+        torch.manual_seed(0)
+        d = DiT(
+            dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160,
+            rope_type="none", attn_mode=mode,
+        )
+        return sum(p.numel() for p in d.parameters())
+
+    full, split, shared = params("full"), params("bidir_causal_split"), params("bidir_causal")
+    assert split == full  # equal-parameter ablation against the RoPE model
+    assert shared == full + 2 * 64 * 64  # one extra dim x dim block per layer

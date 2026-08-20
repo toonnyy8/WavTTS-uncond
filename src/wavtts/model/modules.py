@@ -292,7 +292,13 @@ class Attention(nn.Module):
                 self.c_k_norm = RMSNorm(dim_head, eps=1e-6)
 
         self.to_out = nn.ModuleList([])
-        self.to_out.append(nn.Linear(self.inner_dim, dim))
+        # "bidir_causal" hands every head a past and a future aggregation and concatenates
+        # them, so the output projection sees twice the width and can weight the two
+        # directions per channel. Summing them instead would fix the ratio at 1:1 and
+        # waste the second attention pass. "bidir_causal_split" gives each head only one
+        # direction, so its width — and parameter count — is unchanged.
+        out_dim = self.inner_dim * 2 if getattr(processor, "attn_mode", "full") == "bidir_causal" else self.inner_dim
+        self.to_out.append(nn.Linear(out_dim, dim))
         self.to_out.append(nn.Dropout(dropout))
 
         if self.context_dim is not None and not self.context_pre_only:
@@ -382,19 +388,21 @@ class AttnProcessor:
         see. Running the mask both ways restores the bidirectional context a
         non-autoregressive denoiser needs, while each direction keeps that signal.
 
-        `bidir_causal` gives every head both directions and sums them, matching the
-        attention budget of full attention. `bidir_causal_split` gives the first half
-        of the heads the past and the second half the future, halving it.
+        `bidir_causal` gives every head both directions and concatenates them along the
+        head dimension, matching the attention budget of full attention and letting
+        `to_out` weight the two directions per channel. `bidir_causal_split` gives the
+        first half of the heads the past and the second half the future, halving the
+        budget and leaving the projection width unchanged.
 
         Entropy invariance is applied per query from each direction's own visible
         count, folded into the query rows since `scaled_dot_product_attention` only
         takes a scalar `scale`.
 
-        ponytail: neither variant can weight past against future per query — each
-        direction is separately normalized, so the split is fixed. A learnable per-head
-        gate would make it static-but-tunable; only a single softmax over both sides
-        would make it content-dependent, and that is plain full attention, which
-        destroys the position signal this is built on.
+        Neither variant can weight past against future *per query*: the two directions
+        are normalized by separate softmaxes, so `to_out` can only learn a static
+        weighting. Content-dependent weighting needs one softmax spanning both sides,
+        which is plain full attention — and that destroys the position signal this is
+        built on.
         """
         n, heads = query.shape[-2], query.shape[1]
         idx = torch.arange(n, device=query.device)
@@ -437,7 +445,9 @@ class AttnProcessor:
 
         out_fwd = past(q_fwd[:, sl_f], key[:, sl_f], value[:, sl_f], m_fwd)
         out_bwd = future(q_bwd[:, sl_b], key[:, sl_b], value[:, sl_b], m_bwd)
-        return torch.cat((out_fwd, out_bwd), dim=1) if sl_f != sl_b else out_fwd + out_bwd
+        # split: join along heads, each contributing head_dim. shared: join along
+        # head_dim, so every head emits 2*head_dim for `to_out` to weight
+        return torch.cat((out_fwd, out_bwd), dim=1 if sl_f != sl_b else -1)
 
     def __call__(
         self,
@@ -489,7 +499,7 @@ class AttnProcessor:
             temp = self.attn_temperature**2 if self.attn_temperature != 1.0 else 1.0
             attn_mask = mask if self.attn_mask_enabled else None
             x = self._bidir_causal(query, key, value, attn_mask, temp / math.sqrt(head_dim))
-            x = x.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+            x = x.transpose(1, 2).flatten(2)  # bidir_causal emits 2*head_dim per head
 
         elif self.attn_backend == "torch":
             # mask. e.g. inference got a batch with different target durations, mask out the padding
