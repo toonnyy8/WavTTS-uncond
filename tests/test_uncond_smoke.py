@@ -481,25 +481,28 @@ def test_set_yarn_scale_retunes_freqs_and_temperature():
         _yarn_dit(rope_type="default").set_yarn_scale(4.0)
 
 
-def test_logn_scaling_is_length_dependent():
+def test_logn_scaling_sharpens_but_never_flattens():
     from wavtts.model.modules import AttnProcessor
 
     proc = AttnProcessor(logn_ref_len=100)
     assert proc._logit_scale(100) == pytest.approx(1.0)  # at the reference length, a no-op
-    assert proc._logit_scale(400) > 1.0  # longer than trained -> hotter logits
-    assert proc._logit_scale(25) < 1.0
+    assert proc._logit_scale(400) > 1.0  # longer than the reference -> sharper logits
+    # clamped below the reference: flattening a short clip's softmax is not the job,
+    # and unclamped it would push a 25-key softmax toward uniform
+    assert proc._logit_scale(25) == pytest.approx(1.0)
+    assert proc._logit_scale(2) == pytest.approx(1.0)
     assert AttnProcessor()._logit_scale(4000) == 1.0  # disabled by default
 
 
 def test_logn_reaches_the_attention_softmax():
     from wavtts.model.backbones.dit import STATE_CLEAN, DiT
 
-    # 10 frames against a 100-frame reference: scale is log(10)/log(100) = 0.5, well off 1.0
+    # 10 frames against a 4-frame reference: scale is log(10)/log(4) = 1.66, well off 1.0
     common = dict(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     torch.manual_seed(0)
     off = DiT(**common)
     torch.manual_seed(0)
-    on = DiT(**common, logn_ref_len=100)
+    on = DiT(**common, logn_ref_len=4)
     _reinit_nonzero(off)
     torch.manual_seed(0)
     _reinit_nonzero(on)

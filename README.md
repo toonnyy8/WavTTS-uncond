@@ -101,9 +101,10 @@ so `rpe: relative` sets `L_t = k · clip length` for a constant stretch instead.
 `rpe: absolute` restores the paper's literal behaviour.
 
 **Entropy invariance** — softmax entropy grows with the number of keys, so logits are
-scaled by `log(n) / log(logn_ref_len)`. Trained in, because this model's clips already
-span two orders of magnitude of `n`; the model learns the relationship rather than
-extrapolating it at inference.
+scaled by `max(1, log(n) / log(logn_ref_len))`. The clamp matters: the job is to sharpen
+attention on sequences longer than the reference, never to flatten it on shorter ones.
+Trained in, because this model's clips already span two orders of magnitude of `n`; the
+model learns the relationship rather than extrapolating it at inference.
 
 ```bash
 uv run python src/wavtts/infer/sample_uncond.py \
@@ -117,7 +118,7 @@ uv run python src/wavtts/infer/sample_uncond.py \
 | `arch.yarn_native_ctx` | 3000 | frames (30 s) the architecture should cover unaided |
 | `arch.rpe` | relative | `off` \| `relative` (`L_t = k ·` clip length) \| `absolute` (`k · native_ctx`) |
 | `arch.rpe_per_sample` | True | independent position draw per sample (reference impl) vs one per batch (paper) |
-| `arch.logn_ref_len` | 3000 | entropy-invariant scaling reference; `null` disables |
+| `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
 | `optim.rpe_curriculum` | `[[0,1.0],[20000,1.25],[40000,1.5],[60000,2.0]]` | `[update, k]` milestones |
 
 ### Monitoring

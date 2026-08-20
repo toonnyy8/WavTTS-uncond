@@ -67,7 +67,7 @@ model:
     rpe: relative
     rpe_length_scale: 1.0
     rpe_per_sample: True   # independent draw per sample (reference impl); False is one draw per batch
-    logn_ref_len: 3000
+    logn_ref_len: 500        # see WavTTS.yaml
   waveform:
     target_sample_rate: 16000
     wav_frame_len: 160    # 160 @16k = 100Hz

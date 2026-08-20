@@ -342,16 +342,17 @@ class AttnProcessor:
 
         Two independent terms:
           - entropy invariance (Su, 2021): softmax entropy grows with the number of
-            keys, so `log_m(n)` holds it steady as n moves. Trained in rather than
-            bolted on at inference — this model's clips already span two orders of
-            magnitude of n, so it gets to learn the relationship instead of
-            extrapolating it.
+            keys, so `log_m(n)` holds it steady as n moves. Clamped at 1 — the job is
+            to sharpen attention on sequences longer than the reference, never to
+            flatten it on shorter ones, which is how the reference implementations
+            (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46, pushing
+            a 40-key softmax toward uniform for no reason.
           - YaRN's attention factor, which the reference applies to query and key
             alike; squaring it here scales the logits identically.
         """
         scale = 1.0
         if self.logn_ref_len:
-            scale *= math.log(max(seq_len, 2)) / math.log(self.logn_ref_len)
+            scale *= max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
         if self.attn_temperature != 1.0:
             scale *= self.attn_temperature**2
         return scale

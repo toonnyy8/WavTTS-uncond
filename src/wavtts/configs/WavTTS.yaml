@@ -79,7 +79,9 @@ model:
     rpe: relative            # off | relative (L_t = k * clip length) | absolute (k * native_ctx)
     rpe_length_scale: 1.0    # initial k; optim.rpe_curriculum advances it
     rpe_per_sample: True     # independent draw per sample (reference impl); False is one draw per batch
-    logn_ref_len: 3000       # entropy-invariant attention scaling reference; null disables
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. At 3000
+                             # every training clip sat below 1 and it never sharpened at all
   waveform:
     target_sample_rate: 16000
     wav_frame_len: 160    # 160 @16k = 100Hz
