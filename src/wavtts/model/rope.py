@@ -1,24 +1,30 @@
 """YaRN rotary embedding and randomized positional encoding, for length extrapolation.
 
-Implements the training recipe from "Randomized YaRN Improves Length Generalization
-for Long-Context Reasoning" (Mehta, Yin & Durrett, arXiv:2606.23687), adapted to
-100 Hz waveform frames:
+Follows "Randomized YaRN Improves Length Generalization for Long-Context Reasoning"
+(Mehta, Yin & Durrett, arXiv:2606.23687), adapted to 100 Hz waveform frames:
 
   1. YaRN (Peng et al., 2024) with a *fixed* scale `s` during training. Inference
      uses `s' >= s`; the paper's Appendix B shows `s' > s` reaches beyond `s * native_ctx`.
   2. Randomized positional encoding (Ruoss et al., 2023): training positions are
      `randperm(L_t)[:n].sort()` instead of `arange(n)`, so a short clip still shows
      the model rotations it would only meet in a long one. Training only.
-  3. A length curriculum that grows `L_t` over the run; the paper's ablation puts
-     up to 18.3 points on this, so it is not optional.
 
-Deviation from the paper, deliberate: `L_t` defaults to a multiple of each sample's
-own length rather than a fixed constant. Their sequences all sit near the training
-cap, so a fixed `L_t` stretches every sample about equally. Ours run 0.3-30 s, and a
-fixed `L_t` would stretch the median 4.5 s clip ~13x — in waveform modelling relative
-position *is* physical time, carrying pitch period and formant transitions, so an
-uneven stretch attacks exactly the structure the model depends on. `rpe="absolute"`
-restores the paper's literal behaviour.
+Two deliberate deviations from the paper:
+
+`L_t` is a multiple of each sample's own length, not a fixed constant. Their sequences
+all sit near the training cap, so a fixed `L_t` stretches every sample about equally.
+Ours run 0.3-30 s, and a fixed `L_t` would stretch the median 4.5 s clip ~13x — in
+waveform modelling relative position *is* physical time, carrying pitch period and
+formant transitions, so an uneven stretch attacks exactly the structure the model
+depends on.
+
+`L_t` is drawn per sample from `U[n, n*gamma]` instead of stepping through a
+curriculum. A curriculum makes the stretch factor a property of the *update*: every
+sample in a batch is stretched the same amount, and the model never sees a contiguous
+sequence again once the schedule leaves k=1. A random upper bound makes it a property
+of the *sample*, so from the first update every batch contains rows at every stretch
+from contiguous to gamma. That also removes a discrete regime change from the middle
+of training, which is one less thing for a weight average to straddle.
 
 Outputs follow the x_transformers rotary contract — `(freqs, scale)` consumable by
 `apply_rotary_pos_emb`, which already broadcasts a per-sample `[b, n, d]` freqs.
@@ -112,41 +118,32 @@ class YaRNRotaryEmbedding(nn.Module):
 def randomized_positions(
     batch: int,
     seq_len: int,
-    max_len: int,
+    gamma: float,
     device: torch.device,
-    per_sample: bool = True,
 ) -> torch.Tensor:
-    """Sorted samples of `seq_len` unique positions from [0, max_len).
+    """Sorted samples of `seq_len` unique positions, each row drawn from its own range.
 
-    Sorting keeps token order intact while the absolute indices — and so every
-    relative distance the attention sees — span a range the raw sequence never would.
-    Falls back to contiguous positions when there is no room to spread.
+    Row `b` draws an upper bound `L_b ~ U[seq_len, seq_len * gamma]` and then takes
+    `seq_len` distinct positions from `[0, L_b)`. Sorting keeps token order intact while
+    the absolute indices — and so every relative distance the attention sees — span a
+    range the raw sequence never would.
 
-    `per_sample` draws independently per batch element, as the reference
-    implementation does; the paper's text (and Ruoss et al.) draw one set per batch.
-    Per-sample costs a [b, n, d] frequency tensor instead of [1, n, d] through every
-    block's cos/sin — measured at 88 MiB against 22 GiB, since frame-budget batching
-    caps `b * n` and the two can never be large at once.
+    `L_b == seq_len` yields contiguous positions, so the low end of the draw is exactly
+    the un-augmented sequence. Every batch therefore carries the whole range of stretch
+    factors at once, from the first update onward.
+
+    `gamma <= 1` disables the augmentation.
     """
-    if max_len <= seq_len:
+    if gamma <= 1.0:
         return torch.arange(seq_len, device=device).expand(batch, seq_len)
 
-    draws = batch if per_sample else 1
-    # argsort of uniform noise is a permutation, so this is `draws` independent
-    # randperms in one kernel instead of a Python loop over them
-    positions = torch.rand(draws, max_len, device=device).argsort(dim=-1)[:, :seq_len]
+    max_len = math.ceil(seq_len * gamma)
+    bounds = seq_len + (torch.rand(batch, device=device) * (max_len - seq_len)).long()
+
+    # argsort of uniform noise is a permutation; pushing everything at or past a row's
+    # own bound to +inf keeps it out of the first `seq_len` picks, so one kernel draws
+    # `batch` independent samples from `batch` different ranges
+    noise = torch.rand(batch, max_len, device=device)
+    noise.masked_fill_(torch.arange(max_len, device=device)[None, :] >= bounds[:, None], float("inf"))
+    positions = noise.argsort(dim=-1)[:, :seq_len]
     return positions.sort(dim=-1).values
-
-
-def rpe_max_len(mode: str, seq_len: int, length_scale: float, native_ctx: int) -> int:
-    """Sampling range `L_t` for one batch.
-
-    "relative": `length_scale` multiplies the sample's own length, so the stretch
-    factor is constant across a dataset whose clips vary by two orders of magnitude.
-    "absolute": `length_scale` multiplies `native_ctx` — the paper's fixed `L_t`.
-    """
-    if mode == "relative":
-        return int(round(seq_len * length_scale))
-    if mode == "absolute":
-        return int(round(native_ctx * length_scale))
-    raise ValueError(f"Unknown rpe mode: {mode}")

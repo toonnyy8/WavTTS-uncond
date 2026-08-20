@@ -23,7 +23,6 @@ from wavtts.model.modules import (
 from wavtts.model.rope import (
     YaRNRotaryEmbedding,
     randomized_positions,
-    rpe_max_len,
     yarn_attention_factor,
     yarn_inv_freq,
 )
@@ -104,9 +103,7 @@ class DiT(nn.Module):
         yarn_native_ctx: int = 3000,  # frames the architecture is expected to cover unaided
         yarn_alpha: float = 1.0,
         yarn_beta: float = 32.0,
-        rpe: str = "off",  # "off" | "relative" | "absolute"; training only
-        rpe_length_scale: float = 1.0,  # curriculum value, advanced by the trainer
-        rpe_per_sample: bool = True,  # one position draw per sample (reference impl) vs per batch (paper)
+        rpe_gamma: float = 1.0,  # per-sample L_t ~ U[n, n*gamma]; 1.0 disables. Training only
         logn_ref_len: int | None = None,  # entropy-invariant attention scaling; None disables
     ):
         super().__init__()
@@ -140,9 +137,7 @@ class DiT(nn.Module):
         self.yarn_native_ctx = yarn_native_ctx
         self.yarn_alpha = yarn_alpha
         self.yarn_beta = yarn_beta
-        self.rpe = rpe
-        self.rpe_length_scale = rpe_length_scale
-        self.rpe_per_sample = rpe_per_sample
+        self.rpe_gamma = rpe_gamma
 
         self.dim = dim
         self.depth = depth
@@ -204,10 +199,6 @@ class DiT(nn.Module):
                 f"wav_frame_len ({self.wav_frame_len}) must equal proj_out_dim ({self.proj_out_dim}) "
                 "for reshape wav front-end."
             )
-
-    def set_rpe_length_scale(self, length_scale: float):
-        """Advance the length curriculum. Called per update by the trainer."""
-        self.rpe_length_scale = float(length_scale)
 
     def set_yarn_scale(self, scale: float):
         """Retune YaRN to an inference scale `s'`.
@@ -303,17 +294,15 @@ class DiT(nn.Module):
 
         # randomized positional encoding is a training-time augmentation: the clip keeps
         # its token order but is told it spans a longer stretch, so short training audio
-        # still exercises the rotations only long audio would produce
-        max_len = rpe_max_len(self.rpe, seq_len, self.rpe_length_scale, self.yarn_native_ctx) if self.rpe != "off" else 0
+        # still exercises the rotations only long audio would produce. Each row draws its
+        # own stretch, so a batch spans contiguous through gamma at every update
         if self.rotary_embed is None:
             rope = None  # NoPE: position comes from the causal mask alone
-        elif self.training and max_len > seq_len:
-            rope = self.rotary_embed(
-                randomized_positions(h.shape[0], seq_len, max_len, h.device, per_sample=self.rpe_per_sample)
-            )
+        elif self.training and self.rpe_gamma > 1.0:
+            rope = self.rotary_embed(randomized_positions(h.shape[0], seq_len, self.rpe_gamma, h.device))
         else:
-            # no room to spread (curriculum still at k=1) or inference: contiguous positions,
-            # and a [1, n, d] freqs every block broadcasts instead of a per-sample copy
+            # augmentation off or inference: contiguous positions, and a [1, n, d] freqs
+            # every block broadcasts instead of a per-sample copy
             rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if self.long_skip_connection is not None:

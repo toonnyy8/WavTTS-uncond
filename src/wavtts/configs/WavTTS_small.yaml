@@ -18,8 +18,6 @@ optim:
   grad_accumulation_steps: 1
   max_grad_norm: 1.0
   bnb_optimizer: False
-  # same shape as WavTTS.yaml, compressed to the small run's 500-update warmup
-  rpe_curriculum: [[0, 1.0], [1000, 1.25], [2000, 1.5], [3000, 2.0]]
 
 model:
   name: WavTTS_Uncond_Small  # model name
@@ -65,9 +63,7 @@ model:
     yarn_native_ctx: 3000
     yarn_alpha: 1.0
     yarn_beta: 32.0
-    rpe: relative
-    rpe_length_scale: 1.0
-    rpe_per_sample: True   # independent draw per sample (reference impl); False is one draw per batch
+    rpe_gamma: 4.0         # per-sample L_t ~ U[n, n*gamma]; see WavTTS.yaml
     logn_ref_len: 500        # see WavTTS.yaml
   waveform:
     target_sample_rate: 16000

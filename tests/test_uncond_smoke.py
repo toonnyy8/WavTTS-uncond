@@ -393,26 +393,40 @@ def test_randomized_positions_sorted_unique_and_in_range():
     from wavtts.model.rope import randomized_positions
 
     torch.manual_seed(0)
-    pos = randomized_positions(batch=4, seq_len=50, max_len=500, device=torch.device("cpu"))
-    assert pos.shape == (4, 50)
+    n, gamma = 50, 4.0
+    pos = randomized_positions(batch=64, seq_len=n, gamma=gamma, device=torch.device("cpu"))
+    assert pos.shape == (64, n)
     assert (pos[:, 1:] > pos[:, :-1]).all()  # strictly increasing: order preserved, no repeats
-    assert pos.min() >= 0 and pos.max() < 500
-    assert not torch.equal(pos[0], pos[1])  # independent draw per sample, the default
-    shared = randomized_positions(4, 50, 500, torch.device("cpu"), per_sample=False)
-    assert shared.shape == (1, 50)  # one draw broadcast over the batch, freqs stay [1, n, d]
-    # no room to spread -> plain contiguous positions
-    tight = randomized_positions(batch=2, seq_len=50, max_len=50, device=torch.device("cpu"))
-    assert torch.equal(tight[0], torch.arange(50))
+    assert pos.min() >= 0 and pos.max() < math.ceil(n * gamma)
+    assert not torch.equal(pos[0], pos[1])  # independent draw per sample
 
 
-def test_rpe_max_len_modes():
-    from wavtts.model.rope import rpe_max_len
+def test_gamma_of_one_leaves_positions_contiguous():
+    from wavtts.model.rope import randomized_positions
 
-    assert rpe_max_len("relative", seq_len=455, length_scale=2.0, native_ctx=3000) == 910
-    assert rpe_max_len("relative", seq_len=2979, length_scale=2.0, native_ctx=3000) == 5958
-    assert rpe_max_len("absolute", seq_len=455, length_scale=2.0, native_ctx=3000) == 6000
-    with pytest.raises(ValueError):
-        rpe_max_len("nope", seq_len=1, length_scale=1.0, native_ctx=1)
+    pos = randomized_positions(batch=2, seq_len=50, gamma=1.0, device=torch.device("cpu"))
+    assert torch.equal(pos[0], torch.arange(50))
+    assert torch.equal(pos[1], torch.arange(50))
+
+
+def test_every_batch_spans_contiguous_through_gamma():
+    """The whole point of the random bound: no curriculum, so one batch holds both ends.
+
+    A row's span `pos[-1] - pos[0]` tracks its own upper bound, so the spread of spans
+    across a batch is the spread of stretch factors the model sees in a single update.
+    """
+    from wavtts.model.rope import randomized_positions
+
+    torch.manual_seed(0)
+    n, gamma = 100, 4.0
+    pos = randomized_positions(batch=512, seq_len=n, gamma=gamma, device=torch.device("cpu"))
+    span = (pos[:, -1] - pos[:, 0]).float()
+
+    assert span.min() < 1.2 * n  # some rows are essentially contiguous
+    assert span.max() > 3.0 * n  # others are stretched near gamma
+    assert span.max() < gamma * n  # and never past it
+    # the draw is uniform over the bound, so the mean sits near the middle of [1, gamma]
+    assert 2.0 * n < span.mean() < 3.0 * n
 
 
 def _yarn_dit(**overrides):
@@ -452,7 +466,7 @@ def test_rpe_is_training_only_and_changes_output():
     from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
-    dit = _yarn_dit(rpe="relative", rpe_length_scale=2.0)
+    dit = _yarn_dit(rpe_gamma=4.0)
     _reinit_nonzero(dit)
     x = torch.randn(2, 1600)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
@@ -465,7 +479,7 @@ def test_rpe_is_training_only_and_changes_output():
     with torch.no_grad():
         a = dit(x=x, state=state, time=torch.tensor(0.5))
         b = dit(x=x, state=state, time=torch.tensor(0.5))
-    assert not torch.allclose(a, b)  # fresh random positions every training forward
+    assert not torch.allclose(a, b)  # fresh random bounds and positions every training forward
 
 
 def test_set_yarn_scale_retunes_freqs_and_temperature():
@@ -526,30 +540,15 @@ def test_log_samples_secs_pairs_with_seeds():
     assert pair_sample_lengths([0, 1], None) == [5.0, 5.0]
 
 
-def test_rpe_curriculum_steps_on_updates():
-    from wavtts.model.trainer import Trainer
-
-    trainer = object.__new__(Trainer)
-    trainer.rpe_curriculum = [[0, 1.0], [10, 1.5], [20, 2.0]]
-    trainer._rpe_length_scale = None
-    seen = []
-    trainer.accelerator = type(
-        "A", (), {"unwrap_model": staticmethod(lambda m: m), "is_main_process": False}
-    )()
-    trainer.model = type("M", (), {"transformer": type("T", (), {"set_rpe_length_scale": seen.append})()})()
-
-    for update in range(0, 25):
-        trainer._advance_rpe_curriculum(update)
-    assert seen == [1.0, 1.5, 2.0]  # steps once per milestone, never per update
-
-
 def test_default_config_rope_is_unchanged_when_disabled():
     from wavtts.model.backbones.dit import STATE_CLEAN, DiT
 
     torch.manual_seed(0)
     plain = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     torch.manual_seed(0)
-    explicit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rope_type="default", rpe="off")
+    explicit = DiT(
+        dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rope_type="default", rpe_gamma=1.0
+    )
     x = torch.randn(2, 1600)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
     with torch.no_grad():

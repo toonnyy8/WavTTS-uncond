@@ -88,18 +88,29 @@ Training clips top out at 29.8 s, so generating longer needs help. Two mechanism
 both trained in rather than bolted on at inference, both off by `rope_type: default`:
 
 **Randomized YaRN** ([arXiv:2606.23687](https://arxiv.org/abs/2606.23687)) — YaRN
-frequencies at a fixed scale `s` during training, randomized positional encoding
-(`randperm(L_t)[:n].sort()` instead of `arange(n)`, training only), and a length
-curriculum that grows `L_t` over the run. A short clip keeps its token order but is
-told it spans a longer stretch, so it exercises rotations only long audio would
-produce. Inference runs plain YaRN at `s'`, and `s' > s` reaches past `s · native_ctx`:
-`s=2, s'=4` covers 120 s.
+frequencies at a fixed scale `s` during training, plus randomized positional encoding
+(`randperm(L_t)[:n].sort()` instead of `arange(n)`, training only). A short clip keeps
+its token order but is told it spans a longer stretch, so it exercises rotations only
+long audio would produce. Inference runs plain YaRN at `s'`, and `s' > s` reaches past
+`s · native_ctx`: `s=2, s'=4` covers 120 s.
 
-Unlike the paper's text corpora, our clips span 0.3–30 s, so a fixed `L_t` would
+Two deviations from the paper.
+
+`L_t` is relative. Their sequences all sit near the training cap, so a fixed `L_t`
+stretches every sample about equally. Ours span 0.3–30 s, and a fixed `L_t` would
 stretch a median 4.5 s clip ~13× while barely touching a 30 s one. In waveform
-modelling relative position *is* physical time — pitch period, formant transitions —
-so `rpe: relative` sets `L_t = k · clip length` for a constant stretch instead.
-`rpe: absolute` restores the paper's literal behaviour.
+modelling relative position *is* physical time — pitch period, formant transitions — so
+`L_t` is a multiple of each clip's own length.
+
+`L_t` is drawn per sample rather than stepped through a curriculum:
+`L_t ~ U[n, n·γ]`, fresh every forward, with `γ = 4`. A curriculum makes the stretch
+factor a property of the *update* — every row in a batch stretched alike, and once the
+schedule leaves `k=1` the model never sees a contiguous sequence again. The random
+bound makes it a property of the *sample*, so from the first update every batch spans
+contiguous through `γ`. Measured over 4096 draws at `n=2979`, the realized stretch is
+uniform on `[1, 4]`: min 1.00, quartiles 1.76 / 2.50 / 3.27, max 4.00. It also removes
+a discrete regime change from the middle of training — one less thing for a weight
+average to straddle.
 
 **Entropy invariance** — softmax entropy grows with the number of keys, so logits are
 scaled by `max(1, log(n) / log(logn_ref_len))`. The clamp matters: the job is to sharpen
@@ -117,10 +128,8 @@ uv run python src/wavtts/infer/sample_uncond.py \
 | `arch.rope_type` | yarn | `default` \| `yarn` — `default` disables everything below |
 | `arch.yarn_scale` | 2.0 | `s` during training |
 | `arch.yarn_native_ctx` | 3000 | frames (30 s) the architecture should cover unaided |
-| `arch.rpe` | relative | `off` \| `relative` (`L_t = k ·` clip length) \| `absolute` (`k · native_ctx`) |
-| `arch.rpe_per_sample` | True | independent position draw per sample (reference impl) vs one per batch (paper) |
+| `arch.rpe_gamma` | 4.0 | per-sample stretch bound: `L_t ~ U[n, n·γ]`; `1.0` disables |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
-| `optim.rpe_curriculum` | `[[0,1.0],[20000,1.25],[40000,1.5],[60000,2.0]]` | `[update, k]` milestones |
 
 ### Monitoring
 

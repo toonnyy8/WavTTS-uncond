@@ -59,7 +59,6 @@ def main(model_cfg):
         wandb_resume_id=wandb_resume_id,
         last_per_updates=model_cfg.ckpts.last_per_updates,
         log_per_updates=model_cfg.ckpts.get("log_per_updates", 1),
-        rpe_curriculum=model_cfg.optim.get("rpe_curriculum", None),
         log_samples=model_cfg.ckpts.log_samples,
         log_samples_seeds=model_cfg.ckpts.log_samples_seeds,
         log_samples_secs=model_cfg.ckpts.log_samples_secs,
