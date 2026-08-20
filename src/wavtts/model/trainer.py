@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import random
 
 import torch
 import torchaudio
@@ -187,6 +188,16 @@ class Trainer:
                 ema_model_state_dict=self.ema_model.state_dict(),
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
+                # resume picks up the same noise/t/mixing draws instead of replaying
+                # the run's opening seed. weights_only=True load allows tensors and
+                # plain tuples, so keep it to these; numpy is unused in this loop.
+                # ponytail: rank-0 RNG only — seed_everything gives every rank the
+                # same seed anyway, so restoring it everywhere changes nothing.
+                rng_state=dict(
+                    python=random.getstate(),
+                    torch=torch.get_rng_state(),
+                    cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                ),
             )
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
@@ -277,8 +288,17 @@ class Trainer:
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             update = checkpoint["update"]
+            rng_state = checkpoint.get("rng_state")  # absent in checkpoints saved before this was added
+            if rng_state is not None:
+                random.setstate(tuple(rng_state["python"]))
+                torch.set_rng_state(rng_state["torch"])
+                if rng_state["cuda"] is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng_state["cuda"])
             if self.is_main:
-                print(f"Resume mode: full-state resume (model + optimizer + scheduler), update={update}")
+                print(
+                    f"Resume mode: full-state resume (model + optimizer + scheduler"
+                    f"{' + rng' if rng_state is not None else ''}), update={update}"
+                )
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
@@ -452,7 +472,10 @@ class Trainer:
                 ):
                     from wavtts.train.metrics import clipping_rate, mel_figure, rms, silence_ratio
 
-                    unwrap = self.accelerator.unwrap_model(self.model)
+                    # sample from the EMA weights: they are what inference ships, and they
+                    # move smoothly enough that a fixed seed's clip stays comparable across
+                    # checkpoints instead of jumping with every batch
+                    gen_model = self.ema_model.ema_model
                     gen_len = int(self.log_samples_sec * target_sample_rate)
 
                     # same seeds and duration at every checkpoint: each seed's clip is
@@ -460,7 +483,7 @@ class Trainer:
                     gen_audios = {}
                     with torch.inference_mode():
                         for gen_seed in self.log_samples_seeds:
-                            generated, _ = unwrap.sample(
+                            generated, _ = gen_model.sample(
                                 duration=gen_len,
                                 steps=32,
                                 cfg_strength=2.0,
@@ -503,7 +526,6 @@ class Trainer:
                     if self.logger == "tensorboard":
                         for k, v in metric_log.items():
                             self.writer.add_scalar(k, v, global_update)
-                    self.model.train()
 
         self.save_checkpoint(global_update, last=True)
 

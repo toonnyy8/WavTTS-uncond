@@ -323,6 +323,26 @@ def test_sample_seed_is_isolated_and_deterministic():
     assert torch.equal(out1, out2)  # same seed, same clip
 
 
+def test_rng_state_survives_checkpoint_roundtrip(tmp_path):
+    import random
+
+    torch.manual_seed(999)
+    random.seed(999)
+    state = dict(python=random.getstate(), torch=torch.get_rng_state(), cuda=None)
+    expected = (torch.rand(4), random.random())
+
+    ckpt = tmp_path / "model_last.pt"
+    torch.save({"rng_state": state}, ckpt)
+    torch.manual_seed(1)  # scramble, as a fresh process would
+    random.seed(1)
+
+    loaded = torch.load(ckpt, weights_only=True)["rng_state"]  # the trainer's load path
+    torch.set_rng_state(loaded["torch"])
+    random.setstate(tuple(loaded["python"]))
+    assert torch.equal(torch.rand(4), expected[0])
+    assert random.random() == expected[1]
+
+
 def test_signal_metrics():
     from wavtts.train.metrics import clipping_rate, rms, silence_ratio
 
