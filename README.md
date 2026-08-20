@@ -79,6 +79,7 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 | `model.cfm.p_concat` | 0.5 | among mixed: concat (temporal switch) vs overlap |
 | `ckpts.logger` | tensorboard | `wandb` \| `tensorboard` \| `null` |
 | `ckpts.log_samples_seeds` | [0, 1, 2, 3] | fixed seeds for checkpoint sampling — same clips evolve across training |
+| `ckpts.log_samples_secs` | [5, 15, 30, 60] | one clip length per seed; 60 s is past the 30 s training maximum |
 | `ckpts.spk_ckpt_path` | null | ECAPA (WavLM-large) ckpt enabling `gen/spk_sim_self` |
 
 ### Length extrapolation
@@ -127,7 +128,15 @@ uv run python src/wavtts/infer/sample_uncond.py \
 uv run tensorboard --logdir runs
 ```
 
-At every checkpoint the trainer generates fixed-seed clips and logs audio (`gen/audio_seed{k}`), log-mel images (`gen/mel_seed{k}`), and quality metrics:
+At every checkpoint the trainer generates one fixed-seed clip per length in
+`log_samples_secs` and logs audio (`gen/audio_{sec}s_seed{k}`), log-mel images
+(`gen/mel_{sec}s_seed{k}`), and quality metrics — both per length (`gen_{sec}s/*`) and
+averaged (`gen/*`). Read the per-length curves: a model that extrapolates badly keeps a
+healthy 5 s clip while the 60 s one collapses, and the average hides that. The four
+clips cost ~45 s per checkpoint on an RTX 4090; a clip that will not fit is skipped with
+a warning rather than taking the run down.
+
+Metrics logged for each clip:
 
 - `gen/utmos` — predicted MOS (1–5), naturalness at a glance
 - `gen/spk_sim_self` — cosine similarity of the clip's two halves' speaker embeddings — the direct speaker-consistency signal this design targets (opt-in via `ckpts.spk_ckpt_path`)

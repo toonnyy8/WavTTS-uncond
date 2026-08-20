@@ -515,6 +515,15 @@ def test_logn_reaches_the_attention_softmax():
     assert not torch.allclose(a, b)  # folded into the softmax scale, it must still bite
 
 
+def test_log_samples_secs_pairs_with_seeds():
+    from wavtts.model.trainer import pair_sample_lengths
+
+    assert pair_sample_lengths([0, 1, 2, 3], [5, 15, 30, 60]) == [5, 15, 30, 60]
+    assert pair_sample_lengths([0, 1, 2, 3], [5]) == [5, 5, 5, 5]  # pads: no seed left bare
+    assert pair_sample_lengths([0, 1], [5, 15, 30, 60]) == [5, 15]  # extras dropped
+    assert pair_sample_lengths([0, 1], None) == [5.0, 5.0]
+
+
 def test_rpe_curriculum_steps_on_updates():
     from wavtts.model.trainer import Trainer
 

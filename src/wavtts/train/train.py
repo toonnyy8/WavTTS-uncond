@@ -62,7 +62,7 @@ def main(model_cfg):
         rpe_curriculum=model_cfg.optim.get("rpe_curriculum", None),
         log_samples=model_cfg.ckpts.log_samples,
         log_samples_seeds=model_cfg.ckpts.log_samples_seeds,
-        log_samples_sec=model_cfg.ckpts.log_samples_sec,
+        log_samples_secs=model_cfg.ckpts.log_samples_secs,
         spk_ckpt_path=model_cfg.ckpts.spk_ckpt_path,
         bnb_optimizer=model_cfg.optim.bnb_optimizer,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),

@@ -211,6 +211,37 @@ freqs 會白白 materialize 成 `[b, n, d]`。實測前 20000 updates（約 5 �
 `rotary_embed.inv_freq` 存進 state_dict，YaRN 版註冊為 `persistent=False` 不存，
 `load_state_dict` 會直接報 unexpected key。
 
+## 訓練中的外推監控
+
+`ckpts.log_samples_secs: [5, 15, 30, 60]` 與 `log_samples_seeds` 逐位配對，一個 seed 一個長度，
+跨 checkpoint 固定。長度階梯的用意：
+
+| 長度 | 意義 |
+|---|---|
+| 5s | 訓練資料主體（median 4.55s） |
+| 15s | p95 |
+| 30s | 訓練最長 utterance，等於 `yarn_native_ctx` |
+| 60s | `yarn_scale × native_ctx`，第一個真正算外推的長度 |
+
+指標同時記**每個長度各自的** `gen_{sec}s/*` 與跨長度平均的 `gen/*`。分開記是必要的——
+外推壞掉的樣子是短的正常、長的崩，平均起來剛好把訊號抹掉。
+
+120s 需要推論期切到 `s'=4`，不放進訓練迴圈：它要 82 秒、峰值 3.99 GiB，
+用 `sample_uncond.py --duration_sec 120 --yarn_scale 4` 離線做。
+
+實測成本（RTX 4090，664.5M，32 步，權重本身 2.48 GiB）：
+
+| 長度 | frames | 時間 | 峰值記憶體 |
+|---|---|---|---|
+| 5s | 500 | 1.5 s | 2.55 GiB |
+| 15s | 1500 | 4.1 s | 2.69 GiB |
+| 30s | 3000 | 10.1 s | 2.89 GiB |
+| 60s | 6000 | 29.7 s | 3.30 GiB |
+| 120s (s'=4) | 12000 | 81.9 s | 3.99 GiB |
+
+四條合計約 45 秒，相對 2500 updates（約 36 分鐘）約 2%。60s 那條比權重多吃 0.82 GiB，
+訓練時的餘裕約 2 GiB，取樣前先 `empty_cache()`；單條 OOM 只跳過並印警告，不中斷訓練。
+
 ## 推論
 
 ```bash

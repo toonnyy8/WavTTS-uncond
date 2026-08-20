@@ -92,7 +92,11 @@ ckpts:
   log_per_updates: 100  # scalar (loss/lr) logging interval in updates
   log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
   log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
-  log_samples_sec: 5  # fixed clip length in seconds
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, 60s = yarn_scale * native_ctx -- the first length
+  # that is genuine extrapolation. 120s needs s'=4 at inference; do that offline with
+  # sample_uncond.py --yarn_scale 4 rather than inside the training loop.
+  log_samples_secs: [5, 15, 30, 60]
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
   save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
   keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints

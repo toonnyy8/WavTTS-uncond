@@ -21,6 +21,15 @@ from wavtts.model.dataset import DynamicBatchSampler, collate_fn
 from wavtts.model.utils import default, exists
 
 
+def pair_sample_lengths(seeds: list[int], secs: list[float] | None) -> list[float]:
+    """One clip length per seed. A short list pads with its last value, so a config
+    that gives a single length still yields a length for every seed."""
+    out = list(secs) if secs else [5.0]
+    if len(out) < len(seeds):
+        out = out + [out[-1]] * (len(seeds) - len(out))
+    return out[: len(seeds)]
+
+
 # trainer
 
 
@@ -87,7 +96,8 @@ class Trainer:
         rpe_curriculum: list | None = None,  # [[update, length_scale], ...]; None leaves it fixed
         log_samples: bool = False,
         log_samples_seeds: list[int] | None = None,  # fixed seeds: clips comparable across checkpoints
-        log_samples_sec: float = 5.0,
+        log_samples_secs: list[float] | None = None,  # one length per seed; the ladder past
+        # the training maximum is what makes extrapolation failure visible
         spk_ckpt_path: str | None = None,  # ECAPA ckpt for gen/spk_sim_self; None disables
         last_per_updates=None,
         accelerate_kwargs: dict = dict(),
@@ -104,7 +114,7 @@ class Trainer:
         self._rpe_length_scale = None
         self.log_samples = log_samples
         self.log_samples_seeds = list(log_samples_seeds) if log_samples_seeds is not None else [0, 1, 2, 3]
-        self.log_samples_sec = log_samples_sec
+        self.log_samples_secs = pair_sample_lengths(self.log_samples_seeds, log_samples_secs)
         self.spk_ckpt_path = spk_ckpt_path
 
         self.accelerator = Accelerator(
@@ -505,51 +515,67 @@ class Trainer:
                     # move smoothly enough that a fixed seed's clip stays comparable across
                     # checkpoints instead of jumping with every batch
                     gen_model = self.ema_model.ema_model
-                    gen_len = int(self.log_samples_sec * target_sample_rate)
+                    torch.cuda.empty_cache()  # the long clips want every spare block
 
-                    # same seeds and duration at every checkpoint: each seed's clip is
-                    # directly comparable across training updates
+                    # one length per seed, held fixed across checkpoints: a length ladder
+                    # past the 30 s training maximum is what makes extrapolation failure
+                    # visible, and per-length metrics keep a collapsing 60 s clip from
+                    # being averaged away by a healthy 5 s one
                     gen_audios = {}
                     with torch.inference_mode():
-                        for gen_seed in self.log_samples_seeds:
-                            generated, _ = gen_model.sample(
-                                duration=gen_len,
-                                steps=32,
-                                cfg_strength=2.0,
-                                sway_sampling_coef=-1.0,
-                                seed=gen_seed,
-                            )
-                            gen_audios[gen_seed] = generated.to(torch.float32).cpu()  # [1, N_gen]
+                        for gen_seed, gen_sec in zip(self.log_samples_seeds, self.log_samples_secs):
+                            try:
+                                generated, _ = gen_model.sample(
+                                    duration=int(gen_sec * target_sample_rate),
+                                    steps=32,
+                                    cfg_strength=2.0,
+                                    sway_sampling_coef=-1.0,
+                                    seed=gen_seed,
+                                )
+                            except torch.cuda.OutOfMemoryError:
+                                # the longest clip is the one that can fail, and losing it
+                                # must not take the run down with it
+                                print(f"\nWARNING: skipped {gen_sec}s sample at update {global_update}, OOM")
+                                torch.cuda.empty_cache()
+                                continue
+                            gen_audios[(gen_seed, gen_sec)] = generated.to(torch.float32).cpu()  # [1, N_gen]
+                    torch.cuda.empty_cache()
 
-                    scores = {"utmos": [], "silence_ratio": [], "clipping_rate": [], "rms": [], "spk_sim_self": []}
-                    for gen_seed, gen_audio in gen_audios.items():
+                    keys = ("utmos", "silence_ratio", "clipping_rate", "rms", "spk_sim_self")
+                    scores = {k: [] for k in keys}
+                    for (gen_seed, gen_sec), gen_audio in gen_audios.items():
+                        tag = f"{gen_sec:g}s_seed{gen_seed}"
                         torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_seed{gen_seed}.wav",
+                            f"{log_samples_path}/update_{global_update}_{tag}.wav",
                             gen_audio,
                             target_sample_rate,
                         )
                         wav_1d = gen_audio[0]
-                        scores["silence_ratio"].append(silence_ratio(wav_1d))
-                        scores["clipping_rate"].append(clipping_rate(wav_1d))
-                        scores["rms"].append(rms(wav_1d))
-                        utmos_score = gen_metrics.utmos(wav_1d, self.accelerator.device)
-                        if utmos_score is not None:
-                            scores["utmos"].append(utmos_score)
-                        spk_sim = gen_metrics.spk_sim_self(wav_1d, self.accelerator.device)
-                        if spk_sim is not None:
-                            scores["spk_sim_self"].append(spk_sim)
+                        clip = {
+                            "silence_ratio": silence_ratio(wav_1d),
+                            "clipping_rate": clipping_rate(wav_1d),
+                            "rms": rms(wav_1d),
+                            "utmos": gen_metrics.utmos(wav_1d, self.accelerator.device),
+                            "spk_sim_self": gen_metrics.spk_sim_self(wav_1d, self.accelerator.device),
+                        }
+                        clip_log = {f"gen_{gen_sec:g}s/{k}": v for k, v in clip.items() if v is not None}
+                        for k, v in clip.items():
+                            if v is not None:
+                                scores[k].append(v)
 
+                        self.accelerator.log(clip_log, step=global_update)
                         if self.logger == "tensorboard":
+                            for k, v in clip_log.items():
+                                self.writer.add_scalar(k, v, global_update)
                             self.writer.add_audio(
-                                f"gen/audio_seed{gen_seed}",
-                                gen_audio,
-                                global_update,
-                                sample_rate=target_sample_rate,
+                                f"gen/audio_{tag}", gen_audio, global_update, sample_rate=target_sample_rate
                             )
                             self.writer.add_figure(
-                                f"gen/mel_seed{gen_seed}", mel_figure(wav_1d, target_sample_rate), global_update
+                                f"gen/mel_{tag}", mel_figure(wav_1d, target_sample_rate), global_update
                             )
 
+                    # the mean across lengths stays for continuity with earlier runs; read
+                    # the per-length curves above to tell extrapolation from overall quality
                     metric_log = {f"gen/{k}": sum(v) / len(v) for k, v in scores.items() if len(v) > 0}
                     self.accelerator.log(metric_log, step=global_update)
                     if self.logger == "tensorboard":
