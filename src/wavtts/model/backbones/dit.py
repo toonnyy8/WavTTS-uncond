@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from x_transformers.x_transformers import RotaryEmbedding
 
 from wavtts.model.modules import (
     AdaLayerNorm_Final,
@@ -102,6 +103,8 @@ class DiT(nn.Module):
             self.register_buffer(
                 "synthesis_window", torch.hann_window(self.patch_len, periodic=True), persistent=False
             )
+
+        self.rotary_embed = RotaryEmbedding(dim_head)
 
         self.time_embed = TimestepEmbedding(dim)
         self.state_embed = nn.Embedding(NUM_STATES, dim)
@@ -251,7 +254,7 @@ class DiT(nn.Module):
         x, token_mask, _token_lens = self._wav_to_tokens(x, mask=mask, lens=lens)
         mask = token_mask
 
-        batch = x.shape[0]
+        batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
             time = time.repeat(batch)
 
@@ -270,16 +273,15 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = h
 
-        # NoPE: there is no positional encoding here at all. Long-range position comes
-        # from the bidirectional causal masks inside the attention (a query can tell
-        # where it sits from how much it can see), local position from the input
-        # embedding's ConvPositionEmbedding.
+        # contiguous positions; a [1, n, d] freqs every block broadcasts over the batch
+        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+
         for block in self.transformer_blocks:
             if self.checkpoint_activations:
                 # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
-                h = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), h, t, mask, use_reentrant=False)
+                h = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), h, t, mask, rope, use_reentrant=False)
             else:
-                h = block(h, t, mask=mask)
+                h = block(h, t, mask=mask, rope=rope)
 
         if self.long_skip_connection is not None:
             h = self.long_skip_connection(torch.cat((h, residual), dim=-1))

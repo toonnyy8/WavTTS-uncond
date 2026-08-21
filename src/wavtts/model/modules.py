@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 from torch import nn
+from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
 # sinusoidal position embedding
@@ -188,15 +189,16 @@ class Attention(nn.Module):
             raise ValueError(f"Unimplemented qk_norm: {qk_norm}")
 
         self.to_out = nn.ModuleList([])
-        # every head produces a past and a future aggregation and they are concatenated,
-        # so the output projection sees twice the width and can weight the two directions
-        # per channel. Summing them instead would fix the ratio at 1:1 and waste the
-        # second attention pass.
-        self.to_out.append(nn.Linear(self.inner_dim * 2, dim))
+        self.to_out.append(nn.Linear(self.inner_dim, dim))
         self.to_out.append(nn.Dropout(dropout))
 
-    def forward(self, x: float["b n d"], mask: bool["b n"] | None = None) -> torch.Tensor:
-        return self.processor(self, x, mask=mask)
+    def forward(
+        self,
+        x: float["b n d"],
+        mask: bool["b n"] | None = None,
+        rope=None,  # rotary position embedding
+    ) -> torch.Tensor:
+        return self.processor(self, x, mask=mask, rope=rope)
 
 
 # Attention processor
@@ -211,71 +213,28 @@ class AttnProcessor:
         self.attn_mask_enabled = attn_mask_enabled
         self.logn_ref_len = logn_ref_len
 
-    def _logn_factor(self, visible: torch.Tensor) -> torch.Tensor:
-        """Per-query entropy-invariant multiplier for a given count of visible keys.
+    def _logit_scale(self, seq_len: int) -> float:
+        """Entropy-invariant attention temperature, folded into the softmax scale.
 
         Entropy invariance (Su, 2021): softmax entropy grows with the number of keys, so
-        `log_m(n)` holds it steady as n moves. Under a causal mask the count differs per
-        query — query `i` sees `i + 1` keys looking back and `lens - i` looking forward —
-        so the multiplier is a vector, not a scalar.
+        `log_m(n)` holds it steady as n moves. Every query attends over the same `n` here,
+        so one scalar covers the whole batch.
 
         Clamped at 1: the job is to sharpen attention on sequences longer than the
         reference, never to flatten it on shorter ones, which is how the reference
         implementations (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46,
         pushing a 40-key softmax toward uniform for no reason.
         """
-        return (visible.clamp(min=2.0).log() / math.log(self.logn_ref_len)).clamp(min=1.0)
-
-    def _bidir_causal(self, query, key, value, mask, base_scale):
-        """Causal attention run over the past and over the future, then concatenated.
-
-        With no positional encoding the causal mask is the only thing that breaks
-        permutation symmetry, and it is what lets the model recover position at all
-        (Kazemnejad et al., 2023): a query can tell where it sits from how much it can
-        see. Running the mask both ways restores the bidirectional context a
-        non-autoregressive denoiser needs, while each direction keeps that signal.
-
-        Entropy invariance is applied per query from each direction's own visible count,
-        folded into the query rows since `scaled_dot_product_attention` only takes a
-        scalar `scale`.
-
-        This cannot weight past against future *per query*: the two directions are
-        normalized by separate softmaxes, so `to_out` can only learn a static weighting.
-        Content-dependent weighting needs one softmax spanning both sides, which is plain
-        full attention — and that destroys the position signal this is built on.
-        """
-        n = query.shape[-2]
-        idx = torch.arange(n, device=query.device)
-
-        q_fwd, q_bwd = query, query
-        if self.logn_ref_len:
-            lens = mask.sum(-1) if mask is not None else torch.full((query.shape[0],), n, device=query.device)
-            # looking back, query i sees keys 0..i; looking forward, keys i..lens-1
-            fwd = self._logn_factor((idx + 1).float())[None, None, :, None]
-            bwd = self._logn_factor((lens[:, None] - idx[None, :]).float())[:, None, :, None]
-            q_fwd, q_bwd = query * fwd, query * bwd
-
-        if mask is None:
-            out_fwd = F.scaled_dot_product_attention(q_fwd, key, value, is_causal=True, scale=base_scale)
-            # reversing turns "future" into "past", so the fast causal kernel serves both
-            # directions; padding would lead the reversed sequence, hence the explicit
-            # mask whenever there is any
-            out_bwd = F.scaled_dot_product_attention(
-                q_bwd.flip(-2), key.flip(-2), value.flip(-2), is_causal=True, scale=base_scale
-            ).flip(-2)
-        else:
-            keep = mask[:, None, None, :]
-            causal = idx[:, None] >= idx[None, :]
-            out_fwd = F.scaled_dot_product_attention(q_fwd, key, value, attn_mask=keep & causal, scale=base_scale)
-            out_bwd = F.scaled_dot_product_attention(q_bwd, key, value, attn_mask=keep & causal.T, scale=base_scale)
-
-        return torch.cat((out_fwd, out_bwd), dim=-1)  # every head emits 2*head_dim
+        if not self.logn_ref_len:
+            return 1.0
+        return max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
 
     def __call__(
         self,
         attn: Attention,
         x: float["b n d"],  # noised input x
         mask: bool["b n"] | None = None,
+        rope=None,  # rotary position embedding
     ) -> torch.FloatTensor:
         batch_size = x.shape[0]
 
@@ -297,9 +256,26 @@ class AttnProcessor:
         if attn.k_norm is not None:
             key = attn.k_norm(key)
 
-        attn_mask = mask if self.attn_mask_enabled else None
-        x = self._bidir_causal(query, key, value, attn_mask, 1.0 / math.sqrt(head_dim))
-        x = x.transpose(1, 2).flatten(2)  # 2*head_dim per head
+        if rope is not None:
+            freqs, xpos_scale = rope
+            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+            query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+            key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+
+        # attention temperature, folded into the softmax scale rather than the query:
+        # scaling the query would allocate another [b, h, n, d] tensor in every block
+        softmax_scale = self._logit_scale(query.shape[-2]) / math.sqrt(head_dim)
+
+        # mask e.g. an inference batch with different target durations: drop the padding
+        if self.attn_mask_enabled and mask is not None:
+            attn_mask = mask[:, None, None, :].expand(batch_size, attn.heads, query.shape[-2], key.shape[-2])
+        else:
+            attn_mask = None
+
+        x = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=softmax_scale
+        )
+        x = x.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
         x = x.to(query.dtype)
 
@@ -345,12 +321,12 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None):  # x: noised input, t: time embedding
+    def forward(self, x, t, mask=None, rope=None):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
         # attention
-        attn_output = self.attn(x=norm, mask=mask)
+        attn_output = self.attn(x=norm, mask=mask, rope=rope)
 
         # process attention output for input x
         x = x + gate_msa.unsqueeze(1) * attn_output

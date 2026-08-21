@@ -109,24 +109,19 @@ unchanged. `patch_overlap: 0` restores disjoint patches.
 
 ### Position encoding
 
-There is no positional encoding (NoPE). Attention runs one causal pass over the past and
-one over the future and concatenates them, so a query infers where it sits from how much
-it can see ([Kazemnejad et al. 2023](https://arxiv.org/abs/2305.19466)). Local relative
-position still comes from the input embedding's `ConvPositionEmbedding` (61-frame
-receptive field, 610 ms); the masks supply everything beyond that.
-
-The two directions are normalized by separate softmaxes, so `to_out` learns a static
-weighting between past and future rather than a content-dependent one. That is the price
-of the position signal: a single softmax spanning both sides is plain full attention,
-which is permutation-equivariant and carries no position at all. Concatenating rather
-than summing doubles the output projection's input width — one extra `inner_dim × dim`
-block per layer — so the projection can weight the directions per channel.
+Ordinary rotary embeddings (`x_transformers` `RotaryEmbedding`) over contiguous
+positions, with full bidirectional attention. Local relative position also comes from
+the input embedding's `ConvPositionEmbedding` (61-frame receptive field, 610 ms).
 
 **Entropy invariance** — softmax entropy grows with the number of keys, so logits are
-scaled by `max(1, log(n) / log(logn_ref_len))`. Under a causal mask the visible count
-differs per query — `i + 1` looking back, `lens - i` looking forward — so the multiplier
-is a vector folded into the query rows. The clamp matters: the job is to sharpen
-attention on sequences longer than the reference, never to flatten it on shorter ones.
+scaled by `max(1, log(n) / log(logn_ref_len))`. Every query attends over the same `n`
+under full attention, so one scalar per forward covers it, folded into the softmax scale
+rather than the query (scaling the query would allocate another `[b, h, n, d]` tensor in
+every block). The clamp matters: the job is to sharpen attention on sequences longer than
+the reference, never to flatten it on shorter ones — unclamped, a 0.4 s clip would run at
+0.46 and push a 40-key softmax toward uniform for no reason. Trained in rather than
+bolted on at inference, because this model's clips already span two orders of magnitude
+of `n`.
 
 | Key | Default | Meaning |
 |---|---|---|

@@ -1,6 +1,6 @@
-# NoPE + bidirectional causal attention, with entropy-invariant attention scaling.
-# model.name differs from the baseline run so checkpoints and TB logs stay separate —
-# the two are not resume-compatible (the output projection is twice as wide here).
+# Vanilla RoPE + full attention, with entropy-invariant attention scaling and
+# overlapping patches. model.name differs from earlier runs so checkpoints and TB logs
+# stay separate — none of them are resume-compatible with this one.
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -28,7 +28,7 @@ optim:
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
 
 model:
-  name: WavTTS_Uncond_Large_NoPE  # model name
+  name: WavTTS_Uncond_Large_RoPE  # model name
   backbone: DiT
   cfm:
     prediction: x_pred         # flow | x_pred
@@ -67,9 +67,8 @@ model:
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
-    # There is no positional encoding (NoPE). Attention runs one causal pass over the
-    # past and one over the future and concatenates them, so position is whatever a
-    # query can infer from how much it can see (Kazemnejad et al. 2023).
+    # Position comes from ordinary rotary embeddings over contiguous positions, and
+    # attention is full and bidirectional.
     logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
                              # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. At 3000
                              # every training clip sat below 1 and it never sharpened at all
