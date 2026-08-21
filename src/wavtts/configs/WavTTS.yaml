@@ -56,6 +56,11 @@ model:
     heads: 16
     dropout: 0.0
     ff_mult: 4
+    # patches overlap by `patch_overlap` samples on each side of their hop, and the
+    # output is reassembled by windowed overlap-add. 80 = half a hop, so every sample is
+    # predicted twice and patch boundaries stop being seams in the waveform. Costs one
+    # wider input and output projection; the token rate stays 100 Hz either way.
+    patch_overlap: 80        # samples into each neighbour; 0 = disjoint patches
     qk_norm: null  # null | rms_norm
     attn_mask_enabled: False
     checkpoint_activations: False  # recompute activations and save memory for extra compute

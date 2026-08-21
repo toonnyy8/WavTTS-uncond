@@ -48,6 +48,7 @@ model:
     heads: 6
     dropout: 0.0
     ff_mult: 4
+    patch_overlap: 80      # see WavTTS.yaml
     qk_norm: null  # null | rms_norm
     attn_mask_enabled: False
     checkpoint_activations: False
