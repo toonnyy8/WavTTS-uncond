@@ -1,6 +1,6 @@
-# Vanilla RoPE + full attention, with entropy-invariant attention scaling and
-# overlapping patches. model.name differs from earlier runs so checkpoints and TB logs
-# stay separate — none of them are resume-compatible with this one.
+# The original WavTTS-Uncond architecture: vanilla RoPE, full bidirectional attention,
+# disjoint 160-sample patches. The only addition is entropy-invariant attention scaling.
+# model.name differs from earlier runs so checkpoints and TB logs stay separate.
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
