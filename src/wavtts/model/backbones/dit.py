@@ -34,7 +34,7 @@ NUM_STATES = 2
 class InputEmbedding(nn.Module):
     def __init__(
         self,
-        patch_len,
+        wav_frame_len,
         out_dim,
         use_audio_proj: bool = False,
         audio_proj_dim: int | None = None,
@@ -45,12 +45,12 @@ class InputEmbedding(nn.Module):
         self.use_audio_proj = use_audio_proj
 
         if not use_audio_proj:
-            self.proj = nn.Linear(patch_len, out_dim)
+            self.proj = nn.Linear(wav_frame_len, out_dim)
         else:
             audio_proj_dim = out_dim if audio_proj_dim is None else audio_proj_dim
             audio_proj_hidden = audio_proj_dim if audio_proj_hidden is None else audio_proj_hidden
             self.x_proj = nn.Sequential(
-                nn.Linear(patch_len, audio_proj_hidden, bias=False),
+                nn.Linear(wav_frame_len, audio_proj_hidden, bias=False),
                 nn.Linear(audio_proj_hidden, audio_proj_dim),
             )
             self.fuse = nn.Linear(audio_proj_dim, out_dim)
@@ -79,8 +79,7 @@ class DiT(nn.Module):
         dim_head=64,
         dropout=0.1,
         ff_mult=4,
-        wav_frame_len=160,  # hop between patches; also the frame rate the dataset batches on
-        patch_overlap=0,  # samples each patch reaches into either neighbour; 0 = disjoint patches
+        wav_frame_len=160,
         qk_norm=None,
         attn_mask_enabled=False,
         long_skip_connection=False,
@@ -92,24 +91,12 @@ class DiT(nn.Module):
     ):
         super().__init__()
 
-        if patch_overlap < 0 or 2 * patch_overlap > wav_frame_len:
-            # beyond half a hop a sample would land in more than two patches at once, and
-            # the analysis window would carry more of its neighbours than of itself
-            raise ValueError(f"patch_overlap must be in [0, {wav_frame_len // 2}], got {patch_overlap}")
-        self.patch_overlap = int(patch_overlap)
-        self.patch_len = wav_frame_len + 2 * self.patch_overlap
-        if self.patch_overlap:
-            # not persistent: derived from patch_len, so it never belongs in a checkpoint
-            self.register_buffer(
-                "synthesis_window", torch.hann_window(self.patch_len, periodic=True), persistent=False
-            )
-
         self.rotary_embed = RotaryEmbedding(dim_head)
 
         self.time_embed = TimestepEmbedding(dim)
         self.state_embed = nn.Embedding(NUM_STATES, dim)
         self.input_embed = InputEmbedding(
-            self.patch_len,
+            wav_frame_len,
             dim,
             use_audio_proj=use_audio_proj,
             audio_proj_dim=audio_proj_dim,
@@ -137,8 +124,8 @@ class DiT(nn.Module):
         self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
 
         self.norm_out = AdaLayerNorm_Final(dim)  # final modulation
-        self.proj_out_dim = self.patch_len
-        self.proj_out = nn.Linear(dim, self.patch_len)
+        self.proj_out_dim = wav_frame_len
+        self.proj_out = nn.Linear(dim, wav_frame_len)
         self.proj_out_output_layer = self.proj_out
 
         self.checkpoint_activations = checkpoint_activations
@@ -167,10 +154,10 @@ class DiT(nn.Module):
     def set_wav_frame_len(self, wav_frame_len: int):
         self.wav_frame_len = int(wav_frame_len)
 
-        if self.wav_frame_len + 2 * self.patch_overlap != self.proj_out_dim:
+        if self.wav_frame_len != self.proj_out_dim:
             raise ValueError(
-                f"wav_frame_len ({self.wav_frame_len}) + 2*patch_overlap ({self.patch_overlap}) must equal "
-                f"proj_out_dim ({self.proj_out_dim}) for the wav front-end."
+                f"wav_frame_len ({self.wav_frame_len}) must equal proj_out_dim ({self.proj_out_dim}) "
+                "for reshape wav front-end."
             )
 
     def _wav_to_tokens(
@@ -179,56 +166,32 @@ class DiT(nn.Module):
         mask: torch.Tensor | None = None,
         lens: torch.Tensor | None = None,
     ):
-        """One token per `wav_frame_len` hop, each reading `patch_overlap` into its neighbours."""
         assert wav.ndim == 2, f"Expected [B, N] wav input, got {tuple(wav.shape)}"
 
         bsz, num_samples = wav.shape
-        hop = self.wav_frame_len
-        pad_len = (hop - (num_samples % hop)) % hop
+        frame_len = self.wav_frame_len
+        pad_len = (frame_len - (num_samples % frame_len)) % frame_len
 
         if pad_len > 0:
             wav = F.pad(wav, (0, pad_len), value=0.0)
             if mask is not None:
                 mask = F.pad(mask, (0, pad_len), value=False)
 
-        # mask and lengths stay hop-aligned whatever the overlap, so the token count and
-        # what counts as padding are the same as with disjoint patches
-        token_mask = mask.view(bsz, -1, hop).any(dim=-1) if mask is not None else None
-        token_lens = (lens.to(dtype=torch.long, device=wav.device) + hop - 1) // hop if lens is not None else None
+        tokens = wav.view(bsz, -1, frame_len)
 
-        o = self.patch_overlap
-        if o == 0:
-            tokens = wav.view(bsz, -1, hop)
-        else:
-            # padding both ends by `o` centres patch i on its own hop, so the first and
-            # last patches reach into silence rather than being shifted inward
-            tokens = F.pad(wav, (o, o), value=0.0).unfold(1, self.patch_len, hop)
+        token_mask = None
+        if mask is not None:
+            token_mask = mask.view(bsz, -1, frame_len).any(dim=-1)
+
+        token_lens = None
+        if lens is not None:
+            token_lens = (lens.to(dtype=torch.long, device=wav.device) + frame_len - 1) // frame_len
 
         return tokens, token_mask, token_lens
 
     def _tokens_to_wav(self, tokens: torch.Tensor, target_num_samples: int):
-        if self.patch_overlap == 0:
-            return tokens.reshape(tokens.shape[0], -1)[:, :target_num_samples]
-
-        bsz, num_tokens, patch_len = tokens.shape
-        hop, o = self.wav_frame_len, self.patch_overlap
-        padded_len = (num_tokens - 1) * hop + patch_len  # == num_tokens * hop + 2 * o
-
-        def fold(x):
-            return F.fold(x, output_size=(1, padded_len), kernel_size=(1, patch_len), stride=(1, hop))
-
-        # Weighted overlap-add. Folding the windowed patches sums them; folding the window
-        # alone gives the weight each output sample actually received, so the ratio is an
-        # exact weighted mean. That is what handles the edges: the outermost `o` samples
-        # are reached by only one patch, at the taper of its window, and a plain COLA sum
-        # would leave them attenuated. Dividing by the true envelope restores full
-        # amplitude there instead of fading the clip in and out.
-        window = self.synthesis_window.to(tokens.dtype)
-        numer = fold((tokens * window).transpose(1, 2)).reshape(bsz, padded_len)
-        envelope = fold(self.synthesis_window[None, :, None].expand(1, patch_len, num_tokens))
-        envelope = envelope.reshape(1, padded_len).clamp(min=1e-8).to(tokens.dtype)
-
-        return (numer / envelope)[:, o : o + target_num_samples]
+        wav = tokens.reshape(tokens.shape[0], -1)
+        return wav[:, :target_num_samples]
 
     def ckpt_wrapper(self, module):
         # https://github.com/chuanyangjin/fast-DiT/blob/main/models.py

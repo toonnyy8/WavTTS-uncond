@@ -82,31 +82,6 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 | `ckpts.log_samples_secs` | [5, 15, 30, 60] | one clip length per seed; 60 s is past the 30 s training maximum |
 | `ckpts.spk_ckpt_path` | null | ECAPA (WavLM-large) ckpt enabling `gen/spk_sim_self` |
 
-### Waveform front-end
-
-The model reads and writes raw 16 kHz audio as patches on a 160-sample hop (100 Hz
-tokens). Patches are not disjoint: each reaches `patch_overlap` samples into either
-neighbour, so with the default 80 every sample is predicted twice and a patch boundary
-is no longer a seam the model has to stitch by itself.
-
-The output is reassembled by **windowed overlap-add**. Each predicted patch is multiplied
-by a Hann window and summed into place; the window alone is summed the same way to give
-the weight each output sample actually received, and the two are divided. That ratio is
-an exact weighted mean, which is what handles the edges: the first and last `patch_overlap`
-samples of a clip are reached by one patch only, at the taper of its window, so a plain
-COLA sum would fade the clip in and out. Dividing by the true envelope restores them to
-full amplitude. With an identity model the round trip is exact to float precision at
-every position, boundaries included.
-
-Cost is one wider input projection and one wider output projection (`patch_len` instead
-of `wav_frame_len`); the token rate, the mask, and the frame-budget batching are
-unchanged. `patch_overlap: 0` restores disjoint patches.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `waveform.wav_frame_len` | 160 | hop between patches (100 Hz at 16 kHz) |
-| `arch.patch_overlap` | 80 | samples each patch reaches into either neighbour; at most half a hop |
-
 ### Position encoding
 
 Ordinary rotary embeddings (`x_transformers` `RotaryEmbedding`) over contiguous
