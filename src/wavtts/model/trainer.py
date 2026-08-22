@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from wavtts.model import CFM
 from wavtts.model.dataset import DynamicBatchSampler, collate_fn
-from wavtts.model.utils import default, exists
+from wavtts.model.utils import default, exists, peak_normalize
 
 
 def pair_sample_lengths(seeds: list[int], secs: list[float] | None) -> list[float]:
@@ -516,9 +516,12 @@ class Trainer:
                     scores = {k: [] for k in keys}
                     for (gen_seed, gen_sec), gen_audio in gen_audios.items():
                         tag = f"{gen_sec:g}s_seed{gen_seed}"
+                        # the model generates at target_rms, which is well outside +-1;
+                        # only the file and the TB audio get scaled, never the metrics
+                        file_audio = peak_normalize(gen_audio)
                         torchaudio.save(
                             f"{log_samples_path}/update_{global_update}_{tag}.wav",
-                            gen_audio,
+                            file_audio,
                             target_sample_rate,
                         )
                         wav_1d = gen_audio[0]
@@ -539,7 +542,7 @@ class Trainer:
                             for k, v in clip_log.items():
                                 self.writer.add_scalar(k, v, global_update)
                             self.writer.add_audio(
-                                f"gen/audio_{tag}", gen_audio, global_update, sample_rate=target_sample_rate
+                                f"gen/audio_{tag}", file_audio, global_update, sample_rate=target_sample_rate
                             )
                             self.writer.add_figure(
                                 f"gen/mel_{tag}", mel_figure(wav_1d, target_sample_rate), global_update

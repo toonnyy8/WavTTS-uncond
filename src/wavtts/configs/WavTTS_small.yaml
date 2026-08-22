@@ -29,7 +29,7 @@ model:
     P_mean: -0.8
     P_std: 0.8
     t_eps: 0.02
-    latents_scale: 9.0
+    latents_scale: 1.0
     use_aux_mel_loss: True
     aux_mel_loss_weight: 0.05
     sample_rate: 16000
@@ -58,7 +58,7 @@ model:
   waveform:
     target_sample_rate: 16000
     wav_frame_len: 160    # 160 @16k = 100Hz
-    target_rms: 0.1       # per-utterance loudness normalization at load time; 0 disables
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
 
 ckpts:
   logger: tensorboard  # wandb | tensorboard | null

@@ -71,7 +71,7 @@ def make_model(use_aux_mel_loss=False, **kwargs):
         use_aux_mel_loss=use_aux_mel_loss,
         aux_mel_loss_weight=0.05,
         sample_rate=16000,
-        latents_scale=9.0,
+        latents_scale=1.0,
     )
     defaults.update(kwargs)
     return CFM(transformer=transformer, **defaults)
@@ -234,12 +234,14 @@ def test_dataset_normalizes_loudness(tmp_path):
         torchaudio.save(str(path), wav.unsqueeze(0), 16000)
         rows.append({"audio_path": str(path), "duration": 1.0})
 
-    ds = CustomDataset(rows, durations=[1.0] * len(rows), target_rms=0.1)
-    for i in range(len(rows)):
+    ds = CustomDataset(rows, durations=[1.0] * len(rows), target_rms=1.0)
+    for i, name in enumerate(signals):
         wav = ds[i]["wav"]
-        assert wav.abs().max() <= 0.99 + 1e-6
-        rms = wav.pow(2).mean().sqrt().item()
-        assert rms == pytest.approx(0.1, abs=0.02) or wav.abs().max() == pytest.approx(0.99, abs=1e-3)
+        # every clip lands exactly on target, the peaky one included: there is no peak
+        # clamp to hand a fraction of the corpus its loudness back
+        assert wav.pow(2).mean().sqrt().item() == pytest.approx(1.0, rel=1e-5), name
+    # and the waveform is expected to leave +-1 -- the impulse train's crest factor is 20
+    assert ds[2]["wav"].abs().max().item() > 1.0
 
     off = CustomDataset(rows, durations=[1.0] * len(rows), target_rms=0.0)
     assert off[0]["wav"].pow(2).mean().sqrt().item() == pytest.approx(0.8 / 2**0.5, abs=0.01)
@@ -423,10 +425,16 @@ def test_signal_metrics():
     silent = torch.zeros(16000)
     assert silence_ratio(silent) == 1.0
     assert clipping_rate(silent) == 0.0
-    loud = torch.ones(16000)
-    assert silence_ratio(loud) == 0.0
-    assert clipping_rate(loud) == 1.0
-    assert abs(rms(loud) - 1.0) < 1e-6
+
+    flat = torch.ones(16000)  # DC: the least peaky signal there is, crest factor 1
+    assert silence_ratio(flat) == 0.0
+    assert clipping_rate(flat) == 0.0
+    assert abs(rms(flat) - 1.0) < 1e-6
+
+    # clipping_rate now reads crest factor, so it takes a genuine spike to move it
+    spiky = torch.full((16000,), 0.01)
+    spiky[:16] = 1.0
+    assert clipping_rate(spiky) == pytest.approx(16 / 16000)
 
 
 def test_mel_figure():
@@ -598,3 +606,40 @@ def test_padding_is_masked_out_of_the_softmax():
         x2[:, 5:] += 10.0  # only the padded frames change
         out2 = attn(x2, mask=mask)
     assert torch.allclose(out[:, :5], out2[:, :5], atol=1e-5)
+
+
+# --- waveform scale ------------------------------------------------------------
+
+
+def test_peak_normalize_only_scales_down():
+    from wavtts.model.utils import peak_normalize
+
+    loud = torch.randn(1, 4000) * 3.0  # training scale: peak well outside +-1
+    out = peak_normalize(loud)
+    assert out.abs().max().item() == pytest.approx(0.99, abs=1e-6)
+    # shape preserved, only gain changed
+    assert torch.allclose(out / out.abs().max(), loud / loud.abs().max(), atol=1e-6)
+
+    quiet = torch.randn(1, 4000) * 0.01  # already inside: loudness must survive
+    assert torch.equal(peak_normalize(quiet), quiet)
+    assert torch.equal(peak_normalize(torch.zeros(1, 100)), torch.zeros(1, 100))
+
+
+def test_signal_metrics_are_scale_invariant():
+    """target_rms is a config knob, so a metric keyed to an absolute level breaks
+    silently the moment it moves. These must read the same at any gain."""
+    from wavtts.train.metrics import clipping_rate, silence_ratio
+
+    torch.manual_seed(0)
+    wav = torch.randn(16000)
+    wav[:4000] *= 1e-4  # a stretch quiet enough to count as silence
+    wav[9000] = wav.abs().max() * 30  # one spike, well past any sane crest factor
+
+    for gain in (0.1, 1.0, 9.0):  # the old domain, the new one, and an absurd one
+        assert silence_ratio(wav * gain) == pytest.approx(silence_ratio(wav), rel=1e-9)
+        assert clipping_rate(wav * gain) == pytest.approx(clipping_rate(wav), rel=1e-9)
+    assert clipping_rate(wav) > 0.0  # the spike is actually caught
+    assert silence_ratio(wav) > 0.0
+
+    assert silence_ratio(torch.zeros(16000)) == 1.0  # degenerate input, no divide by zero
+    assert clipping_rate(torch.zeros(16000)) == 0.0

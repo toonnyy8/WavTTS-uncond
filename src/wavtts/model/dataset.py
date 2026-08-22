@@ -66,14 +66,17 @@ class CustomDataset(Dataset):
             audio = self._resamplers[source_sample_rate](audio)
 
         # loudness: every utterance enters training at the same RMS, so the equal-power
-        # mixing augmentation blends two comparable sources instead of one drowning the other
+        # mixing augmentation blends two comparable sources instead of one drowning the
+        # other. No peak guard: speech runs a crest factor around 7, so clamping to
+        # +-0.99 at target_rms 1.0 would fire on every clip and hand back exactly the
+        # per-clip loudness this is here to remove. At the old target_rms of 0.1 it still
+        # fired on a fifth of the corpus, pulling those clips as low as 0.052. The
+        # waveform leaves the +-1 domain deliberately; peak_normalize() is what anything
+        # writing it to a file or feeding a pretrained model calls first.
         if self.target_rms > 0:
             rms = audio.pow(2).mean().sqrt()
             if rms > 1e-5:
                 audio = audio * (self.target_rms / rms)
-            peak = audio.abs().max()
-            if peak > 0.99:  # ponytail: rescale, not clip — keeps the waveform shape
-                audio = audio * (0.99 / peak)
 
         return {
             "wav": audio.squeeze(0),

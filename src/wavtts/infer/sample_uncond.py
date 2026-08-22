@@ -10,6 +10,7 @@ from hydra.utils import get_class
 from omegaconf import OmegaConf
 
 from wavtts.model import CFM
+from wavtts.model.utils import peak_normalize
 
 
 def load_model(ckpt_path: str, cfg, device: str) -> CFM:
@@ -75,7 +76,9 @@ def main(argv: list[str] | None = None):
 
     for i in range(args.num):
         out_path = os.path.join(args.out_dir, f"sample_{i}.wav")
-        torchaudio.save(out_path, wavs[i : i + 1].to(torch.float32).cpu(), sr)
+        # the model generates at target_rms, outside +-1; a file has to come back inside
+        wav = peak_normalize(wavs[i : i + 1].to(torch.float32).cpu())
+        torchaudio.save(out_path, wav, sr)
         print(f"saved {out_path}")
 
 
