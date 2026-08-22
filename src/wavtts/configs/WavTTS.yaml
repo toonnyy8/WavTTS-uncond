@@ -58,7 +58,7 @@ model:
     dropout: 0.0
     ff_mult: 4
     qk_norm: null  # null | rms_norm
-    attn_mask_enabled: False
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
     checkpoint_activations: False  # recompute activations and save memory for extra compute
     use_audio_proj: True
     audio_proj_dim: 1024
