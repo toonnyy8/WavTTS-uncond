@@ -23,7 +23,6 @@ from wavtts.model.modules import (
 from wavtts.model.rope import (
     YaRNRotaryEmbedding,
     randomized_positions,
-    yarn_attention_factor,
     yarn_inv_freq,
 )
 
@@ -155,7 +154,6 @@ class DiT(nn.Module):
                     attn_backend=attn_backend,
                     attn_mask_enabled=attn_mask_enabled,
                     logn_ref_len=logn_ref_len,
-                    attn_temperature=yarn_attention_factor(yarn_scale) if rope_type == "yarn" else 1.0,
                     attn_mode=attn_mode,
                 )
                 for _ in range(depth)
@@ -204,8 +202,9 @@ class DiT(nn.Module):
         """Retune YaRN to an inference scale `s'`.
 
         The paper trains at `s` and infers at `s' >= s`; `s' > s` reaches past
-        `s * native_ctx`. Frequencies and attention temperature both depend on the
-        scale, so both are rebuilt here — no parameters change.
+        `s * native_ctx`. Only the frequencies are rebuilt — no parameters change, and
+        the attention temperature stays put: it tracks `n`, not the spectrum. See
+        `rope.py` for why YaRN's `s`-dependent temperature is not implemented.
         """
         if self.rope_type != "yarn":
             raise ValueError(f"set_yarn_scale requires rope_type='yarn', got {self.rope_type!r}")
@@ -216,8 +215,6 @@ class DiT(nn.Module):
         )
         self.rotary_embed.inv_freq = inv_freq.to(self.rotary_embed.inv_freq.device)
         self.rotary_embed.scale = self.yarn_scale
-        for block in self.transformer_blocks:
-            block.attn.processor.attn_temperature = yarn_attention_factor(self.yarn_scale)
 
     def _wav_to_tokens(
         self,

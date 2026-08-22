@@ -105,7 +105,7 @@ Su 的原始 formulation 與 Qwen 的實作都夾 `max(1, log_m(n))`，正是因
 | 函式／類別 | 職責 |
 |---|---|
 | `yarn_inv_freq(dim, base, scale, native_ctx, alpha, beta)` | NTK-by-parts 插值後的 inverse frequencies |
-| `yarn_attention_factor(scale)` | `0.1·ln(s) + 1`，`s ≤ 1` 時回 1.0 |
+| ~~`yarn_attention_factor(scale)`~~ | 已移除；`0.1·ln(s)+1` 是把 `n` 偽裝成 `s` 的熵補償，與熵不變性重複計算，且頻譜內插本身不動 logit 尺度 |
 | `YaRNRotaryEmbedding` | 與 x_transformers `RotaryEmbedding` 同介面，`forward` 收任意位置張量 |
 | `randomized_positions(batch, seq_len, max_len, device, per_sample)` | 排序後的不重複隨機位置 |
 | `rpe_max_len(mode, seq_len, length_scale, native_ctx)` | 單一 batch 的 `L_t` |
@@ -115,8 +115,8 @@ Su 的原始 formulation 與 Qwen 的實作都夾 `max(1, log_m(n))`，正是因
 任意位置張量——**per-sample 隨機位置不需要動 attention 任何一行**。
 
 - `backbones/dit.py`：依 config 選 rope 型別；forward 內建位置；
-  `set_rpe_length_scale()`（課程）與 `set_yarn_scale()`（推論期 `s'`，重建 inv_freq
-  與 attention temperature，不動任何參數）。
+  `set_rpe_length_scale()`（課程）與 `set_yarn_scale()`（推論期 `s'`，只重建 inv_freq，
+  不動任何參數，也不動 attention temperature）。
 - `modules.py`：`AttnProcessor._logit_scale()` 把 logn 與 YaRN temperature 合成一個乘數，
   **折進 SDPA 的 `scale` 參數**而非乘在 query 上——後者會在 28 個 block 裡各配置一個
   `[b, h, n, d]` 新張量。`flash_attn` 路徑走 `softmax_scale`，兩個 backend 等價。
@@ -255,7 +255,8 @@ uv run python src/wavtts/infer/sample_uncond.py \
 `tests/test_uncond_smoke.py` 追加（總計 36 個測試，純 CPU、不依賴資料集）：
 
 - YaRN 頻率：最高頻維度不動、最低頻維度整個除以 `s`、中間 ramp 單調；`s=1` 等於原始 RoPE。
-- `yarn_attention_factor`：`s=1` 回 1.0。
+- 頻譜內插不動 logit 尺度：vanilla 與 `s=4` 的 logit std 相同，isotropic 與 anisotropic
+  q/k 皆然。這是移除 `yarn_attention_factor` 的依據。
 - 隨機位置：嚴格遞增（順序保留、無重複）、落在範圍內、per-sample 各不相同、
   `per_sample=False` 回 `[1, n]`、無空間可攤時退回連續位置。
 - `rpe_max_len` 三種模式與未知模式拒絕。

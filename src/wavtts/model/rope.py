@@ -9,7 +9,7 @@ Follows "Randomized YaRN Improves Length Generalization for Long-Context Reasoni
      `randperm(L_t)[:n].sort()` instead of `arange(n)`, so a short clip still shows
      the model rotations it would only meet in a long one. Training only.
 
-Two deliberate deviations from the paper:
+Three deliberate deviations from the paper:
 
 `L_t` is a multiple of each sample's own length, not a fixed constant. Their sequences
 all sit near the training cap, so a fixed `L_t` stretches every sample about equally.
@@ -25,6 +25,18 @@ sequence again once the schedule leaves k=1. A random upper bound makes it a pro
 of the *sample*, so from the first update every batch contains rows at every stretch
 from contiguous to gamma. That also removes a discrete regime change from the middle
 of training, which is one less thing for a weight average to straddle.
+
+YaRN's attention temperature `sqrt(1/t) = 0.1*ln(s) + 1` is not implemented. It is
+fitted where `n = s * native_ctx`, so `ln(s) = ln(n) - ln(native_ctx)` — a function of
+n parameterized by s, which is the entropy-invariant scaling in `modules.py` measured
+against a coarser proxy. Running both double-counts. Nor does it compensate the
+interpolated spectrum: RoPE rotation is block-orthogonal, `logit(i,j) = q_i .
+R(theta_j - theta_i) k_j`, so squashing the frequencies changes which distance maps to
+which angle but never the logit scale. Measured on random q/k at n=3000, vanilla vs
+s=4: ratio 0.9999 isotropic, 1.0002 with a 15x per-dim anisotropy standing in for
+trained weights, against the 1.2965 the formula prescribes. Fine-tuning a model
+across a spectrum change may still want a correction; measure it on that checkpoint
+rather than reusing this constant.
 
 Outputs follow the x_transformers rotary contract — `(freqs, scale)` consumable by
 `apply_rotary_pos_emb`, which already broadcasts a per-sample `[b, n, d]` freqs.
@@ -71,15 +83,6 @@ def yarn_inv_freq(
     ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(0, 1)
     extrapolation_weight = 1 - ramp
     return inv_freq_interpolation * (1 - extrapolation_weight) + inv_freq_extrapolation * extrapolation_weight
-
-
-def yarn_attention_factor(scale: float) -> float:
-    """YaRN's length-dependent attention temperature, `sqrt(1/t) = 0.1*ln(s) + 1`.
-
-    Applied to both query and key in the reference implementation, so the logits
-    end up scaled by its square.
-    """
-    return 0.1 * math.log(scale) + 1.0 if scale > 1.0 else 1.0
 
 
 class YaRNRotaryEmbedding(nn.Module):

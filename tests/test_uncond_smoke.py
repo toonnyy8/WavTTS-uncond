@@ -382,11 +382,38 @@ def test_yarn_inv_freq_interpolates_only_slow_dims():
     assert torch.allclose(yarn_inv_freq(dim, base, 1.0, native), 1.0 / base ** (torch.arange(0, dim, 2) / dim))
 
 
-def test_yarn_attention_factor():
-    from wavtts.model.rope import yarn_attention_factor
+def test_interpolating_the_spectrum_does_not_move_the_logit_scale():
+    """Why YaRN's `0.1*ln(s) + 1` attention temperature is deliberately absent.
 
-    assert yarn_attention_factor(1.0) == 1.0  # no scaling, no temperature change
-    assert yarn_attention_factor(4.0) == pytest.approx(0.1 * torch.tensor(4.0).log().item() + 1.0)
+    A rotary embedding rotates each 2-dim pair, so `logit(i,j) = q_i . R(dtheta) k_j`
+    with `R` orthogonal: squashing the frequencies changes which distance maps to which
+    angle, never the magnitude. Anything left for a temperature to fix is a function of
+    the key count, which is entropy invariance's job.
+    """
+    from wavtts.model.rope import yarn_inv_freq
+
+    dim, n = 64, 512
+    torch.manual_seed(0)
+
+    def logit_std(inv_freq, q, k):
+        pos = torch.arange(n, dtype=torch.float32)
+        f = torch.einsum("i,j->ij", pos, inv_freq)
+        f = torch.stack((f, f), -1).flatten(-2)
+        c, s = f[..., 0::2].cos(), f[..., 0::2].sin()
+
+        def rot(x):
+            x1, x2 = x[..., 0::2], x[..., 1::2]
+            return torch.stack((x1 * c - x2 * s, x1 * s + x2 * c), -1).flatten(-2)
+
+        return (rot(q) @ rot(k).T).std().item()
+
+    vanilla = 1.0 / (10000.0 ** (torch.arange(0, dim, 2).float() / dim))
+    yarn = yarn_inv_freq(dim, 10000.0, 4.0, 3000)
+
+    # isotropic q/k stands in for init, the anisotropic pair for trained weights
+    for scale in (torch.ones(dim), torch.linspace(3.0, 0.2, dim)):
+        q, k = torch.randn(n, dim) * scale, torch.randn(n, dim) * scale
+        assert logit_std(vanilla, q, k) == pytest.approx(logit_std(yarn, q, k), rel=2e-3)
 
 
 def test_randomized_positions_sorted_unique_and_in_range():
@@ -482,16 +509,17 @@ def test_rpe_is_training_only_and_changes_output():
     assert not torch.allclose(a, b)  # fresh random bounds and positions every training forward
 
 
-def test_set_yarn_scale_retunes_freqs_and_temperature():
+def test_set_yarn_scale_retunes_freqs_only():
     torch.manual_seed(0)
     dit = _yarn_dit()
     before = dit.rotary_embed.inv_freq.clone()
+    proc = dit.transformer_blocks[0].attn.processor
+    temperature_before = proc._logit_scale(1000)
 
     dit.set_yarn_scale(4.0)
     assert not torch.allclose(dit.rotary_embed.inv_freq, before)
-    assert dit.transformer_blocks[0].attn.processor.attn_temperature == pytest.approx(
-        0.1 * torch.tensor(4.0).log().item() + 1.0
-    )
+    # s' retunes the spectrum and nothing else; the temperature tracks n, not s
+    assert proc._logit_scale(1000) == pytest.approx(temperature_before)
 
     with pytest.raises(ValueError):
         _yarn_dit(rope_type="default").set_yarn_scale(4.0)

@@ -332,7 +332,6 @@ class AttnProcessor:
         attn_backend: str = "torch",  # "torch" or "flash_attn"
         attn_mask_enabled: bool = True,
         logn_ref_len: int | None = None,  # entropy-invariant scaling reference; None disables
-        attn_temperature: float = 1.0,  # YaRN attention factor, 1.0 disables
         attn_mode: str = "full",  # "full" | "bidir_causal" | "bidir_causal_split"
     ):
         if attn_mode not in ("full", "bidir_causal", "bidir_causal_split"):
@@ -346,28 +345,29 @@ class AttnProcessor:
         self.attn_backend = attn_backend
         self.attn_mask_enabled = attn_mask_enabled
         self.logn_ref_len = logn_ref_len
-        self.attn_temperature = attn_temperature
         self.attn_mode = attn_mode
 
     def _logit_scale(self, seq_len: int) -> float:
-        """Multiplier folded into the query, i.e. the attention temperature.
+        """Attention temperature: entropy invariance (Su, 2021), and nothing else.
 
-        Two independent terms:
-          - entropy invariance (Su, 2021): softmax entropy grows with the number of
-            keys, so `log_m(n)` holds it steady as n moves. Clamped at 1 — the job is
-            to sharpen attention on sequences longer than the reference, never to
-            flatten it on shorter ones, which is how the reference implementations
-            (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46, pushing
-            a 40-key softmax toward uniform for no reason.
-          - YaRN's attention factor, which the reference applies to query and key
-            alike; squaring it here scales the logits identically.
+        Softmax entropy grows with the number of keys, so `log_m(n)` holds it steady as
+        n moves. Clamped at 1 — the job is to sharpen attention on sequences longer than
+        the reference, never to flatten it on shorter ones, which is how the reference
+        implementations (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46,
+        pushing a 40-key softmax toward uniform for no reason.
+
+        YaRN's own attention factor `(0.1*ln(s) + 1)^2` is deliberately absent. It is
+        fitted where `n = s * native_ctx`, so `ln(s) = ln(n) - ln(native_ctx)`: a
+        function of n wearing s as a disguise, which is the correction above measured
+        against a coarser proxy. Composing the two double-counts (1.30 x 1.29 = 1.67 at
+        30 s when either alone asks for ~1.29). It has no frequency-side job either —
+        RoPE rotation is block-orthogonal, so swapping the spectrum at fixed n leaves
+        the logit scale untouched (measured: 1.0002 for anisotropic q/k, against the
+        1.2965 the formula prescribes). See git history for the measurement.
         """
-        scale = 1.0
-        if self.logn_ref_len:
-            scale *= max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
-        if self.attn_temperature != 1.0:
-            scale *= self.attn_temperature**2
-        return scale
+        if not self.logn_ref_len:
+            return 1.0
+        return max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
 
     def _logn_factor(self, visible: torch.Tensor) -> torch.Tensor:
         """Per-query entropy-invariant multiplier for a given count of visible keys.
@@ -495,10 +495,9 @@ class AttnProcessor:
 
         if self.attn_mode != "full":
             # entropy invariance is per query here, so it rides on the query instead of
-            # the scalar scale; keep the YaRN temperature (if any) in the scalar
-            temp = self.attn_temperature**2 if self.attn_temperature != 1.0 else 1.0
+            # the scalar scale, which leaves nothing but 1/sqrt(d) to pass down
             attn_mask = mask if self.attn_mask_enabled else None
-            x = self._bidir_causal(query, key, value, attn_mask, temp / math.sqrt(head_dim))
+            x = self._bidir_causal(query, key, value, attn_mask, 1.0 / math.sqrt(head_dim))
             x = x.transpose(1, 2).flatten(2)  # bidir_causal emits 2*head_dim per head
 
         elif self.attn_backend == "torch":
@@ -669,7 +668,6 @@ class DiTBlock(nn.Module):
         attn_backend="torch",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
         logn_ref_len=None,
-        attn_temperature=1.0,
         attn_mode="full",
     ):
         super().__init__()
@@ -681,7 +679,6 @@ class DiTBlock(nn.Module):
                 attn_backend=attn_backend,
                 attn_mask_enabled=attn_mask_enabled,
                 logn_ref_len=logn_ref_len,
-                attn_temperature=attn_temperature,
                 attn_mode=attn_mode,
             ),
             dim=dim,
