@@ -485,6 +485,70 @@ def test_logn_scaling_sharpens_but_never_flattens():
     assert AttnProcessor()._logit_scale(4000) == 1.0  # disabled by default
 
 
+def test_logn_reads_each_sample_length_from_the_mask_not_the_padded_width():
+    """A sample's temperature must not depend on who it was batched with.
+
+    Collation pads every row to the longest in the batch, so the padded width is a
+    property of the batch, not of the clip. Taking `n` from there would give the same
+    audio a different temperature depending on its batch-mates, and a third one at
+    inference where it arrives unpadded.
+    """
+    from wavtts.model.modules import AttnProcessor
+
+    proc = AttnProcessor(logn_ref_len=100)
+    mask = torch.zeros(3, 400, dtype=torch.bool)
+    for row, real_len in enumerate((400, 200, 25)):
+        mask[row, :real_len] = True
+
+    scale = proc._logit_scale(400, mask)
+    assert scale.shape == (3,)
+    for row, real_len in enumerate((400, 200, 25)):
+        assert scale[row].item() == pytest.approx(proc._logit_scale(real_len), rel=1e-6)
+    assert scale[2].item() == pytest.approx(1.0)  # still clamped per row
+
+    # an all-true mask has to agree with the scalar form, or padding-free batches would
+    # silently change behaviour
+    full = torch.ones(2, 400, dtype=torch.bool)
+    assert proc._logit_scale(400, full)[0].item() == pytest.approx(proc._logit_scale(400), rel=1e-6)
+
+
+def test_a_padded_row_attends_as_if_it_were_alone():
+    """End-to-end: batching a short clip beside a long one must not change its output."""
+    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+
+    torch.manual_seed(0)
+    dit = DiT(
+        dim=64,
+        depth=2,
+        heads=2,
+        dim_head=32,
+        ff_mult=2,
+        wav_frame_len=160,
+        attn_mask_enabled=True,
+        logn_ref_len=100,
+    ).eval()
+    _reinit_nonzero(dit)
+
+    short, long = 160 * 30, 160 * 400  # 30 frames padded out to 400
+    torch.manual_seed(1)
+    clip = torch.randn(1, short)
+
+    with torch.no_grad():
+        alone = dit(
+            x=clip,
+            state=torch.full((1,), STATE_CLEAN, dtype=torch.long),
+            time=torch.tensor(0.5),
+            lens=torch.tensor([short]),
+        )
+        batched = dit(
+            x=torch.cat([torch.nn.functional.pad(clip, (0, long - short)), torch.randn(1, long)]),
+            state=torch.full((2,), STATE_CLEAN, dtype=torch.long),
+            time=torch.tensor(0.5),
+            lens=torch.tensor([short, long]),
+        )
+    assert torch.allclose(alone[0], batched[0, :short], atol=1e-5)
+
+
 def test_logn_reaches_the_attention_softmax():
     from wavtts.model.backbones.dit import STATE_CLEAN, DiT
 

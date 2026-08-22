@@ -213,24 +213,34 @@ class AttnProcessor:
         self.attn_mask_enabled = attn_mask_enabled
         self.logn_ref_len = logn_ref_len
 
-    def _logit_scale(self, seq_len: int) -> float:
-        """Entropy-invariant attention temperature, folded into the softmax scale.
+    def _logit_scale(self, seq_len: int, mask: torch.Tensor | None = None):
+        """Entropy-invariant attention temperature.
 
         Entropy invariance (Su, 2021): softmax entropy grows with the number of keys, so
-        `log_m(n)` holds it steady as n moves. Every query attends over the same `n` here,
-        so one scalar covers the whole batch.
+        `log_m(n)` holds it steady as n moves.
+
+        `n` is each sample's own length, taken from `mask`, not the padded width of the
+        batch. A collated batch pads every row to its longest member, and a sample's
+        temperature must not depend on who it was batched with: the same clip has to get
+        the same attention in training as at inference, where it arrives unpadded. So the
+        result is a `[b]` tensor whenever a mask is present, and a scalar only when every
+        row really is `seq_len` long.
 
         Clamped at 1: the job is to sharpen attention on sequences longer than the
         reference, never to flatten it on shorter ones, which is how the reference
         implementations (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46,
         pushing a 40-key softmax toward uniform for no reason.
 
-        This is the only attention temperature in the model, and `n` is the only thing
-        it responds to — see `rope.py` for why nothing here tracks the rotary spectrum.
+        This is the only attention temperature in the model, and the key count is the only
+        thing it responds to — see `rope.py` for why nothing here tracks the rotary
+        spectrum.
         """
         if not self.logn_ref_len:
             return 1.0
-        return max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
+        if mask is None:
+            return max(1.0, math.log(max(seq_len, 2)) / math.log(self.logn_ref_len))
+        lens = mask.sum(dim=-1).clamp(min=2).to(torch.float32)
+        return (lens.log() / math.log(self.logn_ref_len)).clamp(min=1.0)
 
     def __call__(
         self,
@@ -265,9 +275,16 @@ class AttnProcessor:
             query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
             key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
-        # attention temperature, folded into the softmax scale rather than the query:
-        # scaling the query would allocate another [b, h, n, d] tensor in every block
-        softmax_scale = self._logit_scale(query.shape[-2]) / math.sqrt(head_dim)
+        # attention temperature. A scalar folds into the softmax scale for free; a
+        # per-sample one has to ride on the query, since SDPA's `scale` takes a float.
+        # The pre-scaled query is not needed for any backward, so it costs a transient
+        # buffer rather than retained activation.
+        scale = self._logit_scale(query.shape[-2], mask)
+        if torch.is_tensor(scale):
+            query = query * scale[:, None, None, None].to(query.dtype)
+            softmax_scale = 1.0 / math.sqrt(head_dim)
+        else:
+            softmax_scale = scale / math.sqrt(head_dim)
 
         # mask e.g. an inference batch with different target durations: drop the padding
         if self.attn_mask_enabled and mask is not None:
