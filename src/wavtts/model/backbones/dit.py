@@ -20,6 +20,7 @@ from wavtts.model.modules import (
     DiTBlock,
     TimestepEmbedding,
 )
+from wavtts.model.utils import lens_to_mask
 
 
 # speech-state conditioning: the only condition this model has
@@ -214,7 +215,12 @@ class DiT(nn.Module):
             raise ValueError(f"WavTTS DiT expects raw waveform x [B, N], got {x.ndim}D.")
 
         target_num_samples = x.shape[1]
-        x, token_mask, _token_lens = self._wav_to_tokens(x, mask=mask, lens=lens)
+        x, token_mask, token_lens = self._wav_to_tokens(x, mask=mask, lens=lens)
+        if token_mask is None and token_lens is not None:
+            # `lens` alone is enough to know where the padding starts; without this a
+            # caller that passes lens but no sample-level mask silently gets neither
+            # attention masking nor per-sample entropy scaling
+            token_mask = lens_to_mask(token_lens, length=x.shape[1])
         mask = token_mask
 
         batch, seq_len = x.shape[0], x.shape[1]
