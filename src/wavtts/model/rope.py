@@ -1,15 +1,10 @@
-"""YaRN rotary embedding and randomized positional encoding, for length extrapolation.
+"""Randomized positional encoding, for length extrapolation.
 
-Follows "Randomized YaRN Improves Length Generalization for Long-Context Reasoning"
-(Mehta, Yin & Durrett, arXiv:2606.23687), adapted to 100 Hz waveform frames:
+Ruoss et al. (2023): training positions are `randperm(L_t)[:n].sort()` instead of
+`arange(n)`, so a short clip still shows the model rotations it would only meet in a
+long one. Training only — inference uses contiguous positions.
 
-  1. YaRN (Peng et al., 2024) with a *fixed* scale `s` during training. Inference
-     uses `s' >= s`; the paper's Appendix B shows `s' > s` reaches beyond `s * native_ctx`.
-  2. Randomized positional encoding (Ruoss et al., 2023): training positions are
-     `randperm(L_t)[:n].sort()` instead of `arange(n)`, so a short clip still shows
-     the model rotations it would only meet in a long one. Training only.
-
-Three deliberate deviations from the paper:
+Two deliberate deviations from the paper:
 
 `L_t` is a multiple of each sample's own length, not a fixed constant. Their sequences
 all sit near the training cap, so a fixed `L_t` stretches every sample about equally.
@@ -26,20 +21,24 @@ of the *sample*, so from the first update every batch contains rows at every str
 from contiguous to gamma. That also removes a discrete regime change from the middle
 of training, which is one less thing for a weight average to straddle.
 
-YaRN's attention temperature `sqrt(1/t) = 0.1*ln(s) + 1` is not implemented. It is
-fitted where `n = s * native_ctx`, so `ln(s) = ln(n) - ln(native_ctx)` — a function of
-n parameterized by s, which is the entropy-invariant scaling in `modules.py` measured
-against a coarser proxy. Running both double-counts. Nor does it compensate the
-interpolated spectrum: RoPE rotation is block-orthogonal, `logit(i,j) = q_i .
-R(theta_j - theta_i) k_j`, so squashing the frequencies changes which distance maps to
-which angle but never the logit scale. Measured on random q/k at n=3000, vanilla vs
-s=4: ratio 0.9999 isotropic, 1.0002 with a 15x per-dim anisotropy standing in for
-trained weights, against the 1.2965 the formula prescribes. Fine-tuning a model
-across a spectrum change may still want a correction; measure it on that checkpoint
-rather than reusing this constant.
+The stretch being *random* is what makes it an augmentation rather than a covariate
+shift. A deterministic length-dependent stretch — a dynamic YaRN scale, say — gives
+each clip length its own angle-per-frame map, which the model learns to depend on and
+then meets unseen at any untrained length. Drawn fresh per sample, no such map exists
+to depend on, and local physical timing falls to `ConvPositionEmbedding` (receptive
+field 61 frames = 610 ms) while the rotary embedding carries coarse relative order.
 
-Outputs follow the x_transformers rotary contract — `(freqs, scale)` consumable by
-`apply_rotary_pos_emb`, which already broadcasts a per-sample `[b, n, d]` freqs.
+Why no YaRN here: its every design choice — NTK-by-parts sparing the high-frequency
+dims, the `0.1*ln(s) + 1` attention temperature, the short adaptation run — exists to
+preserve structure a model already learned under a different spectrum. Training from
+scratch there is nothing to preserve, so a fixed interpolated spectrum is just an
+oddly-shaped one chosen for no reason, and for this data an actively bad one: over the
+longest position the augmentation ever produces (4 * 2979 = 11916), vanilla base=10000
+already leaves 5 of 32 dim pairs short of a single turn, and s=4 makes that 10 of 32.
+Length generalization comes from the positions trained on, which is this file's job.
+
+Output feeds `x_transformers.RotaryEmbedding.forward`, which takes `[b, n]` positions
+directly and returns a `[b, n, d]` freqs that `apply_rotary_pos_emb` broadcasts.
 """
 
 from __future__ import annotations
@@ -47,75 +46,6 @@ from __future__ import annotations
 import math
 
 import torch
-from torch import nn
-from torch.amp import autocast
-
-
-def _correction_dim(num_rotations: float, dim: int, base: float, native_ctx: int) -> float:
-    """RoPE dimension index that completes `num_rotations` turns across `native_ctx`."""
-    return (dim * math.log(native_ctx / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
-
-
-def yarn_inv_freq(
-    dim: int,
-    base: float,
-    scale: float,
-    native_ctx: int,
-    alpha: float = 1.0,
-    beta: float = 32.0,
-) -> torch.Tensor:
-    """NTK-by-parts interpolated inverse frequencies (YaRN, Peng et al. 2024).
-
-    Dimensions turning more than `beta` times across `native_ctx` are left to
-    extrapolate, those turning less than `alpha` times are fully interpolated by
-    `scale`, and the band between ramps linearly.
-    """
-    pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-    inv_freq_extrapolation = 1.0 / pos_freqs
-    inv_freq_interpolation = 1.0 / (scale * pos_freqs)
-
-    low = math.floor(_correction_dim(beta, dim, base, native_ctx))
-    high = math.ceil(_correction_dim(alpha, dim, base, native_ctx))
-    low, high = max(low, 0), min(high, dim - 1)
-    if low == high:
-        high += 0.001  # ponytail: guard the degenerate ramp, same as the reference impl
-
-    ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(0, 1)
-    extrapolation_weight = 1 - ramp
-    return inv_freq_interpolation * (1 - extrapolation_weight) + inv_freq_extrapolation * extrapolation_weight
-
-
-class YaRNRotaryEmbedding(nn.Module):
-    """Drop-in for x_transformers' RotaryEmbedding, with YaRN frequencies.
-
-    `forward` takes explicit positions (`[n]` or `[b, n]`) so randomized positional
-    encoding needs nothing more than a different position tensor.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        scale: float = 1.0,
-        native_ctx: int = 3000,
-        base: float = 10000.0,
-        alpha: float = 1.0,
-        beta: float = 32.0,
-    ):
-        super().__init__()
-        self.scale = scale
-        self.native_ctx = native_ctx
-        self.register_buffer("inv_freq", yarn_inv_freq(dim, base, scale, native_ctx, alpha, beta), persistent=False)
-
-    @autocast("cuda", enabled=False)
-    def forward(self, positions: torch.Tensor):
-        if positions.ndim == 1:
-            positions = positions.unsqueeze(0)
-        freqs = torch.einsum("b i , j -> b i j", positions.type_as(self.inv_freq), self.inv_freq)
-        freqs = torch.stack((freqs, freqs), dim=-1).flatten(start_dim=-2)
-        return freqs, 1.0
-
-    def forward_from_seq_len(self, seq_len: int):
-        return self.forward(torch.arange(seq_len, device=self.inv_freq.device))
 
 
 def randomized_positions(

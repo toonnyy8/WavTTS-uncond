@@ -1,8 +1,9 @@
 # WavTTS 無條件語音生成 — 長度外推（Randomized YaRN + 熵不變性）設計文件
 
 日期：2026-08-20
-狀態：**部分被後續修訂取代**（見下方修訂紀錄）。原始設計實作於 `length-extrapolation`，
-現行實作在 `randomized-yarn-uniform`
+狀態：**YaRN 部分已整個撤回**（見下方修訂紀錄）。原始設計實作於 `length-extrapolation`，
+Randomized YaRN 的最終形態留在 `randomized-yarn-uniform`（連同其 checkpoint），
+現行實作在 `randomized-rope`
 前置文件：[`2026-08-19-uncond-speech-cfg-design.md`](2026-08-19-uncond-speech-cfg-design.md)
 （其中「負分支選擇：自我限制性質」一節記錄了 `mixed` state 併入 `null` 的決定，
 與本文件的長度外推改動同期，但兩者互相獨立）
@@ -34,7 +35,29 @@ config 只剩 `arch.rpe_gamma`。
 commit，一併繼承了 `attn_mode`（`bidir_causal` / `bidir_causal_split`）、
 `rope_type: none`，以及上游遺留的 `MMDiT` / `ConvNeXtV2Block` / `JointAttnProcessor`
 等死碼。NoPE 的結論在 `nope-bidir-causal` 分支上取得，本分支用不到，已全數刪除。
-`rope_type` 現在只有 `default | yarn`。
+
+**4. 撤回 YaRN，只留隨機位置編碼**（分支 `randomized-rope`）。這是對本文核心前提的
+否定，也是修訂 2 那個論證的一般化。
+
+YaRN 是 **post-train 方法**。它的每一個設計決策——NTK-by-parts 放過高頻維度、
+`0.1·ln(s)+1` 的注意力溫度、短暫的適應訓練——都是為了保住一個模型在*別的*頻譜下
+已經學會的結構。本文把它當 pretrain 設定在用，但從頭訓練時沒有東西要保住：模型會
+學你給它的任何頻譜。固定 s 的內插頻譜於是只是一個沒有理由的怪形狀。
+
+而且對這份資料是壞的形狀。在隨機化能產生的最遠位置（4 × 2979 = 11916）上，原生
+base=10000 已經有 5/32 對維度轉不滿一圈——它們實質上是線性斜坡而非振盪器——
+`s=4` 把這個數字變成 10/32。YaRN 把頻譜的慢端推得更慢（最慢週期 471 s → 1885 s），
+方向與這份資料所需相反：語音在 100 Hz frame 下的結構全在 0.25 到 3000 frames 之間。
+
+真正是 pretrain 方法的是 Ruoss et al. (2023) 的隨機位置編碼，它擴大的是**訓練時的
+位置覆蓋**。長度泛化來自訓練分佈，不是事後補頻譜。`gamma=4` 下訓練位置達 11916，
+所以連續生成到 119 s 用的都是訓練過的位置，推論期不需要任何旋鈕；原生 RoPE 最慢的
+維度要 47117 frames（471 s）才轉完一圈，不會繞回。要更長就是提高 `gamma` 重訓。
+
+刪除：`yarn_inv_freq`、`_correction_dim`、`YaRNRotaryEmbedding`、`set_yarn_scale`、
+`rope_type`（只剩一個選項就不是旋鈕）、四個 `yarn_*` config、`--yarn_scale` flag。
+保留：`randomized_positions`、`rpe_gamma`、`logn_ref_len`（後者是 Su 2021，與 YaRN
+無關，且本來就按實際 `n` 動態）。`base` 維持 10000 不動——調整它是另一個獨立問題。
 
 ## 問題
 

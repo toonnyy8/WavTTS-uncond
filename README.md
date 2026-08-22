@@ -84,17 +84,35 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 
 ### Length extrapolation
 
-Training clips top out at 29.8 s, so generating longer needs help. Two mechanisms,
-both trained in rather than bolted on at inference, both off by `rope_type: default`:
+Training clips top out at 29.8 s, so generating longer needs help. Two mechanisms, both
+trained in rather than bolted on at inference, and both leaving the architecture
+untouched — no extra parameters, no extra buffers, nothing to set at generation time:
 
-**Randomized YaRN** ([arXiv:2606.23687](https://arxiv.org/abs/2606.23687)) — YaRN
-frequencies at a fixed scale `s` during training, plus randomized positional encoding
-(`randperm(L_t)[:n].sort()` instead of `arange(n)`, training only). A short clip keeps
-its token order but is told it spans a longer stretch, so it exercises rotations only
-long audio would produce. Inference runs plain YaRN at `s'`, and `s' > s` reaches past
-`s · native_ctx`: `s=4` covers 120 s, and `s' > 4` reaches past it.
+**Randomized positional encoding** ([Ruoss et al.
+2023](https://arxiv.org/abs/2305.16843)) — training positions are
+`randperm(L_t)[:n].sort()` instead of `arange(n)`. A short clip keeps its token order
+but is told it spans a longer stretch, so it exercises rotations only long audio would
+produce. Training only; inference uses contiguous positions.
 
-Two deviations from the paper.
+At `γ = 4` the longest clip's positions reach 11916, so generating up to **119 s** uses
+positions the model trained on. Vanilla RoPE at `base=10000` turns its slowest dim once
+every 471 s, so nothing wraps along the way. Reaching past 119 s means raising `γ` and
+retraining — length generalization comes from the positions trained on.
+
+*Why not YaRN.* An earlier revision of this branch paired the above with YaRN
+frequencies at a fixed `s`, following [arXiv:2606.23687](https://arxiv.org/abs/2606.23687).
+That was a category error: YaRN is a post-training method, and every piece of it —
+NTK-by-parts sparing the high-frequency dims, the `0.1·ln(s) + 1` attention temperature,
+the short adaptation run — exists to preserve structure a model already learned under a
+different spectrum. Training from scratch there is nothing to preserve, so a fixed
+interpolated spectrum is just an oddly-shaped one picked for no reason — and for this
+data a bad one: over the longest position the augmentation produces, `base=10000`
+already leaves 5 of 32 dim pairs short of a single turn, and `s=4` makes that 10 of 32.
+It pushes the slow tail slower (471 s → 1885 s) when speech at 100 Hz frames lives
+between 0.25 and 3000 frames. The Randomized YaRN implementation and its checkpoints
+remain on the `randomized-yarn-uniform` branch.
+
+Two deviations from Ruoss et al.
 
 `L_t` is relative. Their sequences all sit near the training cap, so a fixed `L_t`
 stretches every sample about equally. Ours span 0.3–30 s, and a fixed `L_t` would
@@ -120,14 +138,11 @@ model learns the relationship rather than extrapolating it at inference.
 
 ```bash
 uv run python src/wavtts/infer/sample_uncond.py \
-  --ckpt ckpts/.../model_last.pt --duration_sec 240 --yarn_scale 8
+  --ckpt ckpts/.../model_last.pt --duration_sec 60
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
-| `arch.rope_type` | yarn | `default` \| `yarn` — `default` disables everything below |
-| `arch.yarn_scale` | 4.0 | `s` during training; keep in step with `rpe_gamma` |
-| `arch.yarn_native_ctx` | 3000 | frames (30 s) the architecture should cover unaided |
 | `arch.rpe_gamma` | 4.0 | per-sample stretch bound: `L_t ~ U[n, n·γ]`; `1.0` disables |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
 

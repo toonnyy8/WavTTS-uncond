@@ -225,8 +225,8 @@ class AttnProcessor:
         implementations (Qwen) apply it too. Without the clamp a 0.4 s clip runs at 0.46,
         pushing a 40-key softmax toward uniform for no reason.
 
-        This is the only attention temperature in the model. YaRN's own
-        `(0.1*ln(s) + 1)^2` is deliberately absent — see `rope.py` for why.
+        This is the only attention temperature in the model, and `n` is the only thing
+        it responds to — see `rope.py` for why nothing here tracks the rotary spectrum.
         """
         if not self.logn_ref_len:
             return 1.0

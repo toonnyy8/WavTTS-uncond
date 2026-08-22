@@ -366,54 +366,20 @@ def test_sample_seed_is_isolated_and_deterministic():
     assert torch.equal(out1, out2)  # same seed, same clip
 
 
-def test_yarn_inv_freq_interpolates_only_slow_dims():
-    from wavtts.model.rope import yarn_inv_freq
+def test_vanilla_rope_never_wraps_over_the_trained_position_range():
+    """gamma=4 is safe on the stock spectrum: no dim completes a turn and aliases.
 
-    dim, base, native = 72, 10000.0, 3000
-    vanilla = yarn_inv_freq(dim, base, 1.0, native)
-    scaled = yarn_inv_freq(dim, base, 4.0, native)
-
-    # highest-frequency dims extrapolate untouched, lowest are divided by the full scale
-    assert torch.allclose(scaled[0], vanilla[0])
-    assert torch.allclose(scaled[-1], vanilla[-1] / 4.0)
-    # and the ramp between is monotone in how much interpolation each dim receives
-    ratio = vanilla / scaled
-    assert torch.all(ratio[1:] >= ratio[:-1] - 1e-6)
-    assert torch.allclose(yarn_inv_freq(dim, base, 1.0, native), 1.0 / base ** (torch.arange(0, dim, 2) / dim))
-
-
-def test_interpolating_the_spectrum_does_not_move_the_logit_scale():
-    """Why YaRN's `0.1*ln(s) + 1` attention temperature is deliberately absent.
-
-    A rotary embedding rotates each 2-dim pair, so `logit(i,j) = q_i . R(dtheta) k_j`
-    with `R` orthogonal: squashing the frequencies changes which distance maps to which
-    angle, never the magnitude. Anything left for a temperature to fix is a function of
-    the key count, which is entropy invariance's job.
+    Randomized positions push a 2979-frame clip out to 11916. Vanilla RoPE at
+    base=10000 turns its slowest dim once every 47117 frames (471 s), so two positions
+    that far apart never collide — which is why this branch needs no spectrum surgery.
     """
-    from wavtts.model.rope import yarn_inv_freq
+    from x_transformers.x_transformers import RotaryEmbedding
 
-    dim, n = 64, 512
-    torch.manual_seed(0)
-
-    def logit_std(inv_freq, q, k):
-        pos = torch.arange(n, dtype=torch.float32)
-        f = torch.einsum("i,j->ij", pos, inv_freq)
-        f = torch.stack((f, f), -1).flatten(-2)
-        c, s = f[..., 0::2].cos(), f[..., 0::2].sin()
-
-        def rot(x):
-            x1, x2 = x[..., 0::2], x[..., 1::2]
-            return torch.stack((x1 * c - x2 * s, x1 * s + x2 * c), -1).flatten(-2)
-
-        return (rot(q) @ rot(k).T).std().item()
-
-    vanilla = 1.0 / (10000.0 ** (torch.arange(0, dim, 2).float() / dim))
-    yarn = yarn_inv_freq(dim, 10000.0, 4.0, 3000)
-
-    # isotropic q/k stands in for init, the anisotropic pair for trained weights
-    for scale in (torch.ones(dim), torch.linspace(3.0, 0.2, dim)):
-        q, k = torch.randn(n, dim) * scale, torch.randn(n, dim) * scale
-        assert logit_std(vanilla, q, k) == pytest.approx(logit_std(yarn, q, k), rel=2e-3)
+    dim_head, max_position = 64, 4 * 2979
+    inv_freq = RotaryEmbedding(dim_head).inv_freq
+    turns = max_position * inv_freq / (2 * math.pi)
+    assert turns.min() < 1.0  # slowest dim has not come back around
+    assert turns.min() == pytest.approx(0.253, abs=0.01)
 
 
 def test_randomized_positions_sorted_unique_and_in_range():
@@ -456,7 +422,7 @@ def test_every_batch_spans_contiguous_through_gamma():
     assert 2.0 * n < span.mean() < 3.0 * n
 
 
-def _yarn_dit(**overrides):
+def _rpe_dit(**overrides):
     from wavtts.model.backbones.dit import DiT
 
     kwargs = dict(
@@ -466,24 +432,21 @@ def _yarn_dit(**overrides):
         dim_head=32,
         ff_mult=2,
         wav_frame_len=160,
-        rope_type="yarn",
-        yarn_scale=2.0,
-        yarn_native_ctx=100,
         logn_ref_len=100,
     )
     kwargs.update(overrides)
     return DiT(**kwargs)
 
 
-def test_yarn_dit_forward_and_extrapolates_past_native_ctx():
+def test_dit_forward_runs_far_past_the_reference_length():
     from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
-    dit = _yarn_dit()
+    dit = _rpe_dit()
     _reinit_nonzero(dit)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
 
-    for num_samples in (1600, 160 * 400):  # 10 frames, then 4x the 100-frame native ctx
+    for num_samples in (1600, 160 * 400):  # 10 frames, then 4x the 100-frame reference
         out = dit(x=torch.randn(2, num_samples), state=state, time=torch.tensor(0.5))
         assert out.shape == (2, num_samples)
         assert torch.isfinite(out).all()
@@ -493,7 +456,7 @@ def test_rpe_is_training_only_and_changes_output():
     from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
-    dit = _yarn_dit(rpe_gamma=4.0)
+    dit = _rpe_dit(rpe_gamma=4.0)
     _reinit_nonzero(dit)
     x = torch.randn(2, 1600)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
@@ -507,22 +470,6 @@ def test_rpe_is_training_only_and_changes_output():
         a = dit(x=x, state=state, time=torch.tensor(0.5))
         b = dit(x=x, state=state, time=torch.tensor(0.5))
     assert not torch.allclose(a, b)  # fresh random bounds and positions every training forward
-
-
-def test_set_yarn_scale_retunes_freqs_only():
-    torch.manual_seed(0)
-    dit = _yarn_dit()
-    before = dit.rotary_embed.inv_freq.clone()
-    proc = dit.transformer_blocks[0].attn.processor
-    temperature_before = proc._logit_scale(1000)
-
-    dit.set_yarn_scale(4.0)
-    assert not torch.allclose(dit.rotary_embed.inv_freq, before)
-    # s' retunes the spectrum and nothing else; the temperature tracks n, not s
-    assert proc._logit_scale(1000) == pytest.approx(temperature_before)
-
-    with pytest.raises(ValueError):
-        _yarn_dit(rope_type="default").set_yarn_scale(4.0)
 
 
 def test_logn_scaling_sharpens_but_never_flattens():
@@ -575,7 +522,7 @@ def test_default_config_rope_is_unchanged_when_disabled():
     plain = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     torch.manual_seed(0)
     explicit = DiT(
-        dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rope_type="default", rpe_gamma=1.0
+        dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rpe_gamma=1.0
     )
     x = torch.randn(2, 1600)
     state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
@@ -632,7 +579,7 @@ def test_mel_figure():
 
 def test_attention_output_projection_is_not_widened():
     """Full attention emits head_dim per head; nothing here concatenates two of them."""
-    attn = _yarn_dit().transformer_blocks[0].attn
+    attn = _rpe_dit().transformer_blocks[0].attn
     assert attn.to_out[0].in_features == attn.inner_dim
 
 

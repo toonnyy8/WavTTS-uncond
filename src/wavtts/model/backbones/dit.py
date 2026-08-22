@@ -20,11 +20,7 @@ from wavtts.model.modules import (
     DiTBlock,
     TimestepEmbedding,
 )
-from wavtts.model.rope import (
-    YaRNRotaryEmbedding,
-    randomized_positions,
-    yarn_inv_freq,
-)
+from wavtts.model.rope import randomized_positions
 
 
 # speech-state conditioning: the only condition this model has
@@ -92,13 +88,8 @@ class DiT(nn.Module):
         use_audio_proj: bool = False,
         audio_proj_dim: int | None = None,
         audio_proj_hidden: int | None = None,
-        # length extrapolation (see wavtts/model/rope.py); defaults reproduce the
+        # length extrapolation (see wavtts/model/rope.py); the default reproduces the
         # original vanilla-RoPE behaviour exactly
-        rope_type: str = "default",  # "default" | "yarn"
-        yarn_scale: float = 1.0,  # s during training; s' at inference via set_yarn_scale
-        yarn_native_ctx: int = 3000,  # frames the architecture is expected to cover unaided
-        yarn_alpha: float = 1.0,
-        yarn_beta: float = 32.0,
         rpe_gamma: float = 1.0,  # per-sample L_t ~ U[n, n*gamma]; 1.0 disables. Training only
         logn_ref_len: int | None = None,  # entropy-invariant attention scaling; None disables
     ):
@@ -114,21 +105,7 @@ class DiT(nn.Module):
             audio_proj_hidden=audio_proj_hidden,
         )
 
-        if rope_type == "default":
-            self.rotary_embed = RotaryEmbedding(dim_head)
-        elif rope_type == "yarn":
-            self.rotary_embed = YaRNRotaryEmbedding(
-                dim_head, scale=yarn_scale, native_ctx=yarn_native_ctx, alpha=yarn_alpha, beta=yarn_beta
-            )
-        else:
-            raise ValueError(f"Unknown rope_type: {rope_type}")
-
-        self.rope_type = rope_type
-        self.rope_dim_head = dim_head
-        self.yarn_scale = yarn_scale
-        self.yarn_native_ctx = yarn_native_ctx
-        self.yarn_alpha = yarn_alpha
-        self.yarn_beta = yarn_beta
+        self.rotary_embed = RotaryEmbedding(dim_head)
         self.rpe_gamma = rpe_gamma
 
         self.dim = dim
@@ -187,24 +164,6 @@ class DiT(nn.Module):
                 f"wav_frame_len ({self.wav_frame_len}) must equal proj_out_dim ({self.proj_out_dim}) "
                 "for reshape wav front-end."
             )
-
-    def set_yarn_scale(self, scale: float):
-        """Retune YaRN to an inference scale `s'`.
-
-        The paper trains at `s` and infers at `s' >= s`; `s' > s` reaches past
-        `s * native_ctx`. Only the frequencies are rebuilt — no parameters change, and
-        the attention temperature stays put: it tracks `n`, not the spectrum. See
-        `rope.py` for why YaRN's `s`-dependent temperature is not implemented.
-        """
-        if self.rope_type != "yarn":
-            raise ValueError(f"set_yarn_scale requires rope_type='yarn', got {self.rope_type!r}")
-
-        self.yarn_scale = float(scale)
-        inv_freq = yarn_inv_freq(
-            self.rope_dim_head, 10000.0, self.yarn_scale, self.yarn_native_ctx, self.yarn_alpha, self.yarn_beta
-        )
-        self.rotary_embed.inv_freq = inv_freq.to(self.rotary_embed.inv_freq.device)
-        self.rotary_embed.scale = self.yarn_scale
 
     def _wav_to_tokens(
         self,
