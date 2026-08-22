@@ -282,9 +282,11 @@ class AttnProcessor:
         else:
             softmax_scale = scale / math.sqrt(head_dim)
 
-        # mask e.g. an inference batch with different target durations: drop the padding
+        # keep the padding out of the softmax. Left as `[b, 1, 1, n]` for SDPA to
+        # broadcast: materializing `[b, heads, n, n]` costs heads*n times the memory and
+        # pushes the kernel choice toward the math fallback for no change in result.
         if self.attn_mask_enabled and mask is not None:
-            attn_mask = mask[:, None, None, :].expand(batch_size, attn.heads, query.shape[-2], key.shape[-2])
+            attn_mask = mask[:, None, None, :]
         else:
             attn_mask = None
 
