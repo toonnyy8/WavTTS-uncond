@@ -57,8 +57,6 @@ model:
     dropout: 0.0
     ff_mult: 4
     qk_norm: null  # null | rms_norm
-    pe_attn_head: null
-    attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
     checkpoint_activations: False  # recompute activations and save memory for extra compute
     use_audio_proj: True
@@ -69,14 +67,7 @@ model:
     # augmentation puts the longest clip's positions out to 4 * 2979 = 11916, so the
     # YaRN spectrum is tuned for the range actually trained on (4 * 3000 = 120 s).
     # Inference at s' > 4 reaches past that. rope_type: default disables all of it.
-    # attention shape. "full" is ordinary bidirectional attention. The two causal modes
-    # exist for the NoPE experiment: with rope_type: none the causal mask is the only
-    # thing that breaks permutation symmetry, so it becomes the position signal
-    # (Kazemnejad et al. 2023). "bidir_causal" gives every head both directions and sums
-    # them (same attention FLOPs as full); "bidir_causal_split" gives half the heads the
-    # past and half the future (half the FLOPs).
-    attn_mode: full          # full | bidir_causal | bidir_causal_split
-    rope_type: yarn          # default | yarn | none
+    rope_type: yarn          # default | yarn
     yarn_scale: 4.0          # s during training; set s' at inference. Keep in step with
                              # rpe_gamma -- that is what decides the positions s must cover.
                              # s tunes the frequency spectrum only: YaRN's s-dependent

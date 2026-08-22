@@ -14,7 +14,6 @@ from wavtts.model.backbones.dit import STATE_CLEAN
 """ ~155M """
 # transformer =       DiT(dim = 768, depth = 18, heads = 12, ff_mult = 2)
 # transformer =       DiT(dim = 768, depth = 18, heads = 12, ff_mult = 2, long_skip_connection = True)
-# transformer =     MMDiT(dim = 512, depth = 16, heads = 16, ff_mult = 2)
 
 """ ~335M """
 # FLOPs: 622.1 G, Params: 333.2 M

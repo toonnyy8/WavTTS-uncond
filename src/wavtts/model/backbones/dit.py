@@ -86,8 +86,6 @@ class DiT(nn.Module):
         ff_mult=4,
         wav_frame_len=160,
         qk_norm=None,
-        pe_attn_head=None,
-        attn_backend="torch",  # "torch" | "flash_attn"
         attn_mask_enabled=False,
         long_skip_connection=False,
         checkpoint_activations=False,
@@ -96,8 +94,7 @@ class DiT(nn.Module):
         audio_proj_hidden: int | None = None,
         # length extrapolation (see wavtts/model/rope.py); defaults reproduce the
         # original vanilla-RoPE behaviour exactly
-        attn_mode: str = "full",  # "full" | "bidir_causal" | "bidir_causal_split"
-        rope_type: str = "default",  # "default" | "yarn" | "none" (NoPE)
+        rope_type: str = "default",  # "default" | "yarn"
         yarn_scale: float = 1.0,  # s during training; s' at inference via set_yarn_scale
         yarn_native_ctx: int = 3000,  # frames the architecture is expected to cover unaided
         yarn_alpha: float = 1.0,
@@ -117,11 +114,7 @@ class DiT(nn.Module):
             audio_proj_hidden=audio_proj_hidden,
         )
 
-        if rope_type == "none":
-            # NoPE: no positional encoding at all. Only meaningful with a causal
-            # attn_mode, which is then the sole thing that tells a token where it is.
-            self.rotary_embed = None
-        elif rope_type == "default":
+        if rope_type == "default":
             self.rotary_embed = RotaryEmbedding(dim_head)
         elif rope_type == "yarn":
             self.rotary_embed = YaRNRotaryEmbedding(
@@ -150,11 +143,8 @@ class DiT(nn.Module):
                     ff_mult=ff_mult,
                     dropout=dropout,
                     qk_norm=qk_norm,
-                    pe_attn_head=pe_attn_head,
-                    attn_backend=attn_backend,
                     attn_mask_enabled=attn_mask_enabled,
                     logn_ref_len=logn_ref_len,
-                    attn_mode=attn_mode,
                 )
                 for _ in range(depth)
             ]
@@ -293,9 +283,7 @@ class DiT(nn.Module):
         # its token order but is told it spans a longer stretch, so short training audio
         # still exercises the rotations only long audio would produce. Each row draws its
         # own stretch, so a batch spans contiguous through gamma at every update
-        if self.rotary_embed is None:
-            rope = None  # NoPE: position comes from the causal mask alone
-        elif self.training and self.rpe_gamma > 1.0:
+        if self.training and self.rpe_gamma > 1.0:
             rope = self.rotary_embed(randomized_positions(h.shape[0], seq_len, self.rpe_gamma, h.device))
         else:
             # augmentation off or inference: contiguous positions, and a [1, n, d] freqs

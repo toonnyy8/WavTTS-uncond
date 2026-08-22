@@ -627,176 +627,27 @@ def test_mel_figure():
     plt.close(fig)
 
 
-# --- NoPE + bidirectional causal attention -----------------------------------
+# --- full attention ----------------------------------------------------------
 
 
-def _nope_dit(**overrides):
-    from wavtts.model.backbones.dit import DiT
-
-    kwargs = dict(
-        dim=64,
-        depth=2,
-        heads=2,
-        dim_head=32,
-        ff_mult=2,
-        wav_frame_len=160,
-        rope_type="none",
-        attn_mode="bidir_causal",
-        logn_ref_len=100,
-    )
-    kwargs.update(overrides)
-    return DiT(**kwargs)
+def test_attention_output_projection_is_not_widened():
+    """Full attention emits head_dim per head; nothing here concatenates two of them."""
+    attn = _yarn_dit().transformer_blocks[0].attn
+    assert attn.to_out[0].in_features == attn.inner_dim
 
 
-def test_nope_builds_no_rotary_embedding():
-    dit = _nope_dit()
-    assert dit.rotary_embed is None
-
-
-@pytest.mark.parametrize("mode", ["bidir_causal", "bidir_causal_split"])
-def test_bidir_causal_dit_runs_and_is_position_sensitive(mode):
-    from wavtts.model.backbones.dit import STATE_CLEAN
+def test_padding_is_masked_out_of_the_softmax():
+    from wavtts.model.modules import Attention, AttnProcessor
 
     torch.manual_seed(0)
-    dit = _nope_dit(attn_mode=mode).eval()
-    _reinit_nonzero(dit)
-    x = torch.randn(1, 160 * 20)
-    state = torch.full((1,), STATE_CLEAN, dtype=torch.long)
+    attn = Attention(processor=AttnProcessor(attn_mask_enabled=True), dim=32, heads=2, dim_head=16)
+    x = torch.randn(1, 8, 32)
+    mask = torch.zeros(1, 8, dtype=torch.bool)
+    mask[:, :5] = True
+
     with torch.no_grad():
-        out = dit(x=x, state=state, time=torch.tensor(0.5))
-        # reversing the frames must change the answer: with no positional encoding the
-        # causal mask is the only thing that can tell the model where a frame sits
-        rev = dit(x=x.view(1, 20, 160).flip(1).reshape(1, -1), state=state, time=torch.tensor(0.5))
-    assert out.shape == (1, 160 * 20)
-    assert torch.isfinite(out).all()
-    assert not torch.allclose(out, rev.view(1, 20, 160).flip(1).reshape(1, -1), atol=1e-4)
-
-
-def test_only_the_causal_modes_break_permutation_equivariance():
-    """The control that makes the test above meaningful.
-
-    Full attention with no rope is permutation-equivariant, so it carries no position
-    at all; the causal modes are not. (In the assembled DiT this is not the whole story
-    — `ConvPositionEmbedding` in the input embedding already supplies local relative
-    position over a 61-frame window whatever `rope_type` says. So NoPE here means
-    "local position from the conv, long-range position from the mask", not "none".)
-    """
-    from wavtts.model.modules import AttnProcessor
-
-    torch.manual_seed(0)
-    n, h, d = 6, 2, 4
-    q, k, v = (torch.randn(1, h, n, d) for _ in range(3))
-    perm = torch.randperm(n)
-
-    full = AttnProcessor(attn_mode="full")
-    with torch.no_grad():
-        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)
-        permuted = torch.nn.functional.scaled_dot_product_attention(
-            q[:, :, perm], k[:, :, perm], v[:, :, perm], scale=1.0
-        )
-    assert full.attn_mode == "full"
-    assert torch.allclose(ref[:, :, perm], permuted, atol=1e-5)
-
-    causal = AttnProcessor(attn_mode="bidir_causal")
-    out = causal._bidir_causal(q, k, v, None, 1.0)
-    out_perm = causal._bidir_causal(q[:, :, perm], k[:, :, perm], v[:, :, perm], None, 1.0)
-    assert not torch.allclose(out[:, :, perm], out_perm, atol=1e-4)
-
-
-def test_forward_stream_cannot_see_the_future():
-    """Split mode: the past-facing heads must ignore anything after their own position."""
-    from wavtts.model.modules import AttnProcessor
-
-    torch.manual_seed(0)
-    proc = AttnProcessor(attn_mode="bidir_causal_split")
-    n, h, d = 6, 2, 4
-    q = torch.randn(1, h, n, d)
-    k = torch.randn(1, h, n, d)
-    v = torch.randn(1, h, n, d)
-    out = proc._bidir_causal(q, k, v, None, 1.0)
-
-    k2, v2 = k.clone(), v.clone()
-    k2[:, :, -1] += 10.0  # perturb only the last frame
-    v2[:, :, -1] += 10.0
-    out2 = proc._bidir_causal(q, k2, v2, None, 1.0)
-
-    fwd_head, bwd_head = 0, h // 2
-    # the past-facing head is untouched everywhere except at the perturbed frame itself
-    assert torch.allclose(out[0, fwd_head, :-1], out2[0, fwd_head, :-1], atol=1e-5)
-    # the future-facing head sees it from every position
-    assert not torch.allclose(out[0, bwd_head, 0], out2[0, bwd_head, 0], atol=1e-4)
-
-
-def test_logn_factor_uses_the_per_query_visible_count():
-    from wavtts.model.modules import AttnProcessor
-
-    proc = AttnProcessor(attn_mode="bidir_causal", logn_ref_len=100)
-    visible = torch.tensor([1.0, 2.0, 50.0, 100.0, 400.0])
-    f = proc._logn_factor(visible)
-    # clamped at 1 below the reference, exactly 1 at it, above 1 past it — never flatten
-    assert torch.allclose(f[:4], torch.ones(4), atol=1e-6)
-    assert f[4] > 1.0
-    assert torch.isclose(f[4], torch.tensor(math.log(400) / math.log(100)))
-    # monotone in the count
-    assert (f[1:] >= f[:-1]).all()
-
-
-def test_bidir_causal_masked_path_matches_the_unpadded_one():
-    """The explicit-mask branch and the flip fast path must agree on the real frames."""
-    from wavtts.model.modules import AttnProcessor
-
-    torch.manual_seed(0)
-    proc = AttnProcessor(attn_mode="bidir_causal", logn_ref_len=4)
-    n, real, h, d = 8, 5, 2, 4
-    q, k, v = (torch.randn(1, h, n, d) for _ in range(3))
-    mask = torch.zeros(1, n, dtype=torch.bool)
-    mask[:, :real] = True
-
-    padded = proc._bidir_causal(q, k, v, mask, 1.0)
-    trimmed = proc._bidir_causal(q[:, :, :real], k[:, :, :real], v[:, :, :real], None, 1.0)
-    assert torch.allclose(padded[:, :, :real], trimmed, atol=1e-5)
-
-
-def test_bidir_causal_rejects_flash_backend():
-    from wavtts.model.modules import AttnProcessor
-
-    with pytest.raises(ValueError, match="needs attn_backend"):
-        AttnProcessor(attn_mode="bidir_causal", attn_backend="flash_attn")
-
-
-def test_bidir_causal_split_needs_even_heads():
-    from wavtts.model.modules import AttnProcessor
-
-    proc = AttnProcessor(attn_mode="bidir_causal_split")
-    q, k, v = (torch.randn(1, 3, 4, 2) for _ in range(3))
-    with pytest.raises(ValueError, match="even head count"):
-        proc._bidir_causal(q, k, v, None, 1.0)
-
-
-def test_bidir_causal_concatenates_and_split_does_not():
-    """Shape contract: shared heads emit 2*head_dim, split heads emit head_dim."""
-    from wavtts.model.modules import AttnProcessor
-
-    torch.manual_seed(0)
-    q, k, v = (torch.randn(1, 4, 6, 8) for _ in range(3))
-    shared = AttnProcessor(attn_mode="bidir_causal")._bidir_causal(q, k, v, None, 1.0)
-    split = AttnProcessor(attn_mode="bidir_causal_split")._bidir_causal(q, k, v, None, 1.0)
-    assert shared.shape == (1, 4, 6, 16)  # [b, h, n, 2*d]
-    assert split.shape == (1, 4, 6, 8)  # [b, h, n, d]
-
-
-def test_only_shared_bidir_widens_the_output_projection():
-    """The parameter cost of concat is real and lands only on `bidir_causal`."""
-    from wavtts.model.backbones.dit import DiT
-
-    def params(mode):
-        torch.manual_seed(0)
-        d = DiT(
-            dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160,
-            rope_type="none", attn_mode=mode,
-        )
-        return sum(p.numel() for p in d.parameters())
-
-    full, split, shared = params("full"), params("bidir_causal_split"), params("bidir_causal")
-    assert split == full  # equal-parameter ablation against the RoPE model
-    assert shared == full + 2 * 64 * 64  # one extra dim x dim block per layer
+        out = attn(x, mask=mask)
+        x2 = x.clone()
+        x2[:, 5:] += 10.0  # only the padded frames change
+        out2 = attn(x2, mask=mask)
+    assert torch.allclose(out[:, :5], out2[:, :5], atol=1e-5)

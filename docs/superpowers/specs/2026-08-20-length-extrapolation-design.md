@@ -1,10 +1,40 @@
 # WavTTS 無條件語音生成 — 長度外推（Randomized YaRN + 熵不變性）設計文件
 
 日期：2026-08-20
-狀態：已實作並開始訓練（分支 `length-extrapolation`）
+狀態：**部分被後續修訂取代**（見下方修訂紀錄）。原始設計實作於 `length-extrapolation`，
+現行實作在 `randomized-yarn-uniform`
 前置文件：[`2026-08-19-uncond-speech-cfg-design.md`](2026-08-19-uncond-speech-cfg-design.md)
 （其中「負分支選擇：自我限制性質」一節記錄了 `mixed` state 併入 `null` 的決定，
 與本文件的長度外推改動同期，但兩者互相獨立）
+
+## 修訂紀錄
+
+本文以下為 2026-08-20 當時的設計，保留作為決策紀錄。實作後有三次修訂，凡與本文
+牴觸之處以此節為準：
+
+**1. 階段式課程 → 每樣本隨機上界**（`bc07fc0`）。原設計的 `L_t` 課程按 update 推進，
+整批共用同一個拉伸倍率，且 `k` 離開 1.0 後模型再也看不到連續序列。改為每個樣本自抽
+`L_t ~ U[n, n·γ]`，`γ=4`：拉伸倍率變成*樣本*的屬性而非*update* 的屬性，從第一個
+update 起每批就同時涵蓋連續到 4×，也少一個讓權重平均跨越的離散 regime 變化。
+
+隨之移除：`rpe_max_len()`、`randomized_positions()` 的 `per_sample` 參數、
+`set_rpe_length_scale()`、`trainer.py` 的 `_advance_rpe_curriculum()`、
+config 的 `optim.rpe_curriculum` / `rpe_length_scale` / `rpe_per_sample`。
+現行簽名是 `randomized_positions(batch, seq_len, gamma, device)`，
+config 只剩 `arch.rpe_gamma`。
+
+**2. 移除 YaRN 的 attention temperature**（`b93366c`）。`0.1·ln(s)+1` 擬合於
+`n = s·native_ctx` 的情境，故 `ln(s) = ln(n) − ln(native_ctx)`——那是把 `n` 偽裝成 `s`
+的熵補償，與熵不變性重複計算（30 s 處 1.2965 × 1.2883 = 1.67，各自只要 ~1.29）。
+它也沒有頻譜面的職責：RoPE 逐 2 維旋轉正交，固定 `n` 換頻譜不動 logit 尺度
+（量測 vanilla vs `s=4`：isotropic 0.9999、15× anisotropic 1.0002，對照公式要求的
+1.2965）。`set_yarn_scale()` 現在只重建 `inv_freq`。
+
+**3. 移除 NoPE 與 bidirectional causal attention**。這條分支切自 NoPE 實驗的
+commit，一併繼承了 `attn_mode`（`bidir_causal` / `bidir_causal_split`）、
+`rope_type: none`，以及上游遺留的 `MMDiT` / `ConvNeXtV2Block` / `JointAttnProcessor`
+等死碼。NoPE 的結論在 `nope-bidir-causal` 分支上取得，本分支用不到，已全數刪除。
+`rope_type` 現在只有 `default | yarn`。
 
 ## 問題
 
