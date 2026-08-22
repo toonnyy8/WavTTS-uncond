@@ -73,7 +73,12 @@ class CustomDataset(Dataset):
         # fired on a fifth of the corpus, pulling those clips as low as 0.052. The
         # waveform leaves the +-1 domain deliberately; peak_normalize() is what anything
         # writing it to a file or feeding a pretrained model calls first.
+        # DC is removed first, so the RMS below is the signal's standard deviation rather
+        # than sqrt(mean^2 + var). A recording carrying converter bias would otherwise
+        # have that bias counted as loudness and get scaled down for it, and the offset
+        # would survive into training as a constant the model has to learn to emit.
         if self.target_rms > 0:
+            audio = audio - audio.mean()
             rms = audio.pow(2).mean().sqrt()
             if rms > 1e-5:
                 audio = audio * (self.target_rms / rms)

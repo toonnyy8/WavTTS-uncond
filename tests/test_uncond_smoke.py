@@ -226,6 +226,7 @@ def test_dataset_normalizes_loudness(tmp_path):
         "loud": 0.8 * torch.sin(2 * torch.pi * 220 * t),
         "quiet": 0.01 * torch.sin(2 * torch.pi * 220 * t),
         "peaky": torch.zeros(16000).index_fill_(0, torch.arange(0, 16000, 400), 1.0),  # high crest factor
+        "biased": 0.3 * torch.sin(2 * torch.pi * 220 * t) + 0.2,  # converter DC offset
     }
     rows = []
     for name, wav in signals.items():
@@ -241,6 +242,17 @@ def test_dataset_normalizes_loudness(tmp_path):
         assert wav.pow(2).mean().sqrt().item() == pytest.approx(1.0, rel=1e-5), name
     # and the waveform is expected to leave +-1 -- the impulse train's crest factor is 20
     assert ds[2]["wav"].abs().max().item() > 1.0
+
+    # DC is removed before the RMS is taken, so the offset is not counted as loudness:
+    # the biased clip has the same AC level as an unbiased one, and lands on target
+    biased = ds[3]["wav"]
+    assert biased.mean().item() == pytest.approx(0.0, abs=1e-5)
+    assert biased.pow(2).mean().sqrt().item() == pytest.approx(1.0, rel=1e-5)
+    # and the stronger form: the bias becomes invisible. "loud" and "biased" are the same
+    # 220 Hz tone at different amplitudes, one of them offset. After DC removal and RMS
+    # normalization they have to come out as the same waveform -- which they cannot if
+    # the offset is counted as loudness, since it would scale "biased" down by 1.37x.
+    assert torch.allclose(ds[0]["wav"], biased, atol=2e-3)
 
     off = CustomDataset(rows, durations=[1.0] * len(rows), target_rms=0.0)
     assert off[0]["wav"].pow(2).mean().sqrt().item() == pytest.approx(0.8 / 2**0.5, abs=0.01)
