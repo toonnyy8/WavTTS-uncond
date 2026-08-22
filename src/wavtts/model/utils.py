@@ -219,3 +219,22 @@ def get_epss_timesteps(n, device, dtype):
 
 def masked_mean(x, mask):
     return (x * mask).sum() / mask.sum()
+
+
+def peak_normalize(wav: torch.Tensor, limit: float = 0.99) -> torch.Tensor:
+    """Bring a waveform inside +-limit before it is written to a file or fed to a
+    pretrained audio model.
+
+    Training normalizes loudness to a fixed RMS, not a fixed peak, so the waveform sits
+    outside +-1 on purpose — speech runs a crest factor around 7, which puts a clip at
+    RMS 1.0 near a peak of 7. Anything that expects the conventional +-1 domain (a wav
+    file, UTMOS, a speaker encoder) has to be handed a scaled copy.
+
+    Only scales down. A clip already inside the limit keeps its loudness, so the copy
+    stays comparable with quieter ones; use the `rms` metric to track absolute level,
+    never the audio file.
+    """
+    peak = wav.abs().max()
+    if peak <= limit or peak == 0:
+        return wav
+    return wav * (limit / peak)
