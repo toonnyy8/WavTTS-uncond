@@ -69,8 +69,8 @@ ckpts:
   log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
   log_samples_secs: [4, 10, 20, 40]  # one length per seed; see WavTTS.yaml
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
-  save_per_updates: 5000  # numbered checkpoint
-  keep_last_n_checkpoints: 2
-  last_per_updates: 2000  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  save_per_updates: 10000  # numbered checkpoint
+  keep_last_n_checkpoints: 5
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
   exp_name: ${model.name}_${datasets.name}
   save_dir: ckpts/${model.name}_${datasets.name}

@@ -516,8 +516,10 @@ class Trainer:
                     scores = {k: [] for k in keys}
                     for (gen_seed, gen_sec), gen_audio in gen_audios.items():
                         tag = f"{gen_sec:g}s_seed{gen_seed}"
-                        # the model generates at target_rms, which is well outside +-1;
-                        # only the file and the TB audio get scaled, never the metrics
+                        # the model generates at target_rms, which is well outside +-1.
+                        # Everything meant for a human — the wav file, the TB player, the
+                        # mel plot's colour scale — gets the scaled copy; the metrics get
+                        # the raw output, so gen/rms stays the one place level is read.
                         file_audio = peak_normalize(gen_audio)
                         torchaudio.save(
                             f"{log_samples_path}/update_{global_update}_{tag}.wav",
@@ -545,7 +547,7 @@ class Trainer:
                                 f"gen/audio_{tag}", file_audio, global_update, sample_rate=target_sample_rate
                             )
                             self.writer.add_figure(
-                                f"gen/mel_{tag}", mel_figure(wav_1d, target_sample_rate), global_update
+                                f"gen/mel_{tag}", mel_figure(file_audio[0], target_sample_rate), global_update
                             )
 
                     # the mean across lengths stays for continuity with earlier runs; read
