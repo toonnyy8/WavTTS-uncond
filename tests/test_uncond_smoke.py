@@ -719,3 +719,56 @@ def test_signal_metrics_are_scale_invariant():
 
     assert silence_ratio(torch.zeros(16000)) == 1.0  # degenerate input, no divide by zero
     assert clipping_rate(torch.zeros(16000)) == 0.0
+
+
+def test_clean_only_training_labels_everything_clean_and_never_mixes():
+    from wavtts.model.backbones.dit import STATE_CLEAN
+
+    model = make_model(state_null_prob=0.0, p_mix=0.5)
+    mixed = []
+    model._mix_augment = lambda x1, lens, flags: (mixed.append(flags.any().item()), x1)[1]
+    torch.manual_seed(0)
+    state, _ = _observed_states(model, batch=512)
+    assert (state == STATE_CLEAN).all()
+    assert mixed == [False]  # only null samples may mix, and there are none
+
+
+def test_guidance_is_off_when_the_null_branch_was_never_trained():
+    # a clean-only model's null branch is untrained noise; sample() must ignore
+    # cfg_strength rather than steer with it
+    clean_only = make_model(state_null_prob=0.0)
+    _reinit_nonzero(clean_only.transformer)
+    a, _ = clean_only.sample(1600, batch=1, steps=2, cfg_strength=2.0, seed=0)
+    b, _ = clean_only.sample(1600, batch=1, steps=2, cfg_strength=0.0, seed=0)
+    assert torch.equal(a, b)
+
+    with_cfg = make_model(state_null_prob=0.5)
+    _reinit_nonzero(with_cfg.transformer)
+    c, _ = with_cfg.sample(1600, batch=1, steps=2, cfg_strength=2.0, seed=0)
+    d, _ = with_cfg.sample(1600, batch=1, steps=2, cfg_strength=0.0, seed=0)
+    assert not torch.allclose(c, d)  # otherwise the check above is vacuous
+
+
+def test_clean_config_instantiates_model_and_trains_one_step():
+    from importlib.resources import files as pkg_files
+
+    from hydra.utils import get_class
+    from omegaconf import OmegaConf
+
+    from wavtts.model import CFM
+
+    cfg = OmegaConf.load(str(pkg_files("wavtts").joinpath("configs/WavTTS_clean.yaml")))
+    assert cfg.model.cfm.state_null_prob == 0.0
+    arch = OmegaConf.to_container(cfg.model.arch, resolve=True)
+    arch.update(dim=64, depth=2, heads=2)
+    cfm_kwargs = OmegaConf.to_container(cfg.model.cfm, resolve=True)
+    model_cls = get_class(f"wavtts.model.{cfg.model.backbone}")
+    model = CFM(
+        transformer=model_cls(**arch, wav_frame_len=cfg.model.waveform.wav_frame_len),
+        waveform_kwargs=OmegaConf.to_container(cfg.model.waveform, resolve=True),
+        **cfm_kwargs,
+    )
+    torch.manual_seed(0)
+    loss, _ = model(torch.randn(2, 16000) * 0.1)
+    assert torch.isfinite(loss)
+    loss.backward()

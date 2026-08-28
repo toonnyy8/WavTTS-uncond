@@ -245,7 +245,9 @@ class CFM(nn.Module):
                     return pred
                 return self._x_to_v(pred, x, t)
 
-            if cfg_strength < 1e-5:
+            # state_null_prob == 0 means the null branch was never trained, so its
+            # prediction is noise: guidance is off no matter what the caller asked for
+            if cfg_strength < 1e-5 or self.state_null_prob <= 0:
                 pred = self.transformer(x=x, state=state, time=t)
                 return to_v(pred)
 
