@@ -54,6 +54,8 @@ class CFM(nn.Module):
         # waveform geometry
         waveform_kwargs = dict(waveform_kwargs)
         self.wav_frame_len = int(waveform_kwargs.pop("wav_frame_len", 160))
+        hop = waveform_kwargs.pop("wav_frame_hop", None)
+        self.wav_frame_hop = self.wav_frame_len if hop is None else int(hop)
         self.num_channels = self.wav_frame_len
 
         # no-leaky mixing augmentation / state conditioning
@@ -69,7 +71,7 @@ class CFM(nn.Module):
         self.dim = transformer.dim
 
         if hasattr(self.transformer, "set_wav_frame_len"):
-            self.transformer.set_wav_frame_len(self.wav_frame_len)
+            self.transformer.set_wav_frame_len(self.wav_frame_len, self.wav_frame_hop)
 
         # conditional flow related
         self.sigma = sigma
@@ -229,7 +231,9 @@ class CFM(nn.Module):
         state = torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long)
 
         requested = int(duration)
-        aligned = int(math.ceil(requested / self.wav_frame_len) * self.wav_frame_len)
+        # the framing pads up to a whole number of hops, so align here and the generated
+        # length is exactly what the caller asked for rather than a frame more
+        aligned = int(math.ceil(requested / self.wav_frame_hop) * self.wav_frame_hop)
 
         # dedicated generator: sampling with a fixed seed must not perturb the
         # global RNG (e.g. mid-training checkpoint sampling)

@@ -82,6 +82,7 @@ class DiT(nn.Module):
         dropout=0.1,
         ff_mult=4,
         wav_frame_len=160,
+        wav_frame_hop=None,  # framing stride; None or == wav_frame_len means no overlap
         qk_norm=None,
         attn_mask_enabled=False,
         long_skip_connection=False,
@@ -139,7 +140,7 @@ class DiT(nn.Module):
         self.initialize_weights()
 
         # raw waveform tokenization.
-        self.wav_frame_len = wav_frame_len
+        self.set_wav_frame_len(wav_frame_len, wav_frame_hop)
 
     def initialize_weights(self):
         # State (class) embedding:
@@ -157,14 +158,36 @@ class DiT(nn.Module):
         if self.proj_out_output_layer.bias is not None:
             nn.init.constant_(self.proj_out_output_layer.bias, 0)
 
-    def set_wav_frame_len(self, wav_frame_len: int):
+    def set_wav_frame_len(self, wav_frame_len: int, wav_frame_hop: int | None = None):
         self.wav_frame_len = int(wav_frame_len)
+        self.wav_frame_hop = int(wav_frame_hop) if wav_frame_hop is not None else self.wav_frame_len
 
         if self.wav_frame_len != self.proj_out_dim:
             raise ValueError(
                 f"wav_frame_len ({self.wav_frame_len}) must equal proj_out_dim ({self.proj_out_dim}) "
                 "for reshape wav front-end."
             )
+        if not 0 < self.wav_frame_hop <= self.wav_frame_len:
+            raise ValueError(f"wav_frame_hop ({self.wav_frame_hop}) must be in (0, wav_frame_len].")
+        if self.wav_frame_len % self.wav_frame_hop != 0:
+            # keeps the token count a clean function of the sample count and puts every
+            # sample under the same number of frames, so the overlap-add weights are uniform
+            raise ValueError(
+                f"wav_frame_len ({self.wav_frame_len}) must be a multiple of wav_frame_hop ({self.wav_frame_hop})."
+            )
+
+        # Synthesis window for overlap-add. The analysis side is an unwindowed slice, so
+        # a plain (not root) Hann is the matching synthesis window: with a hop that divides
+        # the frame it is COLA, and _tokens_to_wav divides by the actual window sum anyway,
+        # which also fixes up the ramp at the two ends.
+        window = torch.hann_window(self.wav_frame_len, periodic=True)
+        self.register_buffer("ola_window", window, persistent=False)
+
+    @property
+    def wav_pad_front(self) -> int:
+        """Left-pad so the first real sample sits under a full set of frames, not the
+        window's rising edge. Zero when there is no overlap."""
+        return self.wav_frame_len - self.wav_frame_hop
 
     def _wav_to_tokens(
         self,
@@ -174,30 +197,51 @@ class DiT(nn.Module):
     ):
         assert wav.ndim == 2, f"Expected [B, N] wav input, got {tuple(wav.shape)}"
 
-        bsz, num_samples = wav.shape
-        frame_len = self.wav_frame_len
-        pad_len = (frame_len - (num_samples % frame_len)) % frame_len
+        num_samples = wav.shape[1]
+        frame_len, hop = self.wav_frame_len, self.wav_frame_hop
+        pad_front = self.wav_pad_front
+        pad_back = pad_front + (-num_samples) % hop
 
-        if pad_len > 0:
-            wav = F.pad(wav, (0, pad_len), value=0.0)
-            if mask is not None:
-                mask = F.pad(mask, (0, pad_len), value=False)
-
-        tokens = wav.view(bsz, -1, frame_len)
+        wav = F.pad(wav, (pad_front, pad_back), value=0.0)
+        tokens = wav.unfold(-1, frame_len, hop)
 
         token_mask = None
         if mask is not None:
-            token_mask = mask.view(bsz, -1, frame_len).any(dim=-1)
+            mask = F.pad(mask, (pad_front, pad_back), value=False)
+            token_mask = mask.unfold(-1, frame_len, hop).any(dim=-1)
 
         token_lens = None
         if lens is not None:
-            token_lens = (lens.to(dtype=torch.long, device=wav.device) + frame_len - 1) // frame_len
+            # a frame counts as real if it touches any real sample, matching token_mask
+            token_lens = (lens.to(dtype=torch.long, device=wav.device) + frame_len - 1) // hop
 
         return tokens, token_mask, token_lens
 
     def _tokens_to_wav(self, tokens: torch.Tensor, target_num_samples: int):
-        wav = tokens.reshape(tokens.shape[0], -1)
-        return wav[:, :target_num_samples]
+        frame_len, hop = self.wav_frame_len, self.wav_frame_hop
+        if hop == frame_len:
+            wav = tokens.reshape(tokens.shape[0], -1)
+            return wav[:, :target_num_samples]
+
+        num_tokens = tokens.shape[1]
+        num_padded = (num_tokens - 1) * hop + frame_len
+        window = self.ola_window
+
+        def overlap_add(frames):  # [b, t, frame_len] -> [b, num_padded]
+            folded = F.fold(frames.transpose(1, 2), (1, num_padded), kernel_size=(1, frame_len), stride=(1, hop))
+            return folded.reshape(frames.shape[0], num_padded)
+
+        wav = overlap_add(tokens * window.to(tokens.dtype))
+        # Overlapping frames each predict the same samples and will not agree. Dividing by
+        # the summed window turns the weighted sum into a weighted mean, so a stretch every
+        # frame agrees on comes back unscaled instead of shaped by the window. The divide
+        # runs in fp32 on purpose: in bf16 the window sum carries about three digits, and
+        # that error would ride out on the waveform as a tone at the frame rate.
+        norm = overlap_add(window.float().expand(1, num_tokens, frame_len))
+        wav = (wav.float() / norm.clamp_min(1e-8)).to(tokens.dtype)
+
+        pad_front = self.wav_pad_front
+        return wav[:, pad_front : pad_front + target_num_samples]
 
     def ckpt_wrapper(self, module):
         # https://github.com/chuanyangjin/fast-DiT/blob/main/models.py

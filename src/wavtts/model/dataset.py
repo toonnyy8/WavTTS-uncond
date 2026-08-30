@@ -18,6 +18,7 @@ class CustomDataset(Dataset):
         durations=None,
         target_sample_rate=16_000,
         wav_frame_len: int = 160,
+        wav_frame_hop: int | None = None,
         target_rms: float = 0.1,  # per-utterance loudness normalization; 0 disables
         **_,
     ):
@@ -25,6 +26,10 @@ class CustomDataset(Dataset):
         self.durations = durations
         self.target_sample_rate = target_sample_rate
         self.wav_frame_len = wav_frame_len
+        # batches are budgeted in model tokens, and overlapping frames produce one token
+        # per hop, not per frame. Keeping the frame length here would undercount by
+        # wav_frame_len / wav_frame_hop and blow up memory by the same factor.
+        self.wav_frame_hop = wav_frame_len if wav_frame_hop is None else wav_frame_hop
         self.target_rms = target_rms
 
         self._resamplers = {}
@@ -33,8 +38,8 @@ class CustomDataset(Dataset):
         if (
             self.durations is not None
         ):  # Please make sure the separately provided durations are correct, otherwise 99.99% OOM
-            return self.durations[index] * self.target_sample_rate / self.wav_frame_len
-        return self.data[index]["duration"] * self.target_sample_rate / self.wav_frame_len
+            return self.durations[index] * self.target_sample_rate / self.wav_frame_hop
+        return self.data[index]["duration"] * self.target_sample_rate / self.wav_frame_hop
 
     def __len__(self):
         return len(self.data)

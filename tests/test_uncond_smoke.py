@@ -749,7 +749,8 @@ def test_guidance_is_off_when_the_null_branch_was_never_trained():
     assert not torch.allclose(c, d)  # otherwise the check above is vacuous
 
 
-def test_clean_config_instantiates_model_and_trains_one_step():
+@pytest.mark.parametrize("config", ["WavTTS_clean.yaml", "WavTTS_clean_ola.yaml"])
+def test_clean_config_instantiates_model_and_trains_one_step(config):
     from importlib.resources import files as pkg_files
 
     from hydra.utils import get_class
@@ -757,7 +758,7 @@ def test_clean_config_instantiates_model_and_trains_one_step():
 
     from wavtts.model import CFM
 
-    cfg = OmegaConf.load(str(pkg_files("wavtts").joinpath("configs/WavTTS_clean.yaml")))
+    cfg = OmegaConf.load(str(pkg_files("wavtts").joinpath(f"configs/{config}")))
     assert cfg.model.cfm.state_null_prob == 0.0
     arch = OmegaConf.to_container(cfg.model.arch, resolve=True)
     arch.update(dim=64, depth=2, heads=2)
@@ -768,7 +769,93 @@ def test_clean_config_instantiates_model_and_trains_one_step():
         waveform_kwargs=OmegaConf.to_container(cfg.model.waveform, resolve=True),
         **cfm_kwargs,
     )
+    hop = cfg.model.waveform.get("wav_frame_hop", cfg.model.waveform.wav_frame_len)
+    assert model.transformer.wav_frame_hop == hop
     torch.manual_seed(0)
     loss, _ = model(torch.randn(2, 16000) * 0.1)
     assert torch.isfinite(loss)
     loss.backward()
+
+
+# overlapping framing + windowed overlap-add
+
+
+@pytest.mark.parametrize("hop", [160, 80, 40])
+def test_frame_roundtrip_is_lossless(hop):
+    # every sample is covered by frames that all carry its true value, so the windowed
+    # overlap-add has to hand back exactly what went in — padding, fold geometry and
+    # window normalization all have to be right for this to hold
+    from wavtts.model.backbones.dit import DiT
+
+    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=hop)
+    wav = torch.randn(3, 4321)
+    tokens, _, _ = dit._wav_to_tokens(wav)
+    assert tokens.shape[-1] == 160
+    out = dit._tokens_to_wav(tokens, target_num_samples=wav.shape[1])
+    assert out.shape == wav.shape
+    assert torch.allclose(out, wav, atol=1e-5)
+
+
+def test_hop_sets_the_token_rate():
+    from wavtts.model.backbones.dit import DiT
+
+    wav = torch.randn(2, 16000)
+    counts = {}
+    for hop in (160, 80, 40):
+        dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=hop)
+        tokens, mask, lens = dit._wav_to_tokens(
+            wav, mask=torch.ones(2, 16000, dtype=torch.bool), lens=torch.tensor([16000, 8000])
+        )
+        counts[hop] = tokens.shape[1]
+        assert mask.shape[1] == tokens.shape[1]
+        assert lens[0].item() == tokens.shape[1]  # a full-length row spans every token
+        assert lens[1].item() < tokens.shape[1]
+    assert counts == {160: 100, 80: 201, 40: 403}
+
+
+def test_no_overlap_is_the_old_reshape_framing():
+    from wavtts.model.backbones.dit import DiT
+
+    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160)  # hop defaults to frame_len
+    assert dit.wav_frame_hop == 160 and dit.wav_pad_front == 0
+    wav = torch.randn(2, 1600)
+    tokens, _, _ = dit._wav_to_tokens(wav)
+    assert torch.equal(tokens, wav.view(2, 10, 160))
+
+
+def test_synthesis_window_is_smooth_and_cola():
+    from wavtts.model.backbones.dit import DiT
+
+    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=80)
+    w = dit.ola_window
+    assert w[0] == 0 and w.argmax().item() == 80  # tapered to zero, peak in the middle
+    # constant-overlap-add: shifted copies sum to a constant, so a signal every frame
+    # agrees on comes back unscaled even before the normalization divide
+    summed = w[:80] + w[80:]
+    assert torch.allclose(summed, torch.ones(80), atol=1e-6)
+
+
+@pytest.mark.parametrize("hop", [160, 80])
+def test_overlapping_model_forward_and_sample(hop):
+    from hydra.utils import get_class  # noqa: F401
+
+    from wavtts.model import CFM, DiT
+
+    torch.manual_seed(0)
+    model = CFM(
+        transformer=DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160),
+        waveform_kwargs=dict(wav_frame_len=160, wav_frame_hop=hop, target_sample_rate=16000),
+        state_null_prob=0.0,
+    )
+    assert model.transformer.wav_frame_hop == hop
+    _reinit_nonzero(model.transformer)
+
+    # ragged batch: the second row is padded, so mask and lens both have to survive the
+    # regrouping into overlapping tokens
+    loss, _ = model(torch.randn(2, 3200) * 0.1, lens=torch.tensor([3200, 1712]))
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    out, _ = model.sample(1500, batch=1, steps=2, seed=0)
+    assert out.shape == (1, 1500)  # aligned up to the hop grid, not a whole frame
+    assert torch.isfinite(out).all()
