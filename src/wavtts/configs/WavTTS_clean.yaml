@@ -21,21 +21,23 @@ datasets:
   name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
                       # 244.6 h. The arrow also carries a text column; nothing reads it, this
                       # model is unconditional
-  batch_size_per_gpu: 3200  # single 24 GB GPU (RTX 4090) w/ bf16, no activation checkpointing
+  batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing:
+                             # the whole 19200-frame update fits in one batch, no accumulation
   batch_size_type: frame  # frame | sample
-  max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
+  max_samples: 384  # 6x the old 64, so the frame budget stays the binding cap. At 64 the
+                    # sampler tops out at 17.6k of the 19200 frames on short clips
   num_workers: 16
 
 optim:
-  epochs: 150  # 4.56x the data at 53.7 h gives 5541 updates/epoch, so 150 epochs is 831k
-               # total updates — the same compute budget the 686 x 1213 clean-100 schedule
-               # was sized for, spent on 4.56x more unique audio instead of more passes.
-               # The LR decay horizon is derived from this, so changing it rescales the
-               # whole schedule; resuming a checkpoint would pin it instead, since
-               # SequentialLR stores total_iters in its state_dict
+  epochs: 177  # one 19200-frame batch per update is 4705 updates/epoch (vs 5541 under 6x
+               # accumulation), so 177 epochs is 833k updates — the same budget 150 x 5541
+               # bought, which in turn matched the 686 x 1213 clean-100 schedule.
+               # This only sets where training stops: the resumed run keeps the LR horizon
+               # from the checkpoint (SequentialLR stores total_iters, decay ends at 831150),
+               # so 177 lands the last update on the LR floor instead of 26k short of it
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
-  grad_accumulation_steps: 6  # 6 x 3200 = 19200 frames/update; cheaper than activation checkpointing here
+  grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
 
@@ -65,7 +67,8 @@ model:
     ff_mult: 4
     qk_norm: null  # null | rms_norm
     attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
-    checkpoint_activations: False  # recompute activations and save memory for extra compute
+    checkpoint_activations: True  # recompute activations so the full 19200-frame update fits
+                                  # in one batch, trading ~30% step time for no accumulation
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
