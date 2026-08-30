@@ -1,17 +1,18 @@
-# Overlapping-frames arm of WavTTS_clean.yaml. The waveform front end slices frames at a
-# hop of half a frame instead of butting them end to end, and the output is reassembled by
-# overlap-add under a Hann window (see DiT._wav_to_tokens / _tokens_to_wav). Every sample
-# is then predicted by two tokens and blended, so a frame boundary is a crossfade rather
-# than a splice — the buzz at the 100 Hz frame rate is what this is aimed at.
+# Overlapping-frames arm of WavTTS_clean.yaml. The waveform front end slices 320-sample
+# frames at a hop of 160 instead of butting 160-sample frames end to end, and the output
+# is reassembled by overlap-add under a Hann window (see DiT._wav_to_tokens /
+# _tokens_to_wav). Every sample is then predicted by two tokens and blended, so a frame
+# boundary is a crossfade rather than a splice — the buzz at the 100 Hz frame rate is
+# what this is aimed at.
 #
-# Everything else matches WavTTS_clean.yaml: no CFG, clean-460, same architecture and
-# optimizer. The two knobs below that do change are consequences of the token rate
-# doubling to 200 Hz, not independent choices — see logn_ref_len and epochs.
+# The frame doubles with the overlap, so the hop — and with it the token rate, 100 Hz —
+# is exactly what WavTTS_clean.yaml runs. Same tokens per second of audio, same tokens
+# per batch, same updates per epoch, same schedule: the two arms differ in the framing
+# and nothing else. What each token carries changes, 20 ms of audio seen through a window
+# rather than 10 ms seen whole, which is the point.
 #
-# The cost: a token is now half a frame of new audio, so a 19200-token batch carries
-# ~91 s of audio instead of ~187 s. At a matched update budget this arm sees half the
-# audio the non-overlapping arm does. Matching audio instead would need a 38400-token
-# batch, which does not fit in 24 GB.
+# Not resumable from the Clean checkpoint: the frame width is the input and output width
+# of the model, so input_embed and proj_out change shape (+307k params, +0.05%).
 #
 # Launch with bf16:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -29,19 +30,17 @@ datasets:
                       # model is unconditional
   batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing.
                              # This budget is in model tokens, and CustomDataset.get_frame_len
-                             # divides duration by the hop, so the same number still means the
-                             # same memory — it just buys half as much audio at hop 80
+                             # divides duration by the hop, which is 160 here as in the
+                             # non-overlapping arm: same tokens, same audio, same memory
   batch_size_type: frame  # frame | sample
-  max_samples: 384  # not binding at this token rate (mean 15.5 sequences per batch); kept
-                    # equal to the non-overlapping arm so the two configs differ in one place
+  max_samples: 384  # the frame budget is the binding cap, as in the non-overlapping arm
   num_workers: 16
 
 optim:
-  epochs: 86  # at 200 Hz a 19200-token batch holds half as many clips, so an epoch is
-              # 9673 updates instead of 4705. 86 epochs is 832k updates — the same update
-              # budget the non-overlapping arm runs, which is what keeps the two comparable
-              # on compute. It is 86 passes over the data rather than 177, and the LR decay
-              # horizon is derived from it, so changing it rescales the whole schedule
+  epochs: 177  # the hop is unchanged, so an epoch is the same 4705 updates and 177 epochs
+               # is the same 833k-update budget the non-overlapping arm runs — matched on
+               # both compute and data. The LR decay horizon is derived from this, so
+               # changing it rescales the whole schedule
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
   grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
@@ -80,26 +79,29 @@ model:
     audio_proj_dim: 1024
     audio_proj_hidden: 768
     # length extrapolation — randomized positional encoding (Ruoss et al. 2023), see
-    # wavtts/model/rope.py. Training data tops out at 5958 tokens (29.8 s at 200 Hz), so
-    # gamma=4 puts the longest clip's positions out to 23832, still 119 s — the physical
-    # span is unchanged, only the token count doubled. Nothing wraps either: at 200 Hz
-    # the slowest RoPE dim at base=10000 turns once every 235 s, still past 119 s.
-    # Reaching past 119 s means raising gamma and retraining.
+    # wavtts/model/rope.py. Training data tops out at 2979 tokens (29.8 s), so gamma=4
+    # puts the longest clip's positions out to 11916 (119 s). Generating up to that
+    # length therefore uses positions the model trained on, with no inference-time
+    # knob: vanilla RoPE at base=10000 has its slowest dim turning once every 471 s,
+    # so nothing wraps. Reaching past 119 s means raising gamma and retraining.
     rpe_gamma: 4.0           # per-sample stretch bound: L_t ~ U[n, n*gamma], drawn fresh
                              # every forward. gamma=1 disables. Not a curriculum: every
                              # batch spans contiguous through 4x from the first update
-    logn_ref_len: 1000       # entropy-invariant scaling reference, clamped at 1 so it only
-                             # sharpens. Doubled with the token rate: 1000 tokens at 200 Hz
-                             # is the same 5 s the non-overlapping arm's 500 was, so the
-                             # temperature curve stays put in seconds. This is the only
-                             # attention temperature in the model
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. The
+                             # token rate is unchanged, so this is unchanged. This is the
+                             # only attention temperature in the model
   waveform:
     target_sample_rate: 16000
-    wav_frame_len: 160    # window length; 160 @16k = 10 ms of audio per token
-    wav_frame_hop: 80     # framing stride. Must divide wav_frame_len; equal to it (the
-                          # default when omitted) is the old end-to-end reshape framing.
-                          # 80 is 50% overlap, so the token rate is 200 Hz and each output
-                          # sample is the Hann-weighted mean of two tokens' predictions
+    wav_frame_len: 320    # window length; 320 @16k = 20 ms of audio per token, twice the
+                          # non-overlapping arm's, and it sets the model's input and
+                          # output width
+    wav_frame_hop: 160    # framing stride, and what the token rate is actually set by:
+                          # 160 @16k = 100 Hz, the same rate the non-overlapping arm runs.
+                          # Must divide wav_frame_len; equal to it (the default when
+                          # omitted) is the old end-to-end reshape framing. At half the
+                          # frame it is 50% overlap, so every output sample is the
+                          # Hann-weighted mean of two tokens' predictions
     target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
 
 ckpts:

@@ -780,37 +780,40 @@ def test_clean_config_instantiates_model_and_trains_one_step(config):
 # overlapping framing + windowed overlap-add
 
 
-@pytest.mark.parametrize("hop", [160, 80, 40])
-def test_frame_roundtrip_is_lossless(hop):
+@pytest.mark.parametrize("frame_len,hop", [(160, 160), (160, 80), (160, 40), (320, 160)])
+def test_frame_roundtrip_is_lossless(frame_len, hop):
     # every sample is covered by frames that all carry its true value, so the windowed
     # overlap-add has to hand back exactly what went in — padding, fold geometry and
     # window normalization all have to be right for this to hold
     from wavtts.model.backbones.dit import DiT
 
-    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=hop)
+    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=frame_len, wav_frame_hop=hop)
     wav = torch.randn(3, 4321)
     tokens, _, _ = dit._wav_to_tokens(wav)
-    assert tokens.shape[-1] == 160
+    assert tokens.shape[-1] == frame_len
     out = dit._tokens_to_wav(tokens, target_num_samples=wav.shape[1])
     assert out.shape == wav.shape
     assert torch.allclose(out, wav, atol=1e-5)
 
 
-def test_hop_sets_the_token_rate():
+def test_hop_not_frame_len_sets_the_token_rate():
+    # (320, 160) is the overlapping arm: the frame doubles with the overlap, so the token
+    # count per second of audio matches the non-overlapping (160, 160) baseline
     from wavtts.model.backbones.dit import DiT
 
     wav = torch.randn(2, 16000)
     counts = {}
-    for hop in (160, 80, 40):
-        dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=hop)
+    for frame_len, hop in ((160, 160), (160, 80), (160, 40), (320, 160)):
+        dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=frame_len, wav_frame_hop=hop)
         tokens, mask, lens = dit._wav_to_tokens(
             wav, mask=torch.ones(2, 16000, dtype=torch.bool), lens=torch.tensor([16000, 8000])
         )
-        counts[hop] = tokens.shape[1]
+        counts[(frame_len, hop)] = tokens.shape[1]
         assert mask.shape[1] == tokens.shape[1]
         assert lens[0].item() == tokens.shape[1]  # a full-length row spans every token
         assert lens[1].item() < tokens.shape[1]
-    assert counts == {160: 100, 80: 201, 40: 403}
+    assert counts == {(160, 160): 100, (160, 80): 201, (160, 40): 403, (320, 160): 101}
+    assert counts[(320, 160)] - counts[(160, 160)] == 1  # one extra frame for the front pad
 
 
 def test_no_overlap_is_the_old_reshape_framing():
@@ -826,25 +829,23 @@ def test_no_overlap_is_the_old_reshape_framing():
 def test_synthesis_window_is_smooth_and_cola():
     from wavtts.model.backbones.dit import DiT
 
-    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=160, wav_frame_hop=80)
+    dit = DiT(dim=32, depth=1, heads=2, dim_head=16, wav_frame_len=320, wav_frame_hop=160)
     w = dit.ola_window
-    assert w[0] == 0 and w.argmax().item() == 80  # tapered to zero, peak in the middle
+    assert w[0] == 0 and w.argmax().item() == 160  # tapered to zero, peak in the middle
     # constant-overlap-add: shifted copies sum to a constant, so a signal every frame
     # agrees on comes back unscaled even before the normalization divide
-    summed = w[:80] + w[80:]
-    assert torch.allclose(summed, torch.ones(80), atol=1e-6)
+    summed = w[:160] + w[160:]
+    assert torch.allclose(summed, torch.ones(160), atol=1e-6)
 
 
-@pytest.mark.parametrize("hop", [160, 80])
-def test_overlapping_model_forward_and_sample(hop):
-    from hydra.utils import get_class  # noqa: F401
-
+@pytest.mark.parametrize("frame_len,hop", [(160, 160), (160, 80), (320, 160)])
+def test_overlapping_model_forward_and_sample(frame_len, hop):
     from wavtts.model import CFM, DiT
 
     torch.manual_seed(0)
     model = CFM(
-        transformer=DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160),
-        waveform_kwargs=dict(wav_frame_len=160, wav_frame_hop=hop, target_sample_rate=16000),
+        transformer=DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=frame_len),
+        waveform_kwargs=dict(wav_frame_len=frame_len, wav_frame_hop=hop, target_sample_rate=16000),
         state_null_prob=0.0,
     )
     assert model.transformer.wav_frame_hop == hop
