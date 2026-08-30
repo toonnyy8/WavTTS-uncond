@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Restart-on-crash supervisor for the clean-460 run.
+# Restart-on-crash supervisor for a training run.
 #
-# The 460 h run has already died once to `CUDA error: unspecified launch failure`
-# (update 56539) — a driver/hardware hiccup, not OOM, so a plain relaunch fixes it.
-# Resume is full-state from model_last.pt, which is written every last_per_updates
-# (2500), so a crash costs at most ~2500 updates of work.
+# The clean-460 run died once to `CUDA error: unspecified launch failure` (update
+# 56539) — a driver/hardware hiccup, not OOM, so a plain relaunch fixes it. Resume
+# is full-state from model_last.pt, which is written every last_per_updates (2500),
+# so a crash costs at most ~2500 updates of work.
 #
-#   nohup scripts/train_clean_loop.sh >/dev/null 2>&1 &
+#   nohup scripts/train_loop.sh [config.yaml] >/dev/null 2>&1 &
 #
 # To stop training: kill this script FIRST, then the trainer — otherwise the
 # supervisor sees the exit as a crash and restarts it.
-#   pkill -f train_clean_loop.sh
-#   pkill -f '.venv/bin/python src/wavtts/train/train.py --config-name WavTTS_clean.yaml'
+#   pkill -f train_loop.sh
+#   pkill -f '.venv/bin/python src/wavtts/train/train.py --config-name <config.yaml>'
 
 set -u
 cd "$(dirname "$0")/.."
 
-CONFIG=WavTTS_clean.yaml
-LOG=logs/train_clean.log
+CONFIG=${1:-WavTTS_clean.yaml}
+LOG=logs/train_${CONFIG%.yaml}.log
 TRAINER_CMDLINE=".venv/bin/python src/wavtts/train/train.py --config-name $CONFIG"
 mkdir -p logs
 

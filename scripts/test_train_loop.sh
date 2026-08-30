@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Self-check for train_clean_loop.sh: restarts on crash, stops on success, and waits
+# Self-check for train_loop.sh: restarts on crash, stops on success, and waits
 # for a run already in flight. Runs the real script with the trainer swapped for a stub
 # and a fake config name, so it never touches the GPU or a checkpoint.
-#   scripts/test_train_clean_loop.sh
+#   scripts/test_train_loop.sh
 set -u
 cd "$(dirname "$0")/.."
 
@@ -13,13 +13,14 @@ mkdir -p "$WORK/scripts" "$WORK/logs" "$WORK/.venv/bin" "$WORK/src/wavtts/train"
 python3 - "$WORK" <<'PY'
 import sys
 w = sys.argv[1]
-s = open('scripts/train_clean_loop.sh').read()
-s = s.replace('CONFIG=WavTTS_clean.yaml', 'CONFIG=FAKE_TEST.yaml')
+s = open('scripts/train_loop.sh').read()
+s = s.replace('CONFIG=${1:-WavTTS_clean.yaml}', 'CONFIG=FAKE_TEST.yaml')
 s = s.replace('''    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
         .venv/bin/accelerate launch --mixed_precision bf16 \\
         src/wavtts/train/train.py --config-name "$CONFIG" >>"$LOG" 2>&1''',
               '''    bash -c 'sleep 1; exit $(cat rc)' >>"$LOG" 2>&1''')
 s = s.replace('sleep 60', 'sleep 1').replace('sleep 30', 'sleep 1')
+s = s.replace('LOG=logs/train_${CONFIG%.yaml}.log', 'LOG=logs/train_clean.log')
 open(w + '/scripts/loop.sh', 'w').write(s)
 PY
 chmod +x "$WORK/scripts/loop.sh"
