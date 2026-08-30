@@ -1,8 +1,11 @@
 # No-CFG ablation of WavTTS.yaml: every sample is labelled clean, so the null branch
 # and the mixing augmentation never fire and there is nothing to guide against.
 # Sampling ignores cfg_strength (CFM.sample switches guidance off when
-# state_null_prob == 0). Everything else — architecture, optimizer, RPE, data — is
-# identical to WavTTS.yaml, so the pair is a clean A/B on CFG alone.
+# state_null_prob == 0). Architecture, optimizer and RPE are identical to WavTTS.yaml;
+# the data no longer is — see below.
+#
+# Trained from scratch on clean-460 (244.6 h). The Norm/CFG arm is 100 h-only, so this pair
+# is no longer a controlled A/B on CFG — it varies CFG and training data together.
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -15,14 +18,21 @@ hydra:
 seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
 
 datasets:
-  name: LibriTTS_100  # prepared data dir name under data/ (wav-only, 53.7 h)
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
   batch_size_per_gpu: 3200  # single 24 GB GPU (RTX 4090) w/ bf16, no activation checkpointing
   batch_size_type: frame  # frame | sample
   max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
   num_workers: 16
 
 optim:
-  epochs: 686
+  epochs: 150  # 4.56x the data at 53.7 h gives 5541 updates/epoch, so 150 epochs is 831k
+               # total updates — the same compute budget the 686 x 1213 clean-100 schedule
+               # was sized for, spent on 4.56x more unique audio instead of more passes.
+               # The LR decay horizon is derived from this, so changing it rescales the
+               # whole schedule; resuming a checkpoint would pin it instead, since
+               # SequentialLR stores total_iters in its state_dict
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
   grad_accumulation_steps: 6  # 6 x 3200 = 19200 frames/update; cheaper than activation checkpointing here
