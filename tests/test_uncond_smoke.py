@@ -749,7 +749,7 @@ def test_guidance_is_off_when_the_null_branch_was_never_trained():
     assert not torch.allclose(c, d)  # otherwise the check above is vacuous
 
 
-@pytest.mark.parametrize("config", ["WavTTS_clean.yaml", "WavTTS_clean_ola.yaml"])
+@pytest.mark.parametrize("config", ["WavTTS_clean.yaml", "WavTTS_clean_ola.yaml", "WavTTS_clean_ola_init100.yaml"])
 def test_clean_config_instantiates_model_and_trains_one_step(config):
     from importlib.resources import files as pkg_files
 
@@ -860,3 +860,48 @@ def test_overlapping_model_forward_and_sample(frame_len, hop):
     out, _ = model.sample(1500, batch=1, steps=2, seed=0)
     assert out.shape == (1, 1500)  # aligned up to the hop grid, not a whole frame
     assert torch.isfinite(out).all()
+
+
+def test_widened_weights_reproduce_the_old_model_under_the_window():
+    # scripts/make_pretrained_init.py grows x_proj and proj_out when a run starts from a
+    # checkpoint with a different wav_frame_len, keeping the old values at the tail of the
+    # grown axis. That alignment is the whole claim: at frame_len 320 / hop 160 the frame
+    # the old weights were trained on is the *second* half of the new one. Get it backwards
+    # and the init is silently worthless, so pin it against the two models' actual outputs.
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from make_pretrained_init import widen
+
+    from wavtts.model import DiT
+
+    torch.manual_seed(0)
+    kwargs = dict(
+        dim=64, depth=2, heads=2, dim_head=32, dropout=0.0, use_audio_proj=True, audio_proj_dim=48, audio_proj_hidden=32
+    )
+    old = DiT(wav_frame_len=160, **kwargs).eval()
+    nn.init.normal_(old.proj_out.weight, std=0.05)  # ships zero-init, would output silence
+    nn.init.normal_(old.proj_out.bias, std=0.05)
+
+    new = DiT(wav_frame_len=320, wav_frame_hop=160, **kwargs).eval()
+    target = new.state_dict()
+    new.load_state_dict({k: widen(v, target[k].shape) for k, v in old.state_dict().items()})
+
+    n_frames = 12
+    wav = torch.randn(1, 160 * n_frames)
+    time, state = torch.tensor([0.3]), torch.zeros(1, dtype=torch.long)
+    with torch.no_grad():
+        old_out, new_out = old(wav, state, time), new(wav, state, time)
+
+    # The half of each output frame that covers the earlier samples is zeroed, so overlap-add
+    # returns the old prediction scaled by that frame's window weight and nothing else.
+    window = torch.hann_window(320, periodic=True)
+
+    def rel_err(expected):
+        return ((new_out - expected).pow(2).mean() / new_out.pow(2).mean()).sqrt().item()
+
+    # not exact: the OLA framing adds one token for the front pad, which every other token
+    # then attends over
+    assert rel_err(old_out * window[160:].repeat(n_frames)) < 0.05
+    assert rel_err(old_out * window[:160].repeat(n_frames)) > 0.5  # the reversed alignment

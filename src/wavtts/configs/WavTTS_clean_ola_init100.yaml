@@ -1,0 +1,135 @@
+# WavTTS_clean_ola.yaml, started from the clean-100 lineage's weights instead of from
+# noise — the overlapping-frames arm's answer to WavTTS_clean_init100.yaml, so the two
+# framings are compared warm-started rather than one warm and one cold.
+#
+# The waveform front end slices 320-sample frames at a hop of 160 instead of butting
+# 160-sample frames end to end, and the output is reassembled by overlap-add under a Hann
+# window (see DiT._wav_to_tokens / _tokens_to_wav). Every sample is then predicted by two
+# tokens and blended, so a frame boundary is a crossfade rather than a splice — the buzz
+# at the 100 Hz frame rate is what this is aimed at.
+#
+# The frame doubles with the overlap, so the hop — and with it the token rate, 100 Hz —
+# is exactly what WavTTS_clean.yaml runs. Same tokens per second of audio, same tokens
+# per batch, same updates per epoch, same schedule: the two arms differ in the framing
+# and nothing else. What each token carries changes, 20 ms of audio seen through a window
+# rather than 10 ms seen whole, which is the point.
+#
+# The frame width is the input width of input_embed.x_proj and the output width of
+# proj_out, so those three tensors cannot be copied across as they are (+307k params,
+# +0.05%). make_pretrained_init.py widens them, keeping the old values at the tail of the
+# grown axis: token t's frame is now t-1 and t concatenated, so what the old weights were
+# trained on is the second half. The 424 other tensors transfer untouched. Prepare it with:
+#   python scripts/make_pretrained_init.py \
+#     ckpts/WavTTS_Uncond_Large_RPE_Clean_Init100_LibriTTS_460/model_last.pt \
+#     ckpts/WavTTS_Uncond_Large_RPE_Clean_OLA_Init100_LibriTTS_460 \
+#     WavTTS_clean_ola_init100.yaml
+#
+# This is a fresh run, not a resume: optimizer, LR schedule and update counter all start
+# at zero, warmup included. Expect the first updates to sit above where the source run
+# left off — half of every output frame has no trained head to inherit, so overlap-add
+# comes back ramped by the window until that half learns.
+#
+# Launch:
+#   scripts/train_loop.sh WavTTS_clean_ola_init100.yaml
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
+  batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing.
+                             # This budget is in model tokens, and CustomDataset.get_frame_len
+                             # divides duration by the hop, which is 160 here as in the
+                             # non-overlapping arm: same tokens, same audio, same memory
+  batch_size_type: frame  # frame | sample
+  max_samples: 384  # the frame budget is the binding cap, as in the non-overlapping arm
+  num_workers: 16
+
+optim:
+  epochs: 177  # the hop is unchanged, so an epoch is the same 4705 updates and 177 epochs
+               # is the same 833k-update budget the non-overlapping arm runs — matched on
+               # both compute and data. The LR decay horizon is derived from this, so
+               # changing it rescales the whole schedule
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates
+  grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+
+model:
+  name: WavTTS_Uncond_Large_RPE_Clean_OLA_Init100  # model name
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    sample_rate: 16000
+    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
+                            # disables the mixing augmentation (only null samples mix),
+                            # so p_mix / p_concat / mix_* are left at their defaults and
+                            # never reached
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: True  # recompute activations so the full 19200-frame update fits
+                                  # in one batch, trading ~30% step time for no accumulation
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    # length extrapolation — randomized positional encoding (Ruoss et al. 2023), see
+    # wavtts/model/rope.py. Training data tops out at 2979 tokens (29.8 s), so gamma=4
+    # puts the longest clip's positions out to 11916 (119 s). Generating up to that
+    # length therefore uses positions the model trained on, with no inference-time
+    # knob: vanilla RoPE at base=10000 has its slowest dim turning once every 471 s,
+    # so nothing wraps. Reaching past 119 s means raising gamma and retraining.
+    rpe_gamma: 4.0           # per-sample stretch bound: L_t ~ U[n, n*gamma], drawn fresh
+                             # every forward. gamma=1 disables. Not a curriculum: every
+                             # batch spans contiguous through 4x from the first update
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. The
+                             # token rate is unchanged, so this is unchanged. This is the
+                             # only attention temperature in the model
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 320    # window length; 320 @16k = 20 ms of audio per token, twice the
+                          # non-overlapping arm's, and it sets the model's input and
+                          # output width
+    wav_frame_hop: 160    # framing stride, and what the token rate is actually set by:
+                          # 160 @16k = 100 Hz, the same rate the non-overlapping arm runs.
+                          # Must divide wav_frame_len; equal to it (the default when
+                          # omitted) is the old end-to-end reshape framing. At half the
+                          # frame it is 50% overlap, so every output sample is the
+                          # Hann-weighted mean of two tokens' predictions
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+
+ckpts:
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 100  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # 60s sits inside the position range gamma=4 trains on (119 s), so it tests the model
+  # rather than the encoding. Past 119 s is untrained positions either way.
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
+  keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}
