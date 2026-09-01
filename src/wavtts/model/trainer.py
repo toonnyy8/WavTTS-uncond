@@ -377,7 +377,15 @@ class Trainer:
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
         # otherwise by default with split_batches=False, warmup steps change with num_processes
-        total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
+        # len(train_dataloader) is per-process, but the wrapped scheduler is stepped
+        # num_processes times per optimizer step (same reason warmup is scaled above), so the
+        # decay horizon has to be counted in those same units. Without the factor the LR hits
+        # its floor num_processes times too early on multi-gpu. No-op on a single gpu.
+        total_updates = (
+            math.ceil(len(train_dataloader) / self.grad_accumulation_steps)
+            * self.epochs
+            * self.accelerator.num_processes
+        )
         decay_updates = total_updates - warmup_updates
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
