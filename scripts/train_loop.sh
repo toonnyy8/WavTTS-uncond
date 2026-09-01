@@ -10,15 +10,21 @@
 #
 # To stop training: kill this script FIRST, then the trainer — otherwise the
 # supervisor sees the exit as a crash and restarts it.
-#   pkill -f train_loop.sh
-#   pkill -f '.venv/bin/python src/wavtts/train/train.py --config-name <config.yaml>'
+#   pkill -f 'train_loop[.]sh'
+#   pkill -f 'train[.]py --config-name <config.yaml>'
+# The bracket is not decoration: pkill -f matches every command line on the box, including
+# that of the shell you typed the pkill into, so an unbracketed pattern kills your own
+# shell before the loop ever gets there.
 
 set -u
 cd "$(dirname "$0")/.."
 
 CONFIG=${1:-WavTTS_clean.yaml}
 LOG=logs/train_${CONFIG%.yaml}.log
-TRAINER_CMDLINE=".venv/bin/python src/wavtts/train/train.py --config-name $CONFIG"
+# accelerate launches the ranks as `python -u src/wavtts/train/train.py ...`, so a pattern
+# pinning the interpreter directly to the script never matched and this guard was dead: it
+# reported "no trainer" while four ranks were mid-epoch. Match the script and config only.
+TRAINER_CMDLINE="src/wavtts/train/train[.]py --config-name $CONFIG"
 mkdir -p logs
 
 # Is a trainer for this config already running? A bare `pgrep -f` is not enough: it also
