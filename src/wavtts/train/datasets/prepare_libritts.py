@@ -84,7 +84,7 @@ if __name__ == "__main__":
     tokenizer = "char"  # "pinyin" | "char"
 
     SUB_SET = ["train-clean-100", "train-clean-360"]
-    dataset_dir = "/media/8tsp/dataset/LibriTTS"
+    dataset_dir = "/home/public_datasets/LibriTTS/LibriTTS"
     # clean-100 + clean-360 = the standard "clean-460" pool; keep the name short so it
     # reads as one dataset in ckpt/run dir names rather than a list of subsets
     dataset_name = "LibriTTS_460"
