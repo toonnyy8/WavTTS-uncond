@@ -93,6 +93,12 @@ model:
     target_sample_rate: 16000
     wav_frame_len: 160    # 160 @16k = 100Hz
     target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+    rand_frame_offset: True  # drop a random 0..159 leading samples per draw, so the frame
+                             # grid falls somewhere new every time a clip comes up. The
+                             # patchify is a bare stride-160 reshape, so this is the only
+                             # thing making the model's frame representation shift-tolerant;
+                             # it is also 160x more distinct targets against memorisation.
+                             # Enabled at update 157500 of this run, not from scratch.
 
 ckpts:
   logger: tensorboard  # wandb | tensorboard | null

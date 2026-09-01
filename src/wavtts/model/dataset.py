@@ -19,6 +19,7 @@ class CustomDataset(Dataset):
         target_sample_rate=16_000,
         wav_frame_len: int = 160,
         target_rms: float = 0.1,  # per-utterance loudness normalization; 0 disables
+        rand_frame_offset: bool = False,  # sub-frame grid jitter; see __getitem__
         **_,
     ):
         self.data = custom_dataset
@@ -26,6 +27,7 @@ class CustomDataset(Dataset):
         self.target_sample_rate = target_sample_rate
         self.wav_frame_len = wav_frame_len
         self.target_rms = target_rms
+        self.rand_frame_offset = rand_frame_offset
 
         self._resamplers = {}
 
@@ -64,6 +66,24 @@ class CustomDataset(Dataset):
                     source_sample_rate, self.target_sample_rate
                 )
             audio = self._resamplers[source_sample_rate](audio)
+
+        # Sub-frame offset. Tokenisation is a stride-wav_frame_len reshape
+        # (DiT._wav_to_tokens): no window, no overlap, so shifting a clip by less than one
+        # frame yields a token sequence the model has no architectural way to relate back to
+        # the unshifted one. Without this a clip hands back byte-identical 160-sample vectors
+        # on all 177 epochs, which is exactly what a 664M-parameter model can memorise; with
+        # it the realisation differs every draw, at the cost of under 10 ms of leading silence.
+        # The corpus already covers every grid alignment across its 149k clips, so this buys
+        # decorrelation rather than a symmetry the data hides.
+        #
+        # Trimming, not zero-padding: padding would make "clips open on digital silence" a
+        # systematic feature of the data, and would let a clip spill into one more frame than
+        # get_frame_len() promised DynamicBatchSampler, whose budget rounds no frames up.
+        # Batch composition stays deterministic under the run seed either way -- the sampler
+        # reads durations, which this does not touch.
+        if self.rand_frame_offset and audio.shape[-1] > self.wav_frame_len:
+            offset = int(torch.randint(0, self.wav_frame_len, (1,)).item())
+            audio = audio[..., offset:]
 
         # loudness: every utterance enters training at the same RMS, so the equal-power
         # mixing augmentation blends two comparable sources instead of one drowning the
