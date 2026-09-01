@@ -9,7 +9,8 @@
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-#   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS_clean.yaml
+#   accelerate launch --mixed_precision bf16 --num_processes 4 \
+#     src/wavtts/train/train.py --config-name WavTTS_clean.yaml
 
 hydra:
   run:
@@ -21,23 +22,26 @@ datasets:
   name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
                       # 244.6 h. The arrow also carries a text column; nothing reads it, this
                       # model is unconditional
-  batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing:
-                             # the whole 19200-frame update fits in one batch, no accumulation
+  batch_size_per_gpu: 4800  # 4 x RTX 4090 (24 GB), bf16 + activation checkpointing. With
+                            # accelerate's split_batches=False each GPU pulls its own batch, so
+                            # 4 x 4800 = the same 19200-frame update the single-GPU run used —
+                            # the frame budget per update, the schedule below and the LR are
+                            # unchanged, only wall clock (~4x faster) is
   batch_size_type: frame  # frame | sample
-  max_samples: 384  # 6x the old 64, so the frame budget stays the binding cap. At 64 the
-                    # sampler tops out at 17.6k of the 19200 frames on short clips
-  num_workers: 16
+  max_samples: 384  # 6x the old 64, so the frame budget stays the binding cap: even all-short
+                    # clips would be 190k frames, far past the 4800 a GPU's batch may hold
+  num_workers: 8  # per process; 4 x 8 = 32 = the machine's core count
 
 optim:
-  epochs: 177  # one 19200-frame batch per update is 4705 updates/epoch (vs 5541 under 6x
-               # accumulation), so 177 epochs is 833k updates — the same budget 150 x 5541
-               # bought, which in turn matched the 686 x 1213 clean-100 schedule.
-               # This only sets where training stops: the resumed run keeps the LR horizon
-               # from the checkpoint (SequentialLR stores total_iters, decay ends at 831150),
-               # so 177 lands the last update on the LR floor instead of 26k short of it
+  epochs: 177  # unchanged from the single-GPU run, so the model still makes 177 passes over
+               # the same 244.6 h. The update count is not identical: a 4800-frame budget
+               # packs worse against long clips than 19200 did (two 30 s clips no longer share
+               # a batch), so an epoch is 5151 updates rather than 4705 and the run is 912k
+               # updates instead of 833k — same data, ~9% more padding. The LR horizon follows
+               # len(dataloader), so decay still lands its floor on the last update
   learning_rate: 7.5e-5
-  num_warmup_updates: 20000  # warmup updates
-  grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
+  num_warmup_updates: 20000  # warmup updates (trainer scales by num_processes internally)
+  grad_accumulation_steps: 1  # 4 x 4800 = 19200 frames/update, via activation checkpointing
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
 
@@ -67,8 +71,8 @@ model:
     ff_mult: 4
     qk_norm: null  # null | rms_norm
     attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
-    checkpoint_activations: True  # recompute activations so the full 19200-frame update fits
-                                  # in one batch, trading ~30% step time for no accumulation
+    checkpoint_activations: True  # recompute activations rather than store them; kept on from
+                                  # the single-GPU run so the memory headroom stays the same
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
