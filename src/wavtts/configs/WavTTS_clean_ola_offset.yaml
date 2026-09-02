@@ -27,7 +27,8 @@
 #
 # Launch with bf16:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-#   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS_clean_ola_offset.yaml
+#   accelerate launch --mixed_precision bf16 --num_processes 4 \
+#     src/wavtts/train/train.py --config-name WavTTS_clean_ola_offset.yaml
 
 hydra:
   run:
@@ -39,22 +40,27 @@ datasets:
   name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
                       # 244.6 h. The arrow also carries a text column; nothing reads it, this
                       # model is unconditional
-  batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing.
-                             # This budget is in model tokens, and CustomDataset.get_frame_len
-                             # divides duration by the hop, which is 160 here as in the
-                             # non-overlapping arm: same tokens, same audio, same memory
+  batch_size_per_gpu: 4800  # 4 x RTX 4090 (24 GB), bf16 + activation checkpointing. With
+                            # accelerate's split_batches=False every rank pulls its own batch,
+                            # so 4 x 4800 is one 19200-token update, the size the schedule below
+                            # is built around. The budget is in model tokens, and
+                            # CustomDataset.get_frame_len divides duration by the hop, which is
+                            # 160 here as in the non-overlapping arm: same tokens, same audio
   batch_size_type: frame  # frame | sample
   max_samples: 384  # the frame budget is the binding cap, as in the non-overlapping arm
-  num_workers: 16
+  num_workers: 8  # per process; 4 x 8 = 32 = the machine's core count
 
 optim:
-  epochs: 177  # the hop is unchanged, so an epoch is the same 4705 updates and 177 epochs
-               # is the same 833k-update budget the non-overlapping arm runs — matched on
-               # both compute and data. The LR decay horizon is derived from this, so
-               # changing it rescales the whole schedule
+  epochs: 177  # the hop is unchanged, so this arm batches identically to the non-overlapping
+               # one: same durations, same 4800-token budget, hence the same 5151 updates per
+               # epoch and the same 912k-update run — matched on both compute and data. (5151,
+               # not the 4705 a 19200-token budget gives: a quarter-size budget packs worse
+               # against long clips, since two 30 s clips no longer share a batch. Same audio,
+               # ~9% more padding.) The LR decay horizon is derived from this, so changing it
+               # rescales the whole schedule
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
-  grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
+  grad_accumulation_steps: 1  # 4 x 4800 = 19200 tokens/update, via activation checkpointing
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
 
@@ -84,8 +90,8 @@ model:
     ff_mult: 4
     qk_norm: null  # null | rms_norm
     attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
-    checkpoint_activations: True  # recompute activations so the full 19200-frame update fits
-                                  # in one batch, trading ~30% step time for no accumulation
+    checkpoint_activations: True  # recompute activations rather than store them; kept on from
+                                  # the single-GPU sizing so the memory headroom is unchanged
     use_audio_proj: True
     audio_proj_dim: 1024
     audio_proj_hidden: 768
