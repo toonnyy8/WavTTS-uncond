@@ -483,9 +483,11 @@ class MelSpectrogramLoss(nn.Module):
                 mel_mask = mel_mask.unsqueeze(1)
             
             # Log Magnitude Loss
-            # Formula: L1( log10(x^pow + eps), log10(y^pow + eps) )
-            x_log = x_mels.clamp(min=self.clamp_eps).pow(self.pow).log10()
-            y_log = y_mels.clamp(min=self.clamp_eps).pow(self.pow).log10()
+            # Formula: L1( log10(x^pow + eps^pow), log10(y^pow + eps^pow) )
+            # The eps is an additive floor rather than a clamp: clamping kills the
+            # gradient outright below it, and near-silent mel bins sit there
+            x_log = (x_mels.pow(self.pow) + self.clamp_eps**self.pow).log10()
+            y_log = (y_mels.pow(self.pow) + self.clamp_eps**self.pow).log10()
 
             diff_full = (x_log - y_log).abs()
 
