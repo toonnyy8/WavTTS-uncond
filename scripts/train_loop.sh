@@ -20,6 +20,9 @@ set -u
 cd "$(dirname "$0")/.."
 
 CONFIG=${1:-WavTTS_clean.yaml}
+# Spell out the gpu count instead of letting accelerate pick up whatever is visible: the
+# config's batch_size_per_gpu is set so num_processes x it is the intended update size.
+NUM_PROCESSES=${NUM_PROCESSES:-4}
 LOG=logs/train_${CONFIG%.yaml}.log
 # accelerate launches the ranks as `python -u src/wavtts/train/train.py ...`, so a pattern
 # pinning the interpreter directly to the script never matched and this guard was dead: it
@@ -44,7 +47,7 @@ while true; do
 
     echo "=== launching $CONFIG at $(date '+%F %T') ===" >>"$LOG"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        .venv/bin/accelerate launch --mixed_precision bf16 \
+        .venv/bin/accelerate launch --mixed_precision bf16 --num_processes "$NUM_PROCESSES" \
         src/wavtts/train/train.py --config-name "$CONFIG" >>"$LOG" 2>&1
     rc=$?
 
