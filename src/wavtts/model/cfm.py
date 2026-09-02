@@ -206,6 +206,79 @@ class CFM(nn.Module):
             states.append(x)
         return torch.stack(states)
 
+    def velocity(
+        self,
+        x: float["b nw"],
+        t: float["b"] | float[""],
+        *,
+        cfg_strength: float = 2.0,
+        state: int["b"] | None = None,
+    ):
+        """v(x_t, t) as sampling sees it, guidance included. A method rather than a
+        closure so schemes that drive the ODE themselves (infer/spk_cond.py) get the
+        identical field."""
+        if state is None:
+            state = torch.full((x.shape[0],), STATE_CLEAN, device=x.device, dtype=torch.long)
+
+        def to_v(pred):
+            if self.prediction == "flow":
+                return pred
+            return self._x_to_v(pred, x, t)
+
+        # state_null_prob == 0 means the null branch was never trained, so its
+        # prediction is noise: guidance is off no matter what the caller asked for
+        if cfg_strength < 1e-5 or self.state_null_prob <= 0:
+            pred = self.transformer(x=x, state=state, time=t)
+            return to_v(pred)
+
+        # classifier-free guidance against the null branch, which carries the
+        # mixing augmentation: the guidance term is a classifier gradient and
+        # self-extinguishes once x is unambiguously clean
+        pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True)
+        pred, neg_pred = torch.chunk(pred_cfg, 2, dim=0)
+        v_pos = to_v(pred)
+        v_neg = to_v(neg_pred)
+        return v_pos + (v_pos - v_neg) * cfg_strength
+
+    def timesteps(
+        self,
+        steps: int,
+        *,
+        sway_sampling_coef: float | None = None,
+        timestep_mapping: str = "sway_sampling",
+        timestep_power: float | None = None,
+        shift: float = 1.0,
+        use_epss: bool = True,
+        device=None,
+    ):
+        """The K+1 sampling times, t=0 (noise) to t=1 (data). Split out of `sample` so
+        inference-time schemes that drive the ODE themselves (see infer/spk_cond.py)
+        can step on exactly the same grid."""
+        device = device if device is not None else self.device
+
+        use_epss = use_epss and timestep_mapping == "sway_sampling"
+        if use_epss:  # use Empirically Pruned Step Sampling for low NFE
+            t = get_epss_timesteps(steps, device=device, dtype=torch.float32)
+        else:
+            t = torch.linspace(0, 1, steps + 1, device=device, dtype=torch.float32)
+
+        if timestep_mapping == "uniform":
+            pass
+        elif timestep_mapping == "sway_sampling":
+            if sway_sampling_coef is not None:
+                t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        elif timestep_mapping == "power":
+            if timestep_power is None:
+                raise ValueError("timestep_power must be provided when timestep_mapping='power'")
+            t = t.pow(timestep_power)
+        else:
+            raise ValueError(f"Unknown timestep_mapping: {timestep_mapping}")
+
+        if shift != 1.0:
+            t = t / (t + shift * (1 - t))
+
+        return t
+
     @torch.no_grad()
     def sample(
         self,
@@ -244,46 +317,17 @@ class CFM(nn.Module):
         y0 = torch.randn(batch, aligned, device=device, dtype=dtype, generator=generator)
 
         def fn(t, x):
-            def to_v(pred):
-                if self.prediction == "flow":
-                    return pred
-                return self._x_to_v(pred, x, t)
+            return self.velocity(x, t, cfg_strength=cfg_strength, state=state)
 
-            # state_null_prob == 0 means the null branch was never trained, so its
-            # prediction is noise: guidance is off no matter what the caller asked for
-            if cfg_strength < 1e-5 or self.state_null_prob <= 0:
-                pred = self.transformer(x=x, state=state, time=t)
-                return to_v(pred)
-
-            # classifier-free guidance against the null branch, which carries the
-            # mixing augmentation: the guidance term is a classifier gradient and
-            # self-extinguishes once x is unambiguously clean
-            pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True)
-            pred, neg_pred = torch.chunk(pred_cfg, 2, dim=0)
-            v_pos = to_v(pred)
-            v_neg = to_v(neg_pred)
-            return v_pos + (v_pos - v_neg) * cfg_strength
-
-        use_epss = use_epss and timestep_mapping == "sway_sampling"
-        if use_epss:  # use Empirically Pruned Step Sampling for low NFE
-            t = get_epss_timesteps(steps, device=device, dtype=torch.float32)
-        else:
-            t = torch.linspace(0, 1, steps + 1, device=device, dtype=torch.float32)
-
-        if timestep_mapping == "uniform":
-            pass
-        elif timestep_mapping == "sway_sampling":
-            if sway_sampling_coef is not None:
-                t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
-        elif timestep_mapping == "power":
-            if timestep_power is None:
-                raise ValueError("timestep_power must be provided when timestep_mapping='power'")
-            t = t.pow(timestep_power)
-        else:
-            raise ValueError(f"Unknown timestep_mapping: {timestep_mapping}")
-
-        if shift != 1.0:
-            t = t / (t + shift * (1 - t))
+        t = self.timesteps(
+            steps,
+            sway_sampling_coef=sway_sampling_coef,
+            timestep_mapping=timestep_mapping,
+            timestep_power=timestep_power,
+            shift=shift,
+            use_epss=use_epss,
+            device=device,
+        )
 
         if solver == "dpmpp":
             trajectory = self._dpmpp_2m(fn, y0, t)
