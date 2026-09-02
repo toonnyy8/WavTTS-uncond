@@ -1,0 +1,140 @@
+# WavTTS_clean_ola.yaml plus framing-phase augmentation: every clip is cropped by a
+# random 0..hop-1 samples at load time, so it meets the frame grid at a different phase
+# each time it is drawn (see CustomDataset.__getitem__). Nothing else moves — same data,
+# same architecture, same schedule, same seed — so this is a controlled A/B against
+# WavTTS_clean_ola.yaml, which stays the baseline arm.
+#
+# What it is for. The waveform front end slices on a grid anchored at sample 0, and
+# input_embed is a Linear over the raw samples, so the model has no shift equivariance:
+# delay a waveform by one sample and its token decomposition changes completely. Without
+# the augmentation each of the 149510 clips is seen under one arbitrary alignment for all
+# 177 epochs, and the grid phase is free to become something a 664.5M-parameter model
+# memorizes. The offset turns that into 160 views per clip at no perceptual cost — a pure
+# delay is the one augmentation that cannot change what the audio sounds like.
+#
+# This is not the same target as the overlap. Overlap-add makes a frame boundary a
+# crossfade rather than a splice, which is about neighbouring tokens disagreeing on the
+# samples they share. The offset is about the model tying anything to absolute grid phase.
+# The two compose, and this arm measures whether the second one is worth anything on top
+# of the first.
+#
+# Reading the run: do NOT compare loss curves against the baseline. The augmentation
+# widens the target distribution, so flow_loss and aux_mel_loss both sit higher by
+# construction and the comparison is meaningless. Judge it on the checkpoint samples —
+# gen/utmos, the mel images, and the strength of the 100 Hz frame-rate line in a
+# long-term average spectrum of the generated clips, which is the artifact this is
+# aimed at.
+#
+# Launch with bf16:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS_clean_ola_offset.yaml
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
+  batch_size_per_gpu: 19200  # single 24 GB GPU (RTX 4090) w/ bf16 + activation checkpointing.
+                             # This budget is in model tokens, and CustomDataset.get_frame_len
+                             # divides duration by the hop, which is 160 here as in the
+                             # non-overlapping arm: same tokens, same audio, same memory
+  batch_size_type: frame  # frame | sample
+  max_samples: 384  # the frame budget is the binding cap, as in the non-overlapping arm
+  num_workers: 16
+
+optim:
+  epochs: 177  # the hop is unchanged, so an epoch is the same 4705 updates and 177 epochs
+               # is the same 833k-update budget the non-overlapping arm runs — matched on
+               # both compute and data. The LR decay horizon is derived from this, so
+               # changing it rescales the whole schedule
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates
+  grad_accumulation_steps: 1  # 1 x 19200 = 19200 frames/update, via activation checkpointing
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+
+model:
+  name: WavTTS_Uncond_Large_RPE_Clean_OLA_Offset  # model name
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    sample_rate: 16000
+    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
+                            # disables the mixing augmentation (only null samples mix),
+                            # so p_mix / p_concat / mix_* are left at their defaults and
+                            # never reached
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: True  # recompute activations so the full 19200-frame update fits
+                                  # in one batch, trading ~30% step time for no accumulation
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    # length extrapolation — randomized positional encoding (Ruoss et al. 2023), see
+    # wavtts/model/rope.py. Training data tops out at 2979 tokens (29.8 s), so gamma=4
+    # puts the longest clip's positions out to 11916 (119 s). Generating up to that
+    # length therefore uses positions the model trained on, with no inference-time
+    # knob: vanilla RoPE at base=10000 has its slowest dim turning once every 471 s,
+    # so nothing wraps. Reaching past 119 s means raising gamma and retraining.
+    rpe_gamma: 4.0           # per-sample stretch bound: L_t ~ U[n, n*gamma], drawn fresh
+                             # every forward. gamma=1 disables. Not a curriculum: every
+                             # batch spans contiguous through 4x from the first update
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. The
+                             # token rate is unchanged, so this is unchanged. This is the
+                             # only attention temperature in the model
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 320    # window length; 320 @16k = 20 ms of audio per token, twice the
+                          # non-overlapping arm's, and it sets the model's input and
+                          # output width
+    wav_frame_hop: 160    # framing stride, and what the token rate is actually set by:
+                          # 160 @16k = 100 Hz, the same rate the non-overlapping arm runs.
+                          # Must divide wav_frame_len; equal to it (the default when
+                          # omitted) is the old end-to-end reshape framing. At half the
+                          # frame it is 50% overlap, so every output sample is the
+                          # Hann-weighted mean of two tokens' predictions
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+    random_frame_offset: True  # framing-phase augmentation: crop a random 0..wav_frame_hop-1
+                               # samples off the front of every clip at load time, so the frame
+                               # grid lands somewhere different each epoch. Training only — the
+                               # dataset is the only thing that reads it — and it costs at most
+                               # 9.9 ms off the head of a clip. Cropping, not zero-padding, so
+                               # the token count can only shrink and the sampler's frame budget
+                               # stays an upper bound
+
+ckpts:
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 100  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # 60s sits inside the position range gamma=4 trains on (119 s), so it tests the model
+  # rather than the encoding. Past 119 s is untrained positions either way.
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
+  keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}

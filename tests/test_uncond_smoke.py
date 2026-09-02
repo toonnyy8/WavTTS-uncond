@@ -749,7 +749,15 @@ def test_guidance_is_off_when_the_null_branch_was_never_trained():
     assert not torch.allclose(c, d)  # otherwise the check above is vacuous
 
 
-@pytest.mark.parametrize("config", ["WavTTS_clean.yaml", "WavTTS_clean_ola.yaml", "WavTTS_clean_ola_init100.yaml"])
+@pytest.mark.parametrize(
+    "config",
+    [
+        "WavTTS_clean.yaml",
+        "WavTTS_clean_ola.yaml",
+        "WavTTS_clean_ola_init100.yaml",
+        "WavTTS_clean_ola_offset.yaml",
+    ],
+)
 def test_clean_config_instantiates_model_and_trains_one_step(config):
     from importlib.resources import files as pkg_files
 
@@ -775,6 +783,93 @@ def test_clean_config_instantiates_model_and_trains_one_step(config):
     loss, _ = model(torch.randn(2, 16000) * 0.1)
     assert torch.isfinite(loss)
     loss.backward()
+
+
+# framing-phase augmentation
+
+
+def test_random_frame_offset_crops_a_sub_hop_prefix(tmp_path):
+    import torchaudio
+
+    from wavtts.model.dataset import CustomDataset
+
+    t = torch.linspace(0, 1, 16000)
+    wav = torch.sin(2 * torch.pi * 220 * t)
+    path = tmp_path / "tone.wav"
+    torchaudio.save(str(path), wav.unsqueeze(0), 16000)
+    rows = [{"audio_path": str(path), "duration": 1.0}]
+    # target_rms=0: with the loudness step off, the crop is the only thing that can move,
+    # so the draws can be compared to the source waveform sample for sample
+    kwargs = dict(durations=[1.0], target_rms=0.0, wav_frame_len=320, wav_frame_hop=160)
+
+    off = CustomDataset(rows, **kwargs)
+    ref = off[0]["wav"]
+    assert torch.equal(off[0]["wav"], ref)  # off by default, and deterministic
+
+    aug = CustomDataset(rows, random_frame_offset=True, **kwargs)
+    torch.manual_seed(0)
+    draws = [aug[0]["wav"] for _ in range(64)]
+
+    offsets = set()
+    for d in draws:
+        o = ref.shape[0] - d.shape[0]
+        # the range is the hop, not the frame length: at (320, 160) an offset of 160 would
+        # be the same framing one token over, so there is nothing past 159 to draw
+        assert 0 <= o < 160
+        # and every draw is the clip itself, delayed -- a pure delay is the whole point,
+        # the augmentation must not change what the audio is
+        assert torch.equal(d, ref[o:])
+        offsets.add(o)
+
+    # 64 draws over 160 phases land on ~53 distinct ones; anything near 1 means the offset
+    # is drawn once and reused, which would leave the clip on a fixed grid after all
+    assert len(offsets) > 20
+
+
+def test_offset_arm_differs_from_the_ola_baseline_in_one_key(tmp_path):
+    from importlib.resources import files as pkg_files
+
+    from omegaconf import OmegaConf
+
+    cfg_dir = pkg_files("wavtts").joinpath("configs")
+    base = OmegaConf.to_container(OmegaConf.load(str(cfg_dir.joinpath("WavTTS_clean_ola.yaml"))), resolve=False)
+    arm = OmegaConf.to_container(OmegaConf.load(str(cfg_dir.joinpath("WavTTS_clean_ola_offset.yaml"))), resolve=False)
+
+    assert "random_frame_offset" not in base["model"]["waveform"]
+    assert arm["model"]["waveform"]["random_frame_offset"] is True
+
+    def leaves(d, prefix=""):
+        out = {}
+        for k, v in d.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, dict):
+                out.update(leaves(v, f"{path}."))
+            else:
+                out[path] = v
+        return out
+
+    a, b = leaves(arm), leaves(base)
+    # the arm is a controlled A/B: the augmentation and the run's name, nothing else. Names
+    # of checkpoint dirs are interpolations of model.name, so they compare equal unresolved
+    assert set(a) - set(b) == {"model.waveform.random_frame_offset"}
+    assert set(b) - set(a) == set()
+    assert {k for k in b if a[k] != b[k]} == {"model.name"}
+
+
+def test_random_frame_offset_reaches_the_dataset_from_the_config():
+    from importlib.resources import files as pkg_files
+
+    from omegaconf import OmegaConf
+
+    from wavtts.model.dataset import CustomDataset
+
+    cfg = OmegaConf.load(str(pkg_files("wavtts").joinpath("configs/WavTTS_clean_ola_offset.yaml")))
+    waveform_kwargs = OmegaConf.to_container(cfg.model.waveform, resolve=True)
+    # load_dataset splats model.waveform straight into CustomDataset, so the key has to
+    # survive the trip under its own name and not be swallowed by the **_ catch-all
+    ds = CustomDataset([], durations=[], **waveform_kwargs)
+    assert ds.random_frame_offset is True
+    assert ds.wav_frame_hop == cfg.model.waveform.wav_frame_hop
 
 
 # overlapping framing + windowed overlap-add

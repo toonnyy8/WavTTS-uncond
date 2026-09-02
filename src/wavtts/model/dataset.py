@@ -20,6 +20,7 @@ class CustomDataset(Dataset):
         wav_frame_len: int = 160,
         wav_frame_hop: int | None = None,
         target_rms: float = 0.1,  # per-utterance loudness normalization; 0 disables
+        random_frame_offset: bool = False,  # framing-phase augmentation, see __getitem__
         **_,
     ):
         self.data = custom_dataset
@@ -31,6 +32,7 @@ class CustomDataset(Dataset):
         # wav_frame_len / wav_frame_hop and blow up memory by the same factor.
         self.wav_frame_hop = wav_frame_len if wav_frame_hop is None else wav_frame_hop
         self.target_rms = target_rms
+        self.random_frame_offset = random_frame_offset
 
         self._resamplers = {}
 
@@ -69,6 +71,34 @@ class CustomDataset(Dataset):
                     source_sample_rate, self.target_sample_rate
                 )
             audio = self._resamplers[source_sample_rate](audio)
+
+        # framing-phase augmentation: drop a random 0..hop-1 samples off the front, so the
+        # clip meets the frame grid at a different phase every time it is drawn.
+        #
+        # The front end slices on a grid anchored at sample 0 (DiT._wav_to_tokens) and
+        # input_embed projects the raw samples through a Linear whose weights are tied to
+        # their position in the frame, so the model has no shift equivariance at all: delay
+        # a waveform by one sample and its whole token decomposition changes. Without this,
+        # every clip is seen under one arbitrary alignment for the entire run -- the same
+        # 149510 waveform/phase pairs, epoch after epoch -- and the grid becomes something
+        # to memorize. The offset turns that into hop distinct views per clip, and it is a
+        # pure delay, so the augmentation is exactly perceptually neutral.
+        #
+        # The range is the hop, not the frame length: framing is periodic in the hop, and an
+        # offset of a whole hop is the same set of frames shifted by one token.
+        #
+        # Cropping rather than left-padding with zeros, for two reasons. Zeros would put a
+        # random-length silence and then an abrupt onset *inside* the first frame -- a
+        # manufactured discontinuity of just the kind this is meant to keep the model from
+        # learning -- and they would grow the token count by one, which get_frame_len (a
+        # duration estimate, read before the audio is) would not see. Cropping can only
+        # shorten, so that estimate stays an upper bound and the frame budget stays safe.
+        # The cost is at most hop-1 samples, 9.9 ms at a hop of 160.
+        if self.random_frame_offset and self.wav_frame_hop > 1:
+            offset = int(torch.randint(0, self.wav_frame_hop, (1,)))
+            offset = min(offset, max(audio.shape[-1] - 1, 0))
+            if offset > 0:
+                audio = audio[..., offset:]
 
         # loudness: every utterance enters training at the same RMS, so the equal-power
         # mixing augmentation blends two comparable sources instead of one drowning the

@@ -146,6 +146,36 @@ uv run python src/wavtts/infer/sample_uncond.py \
 | `arch.rpe_gamma` | 4.0 | per-sample stretch bound: `L_t ~ U[n, n·γ]`; `1.0` disables |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
 
+### Framing-phase augmentation
+
+The front end slices the waveform on a grid anchored at sample 0, and `input_embed` is a
+`Linear` over the raw samples, so the model has no shift equivariance: delay a waveform by
+one sample and its token decomposition changes completely. Left alone, every clip is seen
+under one arbitrary alignment for the whole run, and the grid phase becomes something to
+memorize.
+
+`random_frame_offset` crops a random `0..wav_frame_hop-1` samples off the front of each
+clip at load time, so it meets the grid at a different phase every epoch — `wav_frame_hop`
+distinct views per clip, at no perceptual cost, since a pure delay cannot change what the
+audio sounds like. The range is the hop, not the frame: framing is periodic in the hop.
+Cropping rather than zero-padding, so the token count can only shrink and the sampler's
+frame budget stays an upper bound; the cost is at most 9.9 ms off the head of a clip.
+
+This is a different target from the overlapping-frames arm. Overlap-add makes a frame
+boundary a crossfade rather than a splice — neighbouring tokens disagreeing on the samples
+they share. The offset is about the model tying anything to absolute grid phase. They
+compose; `WavTTS_clean_ola_offset.yaml` is the arm that measures the second on top of the
+first, against `WavTTS_clean_ola.yaml` as the baseline.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `waveform.random_frame_offset` | `False` | crop a random `0..hop-1` samples off each clip at load time; training only |
+
+**Do not compare loss curves across the two arms.** The augmentation widens the target
+distribution, so `flow_loss` and `aux_mel_loss` both sit higher by construction. Judge it
+on the checkpoint samples — `gen/utmos`, the mel images, and the strength of the frame-rate
+line in a long-term average spectrum of the generated clips.
+
 ### Monitoring
 
 ```bash
