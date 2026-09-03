@@ -17,10 +17,18 @@ from tqdm import tqdm
 def deal_with_audio_dir(audio_dir):
     sub_result, durations = [], []
     vocab_set = set()
+    missing_text = 0
     audio_lists = list(audio_dir.rglob("*.wav"))
 
     for line in audio_lists:
         text_path = line.with_suffix(".normalized.txt")
+        # LibriTTS_R ships some clips without their transcript. Skipping them rather than
+        # writing a blank one: nothing in the unconditional model reads the text column,
+        # but a text-conditioned reader of this arrow would get silent garbage instead of
+        # an obvious gap. The count is reported at the end so the loss is never invisible.
+        if not text_path.exists():
+            missing_text += 1
+            continue
         text = open(text_path, "r").read().strip()
         duration = sf.info(str(line)).duration
         if duration < 0.4 or duration > 30:
@@ -28,7 +36,7 @@ def deal_with_audio_dir(audio_dir):
         sub_result.append({"audio_path": str(line), "text": text, "duration": duration})
         durations.append(duration)
         vocab_set.update(list(text))
-    return sub_result, durations, vocab_set
+    return sub_result, durations, vocab_set, missing_text
 
 
 def main():
@@ -47,11 +55,13 @@ def main():
             for audio_dir in dataset_path.iterdir()
             if audio_dir.is_dir()
         ]
+    missing_text = 0
     for future in tqdm(futures, total=len(futures)):
-        sub_result, durations, vocab_set = future.result()
+        sub_result, durations, vocab_set, missing = future.result()
         result.extend(sub_result)
         duration_list.extend(durations)
         text_vocab_set.update(vocab_set)
+        missing_text += missing
     executor.shutdown()
 
     # save preprocessed dataset to disk
@@ -76,6 +86,8 @@ def main():
     print(f"\nFor {dataset_name}, sample count: {len(result)}")
     print(f"For {dataset_name}, vocab size is: {len(text_vocab_set)}")
     print(f"For {dataset_name}, total {sum(duration_list) / 3600:.2f} hours")
+    if missing_text:
+        print(f"For {dataset_name}, skipped {missing_text} clips with no .normalized.txt")
 
 
 if __name__ == "__main__":
@@ -84,10 +96,14 @@ if __name__ == "__main__":
     tokenizer = "char"  # "pinyin" | "char"
 
     SUB_SET = ["train-clean-100", "train-clean-360"]
-    dataset_dir = "/media/8tsp/dataset/LibriTTS"
+    # Corpus root and the name to save under, both overridable:
+    #   python src/wavtts/train/datasets/prepare_libritts.py <dataset_dir> <dataset_name>
+    # LibriTTS_R is LibriTTS restored — same segmentation, same filenames, same subset
+    # layout — so it prepares through this script unchanged, just from another root.
+    dataset_dir = sys.argv[1] if len(sys.argv) > 1 else "/home/public_datasets/LibriTTS/LibriTTS"
     # clean-100 + clean-360 = the standard "clean-460" pool; keep the name short so it
     # reads as one dataset in ckpt/run dir names rather than a list of subsets
-    dataset_name = "LibriTTS_460"
+    dataset_name = sys.argv[2] if len(sys.argv) > 2 else "LibriTTS_460"
     save_dir = str(files("wavtts").joinpath("../../")) + f"/data/{dataset_name}"
     print(f"\nPrepare for {dataset_name}, will save to {save_dir}\n")
     main()
