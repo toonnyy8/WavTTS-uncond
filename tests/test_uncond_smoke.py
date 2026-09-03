@@ -756,6 +756,7 @@ def test_guidance_is_off_when_the_null_branch_was_never_trained():
         "WavTTS_clean_ola.yaml",
         "WavTTS_clean_ola_init100.yaml",
         "WavTTS_clean_ola_offset.yaml",
+        "WavTTS_clean_ola_offset_init460.yaml",
     ],
 )
 def test_clean_config_instantiates_model_and_trains_one_step(config):

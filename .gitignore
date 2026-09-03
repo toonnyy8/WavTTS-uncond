@@ -163,4 +163,5 @@ data/LibriTTS_100_360_500_char/raw.arrow
 # local training artifacts
 /data/LibriTTS_100
 /data/LibriTTS_460
+/data/LibriTTS_R_460
 /ckpts/*/
