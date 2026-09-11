@@ -211,8 +211,9 @@ uv run python scripts/gen_fake_pool.py \
 #    function of --seed, so the shards write disjoint slices of one pool and whichever
 #    finishes last writes raw/ and duration.json. Rows of different lengths share a batch
 #    under a mask (exactly what training does; each row comes out as it would alone) and
-#    the backbone runs under bf16 autocast (--autocast none for the fp32 path): ~10 min
-#    for 50 h on four 4090s, against ~40 min for the round-1 pool's exact-length fp32 run
+#    the backbone runs under bf16 autocast (--autocast none for the fp32 path). Measured:
+#    50 h in 40 min on four 4090s (round 2), against 86 min for the round-1 pool's fp32
+#    run -- bf16 is the 2x; the packing saves launches, not FLOPs
 
 # 3. the round itself (~2.4 h on 4x RTX 4090 for 9000 updates)
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

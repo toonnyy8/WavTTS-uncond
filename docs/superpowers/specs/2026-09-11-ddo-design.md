@@ -576,18 +576,21 @@ the training is normal."* 本 repo 的對應物是 `gen/utmos` 與 `gen/spk_sim_
 靠 `real_fake_ratio` 的索引重複把每個 batch 的真假比例拉回 1:1；
 代價是假樣本在一輪內被重複使用的次數是真樣本的 ~5 倍。池子大小是第一批要做的 ablation 之一。
 
-實測（第 1 輪，fp32、依精確長度分 batch、`--shard i/4` 四卡）：50 h 約 **40 分鐘**。
+實測（第 1 輪，fp32、依精確長度分 batch、`--shard i/4` 四卡）：50 h 共 **86 分鐘**。
 第 2 輪起 `gen_fake_pool.py` 改成兩件與分佈無關的事：(a) 骨幹在 bf16 autocast 下跑
 （4090 的 bf16 tensor core 是 fp32 的兩倍；ODE 狀態與雜訊仍為 fp32；這也正是訓練時 Δ 裡
 評估 p_ref 的精度）；(b) 不同長度的 clip 以 mask 同 batch 生成——`CFM.sample(lens=...)`
 把每列 pad 到最長、以 `mask`/`lens` 告知真實長度，attention、conv 位置嵌入、entropy scaling
 都不碰 padding，每列的輸出與單獨以精確長度生成**逐位元等價**（測試驗證差 < 1e-5），
 所以這**不是**「生長的再剪短」那條被 §3.5 禁止的捷徑。按長度排序後貪婪裝箱，付出成本
-以「列數 × 最長列」計，實際池子的 padding 浪費 0.2%，launch 數 2234 → 964（2.3×）。
-兩者疊加約 4×，一池約 **10 分鐘四卡**。同一輪內不混用兩種生成設定；第 1 輪的池子維持原樣。
+以「列數 × 最長列」計，實際池子的 padding 浪費 0.2%，launch 數 2234 → 964。
+實測第 2 輪的池子 **40 分鐘四卡**：2.1× 全部來自 bf16（單 batch 微基準 fp32 0.59–0.85 s/NFE、
+bf16 0.29–0.34 s/NFE）。混長度裝箱只省 launch 不省 FLOPs——舊的精確長度 batch 雖小但沒有
+padding，總計算量本來就等於總 frame 數，而這個尺寸的模型在幾千 frames 的 batch 上早已接近飽和。
+同一輪內不混用兩種生成設定；第 1 輪的池子維持原樣。
 
 **整體。** 論文擴散版要 12–28 輪。以 24 輪、四卡計：
-`24 × (0.2 h 生成 + 2.4 h 訓練) ≈ 62 小時 wall-clock`（~2.6 天）。
+`24 × (0.7 h 生成 + 0.3 h 訓練) ≈ 24 小時 wall-clock`（第 1 輪後輪次縮到 1500 步，見 §4）。
 先跑 3–4 輪看斜率，再決定要不要走完。
 
 **顯存。** ref 的權重 +2.66 GiB（fp32：accelerate 的 bf16 mixed precision 是 autocast，不轉權重。
