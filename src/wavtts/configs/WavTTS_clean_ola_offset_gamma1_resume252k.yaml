@@ -1,0 +1,162 @@
+# WavTTS_clean_ola_offset.yaml continued under a new name with rpe_gamma 4.0 -> 1.0, as a
+# genuine full-state resume rather than a warm start. Copy the source run's checkpoint in
+# as this run's model_last.pt and Trainer.load_checkpoint takes the "update" key branch:
+# model, optimizer, LR schedule, EMA and RNG all carry over and the counter continues at
+# 252500.
+#   mkdir -p ckpts/WavTTS_Uncond_Large_RPE_Clean_OLA_Offset_Gamma1_Resume252k_LibriTTS_460
+#   cp ckpts/WavTTS_Uncond_Large_RPE_Clean_OLA_Offset_LibriTTS_460/model_last.pt \
+#      ckpts/WavTTS_Uncond_Large_RPE_Clean_OLA_Offset_Gamma1_Resume252k_LibriTTS_460/
+# Copy, do not hardlink: save_checkpoint writes model_last.pt in place, so a shared inode
+# would let this run overwrite the source arm's checkpoint.
+#
+# This is the counterpart to WavTTS_clean_ola_offset_gamma1_init460.yaml, which asked the
+# same question from a cold optimizer at update 0. Here nothing restarts: no second warmup,
+# no EMA re-ramp (the source EMA is 252500 steps in, decay 0.99975, ~40k updates of
+# averaging), no reset of the update counter. The only discontinuity is the positional
+# encoding itself, which makes this the cleaner read on what gamma=1 does to the samples --
+# a change in sample quality here cannot be blamed on a fresh optimizer or a cold EMA.
+#
+# batch_size_per_gpu stays at the source run's 4800 on purpose. Batching depends only on the
+# budget and the durations, so keeping it means the same 5151 updates per epoch the source
+# had, and 252500 lands on the same epoch boundary it would have. Two ranks accumulating 2
+# gives the same 19200-token update; only the gpu count changed.
+#
+# THE SCHEDULE IN THE COPIED CHECKPOINT WAS REBUILT, and the copy step above is not
+# enough on its own. The horizon stored by the source run is num_processes times too long
+# -- trainer.py multiplied an already-global batch count by num_processes again, since
+# len(train_dataloader) only becomes per-process after prepare() further down. Decay
+# total_iters read 14507632 where it should have been about 3566908, so across 252500
+# updates the LR had come down only from 7.5e-5 to 7.02e-5, and resuming as-is would have
+# spent this whole arm at a near-constant rate. Restoring a scheduler state bypasses the
+# fixed formula, so the state itself had to be rewritten:
+#
+#   decay start_factor = 0.935896  (= 7.019e-5 / 7.5e-5, the rate at the branch point)
+#   decay end_factor   = 1e-8
+#   decay total_iters  = 1318454   (= 659227 remaining updates x 2 ranks)
+#   decay last_epoch   = 0,  SequentialLR last_epoch = 505000,  milestone = 40000
+#
+# The LR is continuous across the branch — it resumes at exactly 7.019e-5 rather than
+# snapping down to the 5.54e-5 a corrected-from-the-start schedule would sit at — and
+# anneals from there to the floor on the last update of epoch 177. Continuity is on
+# purpose: gamma is meant to be the only thing that changes at this point, and a 21% LR
+# drop landing on the same update would confound exactly the comparison this arm is for.
+
+# Launch:
+#   CUDA_VISIBLE_DEVICES=2,3 NUM_PROCESSES=2 \
+#     scripts/train_loop.sh WavTTS_clean_ola_offset_gamma1_resume252k.yaml
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
+  batch_size_per_gpu: 4800  # unchanged from the source run, deliberately: batching depends
+                            # only on this budget and the clip durations, so keeping it keeps the
+                            # same 5151 updates per epoch and the resume lands on the same epoch
+                            # boundary. 2 ranks x 2 accumulation x 4800 is the same 19200-token
+                            # update; the budget is in model tokens, and get_frame_len divides
+                            # duration by the hop, 160 here as in the non-overlapping arm
+  batch_size_type: frame  # frame | sample
+  max_samples: 384  # the frame budget is the binding cap, as in the non-overlapping arm
+  num_workers: 16  # per process; 2 x 16 = 32 = the machine's core count
+
+optim:
+  epochs: 177  # the hop is unchanged, so this arm batches identically to the non-overlapping
+               # one: same durations, same 4800-token budget, hence the same 5151 updates per
+               # epoch and the same 912k-update run — matched on both compute and data. (5151,
+               # not the 4705 a 19200-token budget gives: a quarter-size budget packs worse
+               # against long clips, since two 30 s clips no longer share a batch. Same audio,
+               # ~9% more padding.) The LR decay horizon is derived from this, so changing it
+               # rescales the whole schedule
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates
+  grad_accumulation_steps: 2  # 2 ranks x 2 x 4800 = 19200 tokens/update
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+
+model:
+  name: WavTTS_Uncond_Large_RPE_Clean_OLA_Offset_Gamma1_Resume252k  # model name; Gamma1 =
+    # randomized PE disabled, Resume252k = full-state continuation of the OLA_Offset run
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    sample_rate: 16000
+    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
+                            # disables the mixing augmentation (only null samples mix),
+                            # so p_mix / p_concat / mix_* are left at their defaults and
+                            # never reached
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: True  # recompute activations rather than store them; kept on from
+                                  # the single-GPU sizing so the memory headroom is unchanged
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    # length extrapolation, given up from update 252500 onward. The source arm ran gamma=4
+    # for its first 252500 updates, stretching each clip's positions over up to 4x their real
+    # span; this run inherits whatever that taught the weights and stops doing it.
+    rpe_gamma: 1.0           # the one thing this arm changes. At 1.0 DiT.forward skips
+                             # randomized_positions() and takes the contiguous 0..n-1 path
+                             # inference already uses, so training and generation agree on
+                             # position spacing. Nothing above 30 s is trained on any more, so
+                             # the 60 s sample is the expected loss and 5-30 s the expected gain
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. The
+                             # token rate is unchanged, so this is unchanged. This is the
+                             # only attention temperature in the model
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 320    # window length; 320 @16k = 20 ms of audio per token, twice the
+                          # non-overlapping arm's, and it sets the model's input and
+                          # output width
+    wav_frame_hop: 160    # framing stride, and what the token rate is actually set by:
+                          # 160 @16k = 100 Hz, the same rate the non-overlapping arm runs.
+                          # Must divide wav_frame_len; equal to it (the default when
+                          # omitted) is the old end-to-end reshape framing. At half the
+                          # frame it is 50% overlap, so every output sample is the
+                          # Hann-weighted mean of two tokens' predictions
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+    random_frame_offset: True  # framing-phase augmentation: crop a random 0..wav_frame_hop-1
+                               # samples off the front of every clip at load time, so the frame
+                               # grid lands somewhere different each epoch. Training only — the
+                               # dataset is the only thing that reads it — and it costs at most
+                               # 9.9 ms off the head of a clip. Cropping, not zero-padding, so
+                               # the token count can only shrink and the sampler's frame budget
+                               # stays an upper bound
+
+ckpts:
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 100  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # From update 252500 on, 60 s is outside any position range this arm trains: gamma=1 sees
+  # only what the clips really span, up to 30 s. The 60 s sample is therefore the extrapolation
+  # this arm is expected to give up, and 5-30 s is where it is expected to gain.
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
+  keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}
