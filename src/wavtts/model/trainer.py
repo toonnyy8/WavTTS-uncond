@@ -566,7 +566,7 @@ class Trainer:
                         # only where the bar is shown: every entry is a .item() device sync
                         scalars = self._scalar_logs(loss_dict)
                         postfix = {"update": str(global_update), "loss": scalars.get("loss", loss.item())}
-                        for key in ("flow_loss", "aux_mel_loss", "anchor_loss", "ddo/margin", "ddo/acc"):
+                        for key in ("flow_loss", "aux_mel_loss", "anchor_loss", "real_mel_loss", "ddo/margin", "ddo/acc"):
                             if key in scalars:
                                 postfix[key] = scalars[key]
                         progress_bar.set_postfix(postfix)

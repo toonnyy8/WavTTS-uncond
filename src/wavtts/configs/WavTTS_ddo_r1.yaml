@@ -95,9 +95,10 @@ model:
     t_eps: 0.02
     latents_scale: 1.0
     use_aux_mel_loss: True
-    aux_mel_loss_weight: 0.05  # reached only by the anchor rows, which this arm has none of:
-                               # the mel term is a perceptual regularizer, not part of the
-                               # ELBO, so it never enters Delta (spec S3.1)
+    aux_mel_loss_weight: 0.05  # the mel term is a perceptual regularizer, not part of the
+                               # ELBO, so it never enters Delta (spec S3.1). It reaches the
+                               # anchor rows (none in this arm) and, when ddo.real_mel_weight
+                               # is on, the real rows (spec S3.10)
     sample_rate: 16000
     state_null_prob: 0.0    # must stay 0. This study runs no CFG: no null label, no mixing,
                             # no anchor rows — the entire batch is the DDO objective
@@ -213,6 +214,13 @@ ddo:
   anchor_weight: 1.0  # weight on the null rows' retained MLE flow loss. Never reached in
                       # this arm (state_null_prob is 0, so there are no null rows); it is
                       # here for a future CFG-arm port (spec S3.4)
+  real_mel_weight: 0.0  # the auxiliary mel term on the *real* rows, outside Delta, times
+                        # this (on top of aux_mel_loss_weight). The DDO real term saturates
+                        # by update ~200-300 at beta 100, after which nothing in the objective
+                        # holds theta to real speech and silence is a cheap way "away from
+                        # p_ref"; this anchors x_pred's spectrum on real rows for the rest of
+                        # the round (spec S3.10). 0 in round 1 for reproducibility; try 1.0
+                        # from round 2 and read gen/silence_ratio against the corpus' 0.034
   real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
                         # diffusion pairing, enforced by repeating the pool's indices rather
                         # than by pool size — a 1:1-sized pool would be 244.6 h of 32-NFE

@@ -55,6 +55,7 @@ def main(model_cfg):
             beta=ddo_cfg.beta,
             delta_normalize=ddo_cfg.get("delta_normalize", "mean"),
             anchor_weight=ddo_cfg.get("anchor_weight", 1.0),
+            real_mel_weight=ddo_cfg.get("real_mel_weight", 0.0),
         )
         # Recorded, not plumbed: this study runs no CFG at all, so the fake pool is drawn
         # guidance-free and the only correct value is 0. It lives in the config so the

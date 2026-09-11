@@ -465,6 +465,7 @@ def test_all_real_and_all_fake_batches_do_not_crash(flags, state_null_prob):
         "flow_loss",
         "aux_mel_loss",
         "anchor_loss",
+        "real_mel_loss",
         "ddo/loss_real",
         "ddo/loss_fake",
         "ddo/delta_real",
@@ -506,6 +507,47 @@ def test_aux_mel_rides_along_with_the_anchor_only():
     # Delta and lives only on the anchor rows (spec S3.1).
     assert loss_dict["aux_mel_loss"].item() > 0.0
     assert loss_dict["anchor_loss"].item() > loss_dict["aux_mel_loss"].item()
+
+
+def test_real_mel_anchor_rides_on_real_rows_only():
+    """ddo.real_mel_weight adds the aux mel term on the real rows, outside Delta: the DDO
+    statistics are untouched, the term is absent at weight 0 and on an all-fake batch, and
+    it is exactly what it says -- the weighted mel loss of theta's x_pred on real rows."""
+    torch.manual_seed(0)
+    wav = torch.randn(6, 1600) * 0.1
+    is_fake = torch.tensor([False, True, False, True, False, True])
+
+    def run(weight, flags=is_fake):
+        torch.manual_seed(1)
+        model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0, use_aux_mel_loss=True)
+        _attach(model, real_mel_weight=weight)
+        model.train()
+        torch.manual_seed(2)
+        return model(wav, is_fake=flags)
+
+    loss0, d0 = run(0.0)
+    loss1, d1 = run(1.0)
+    assert math.isnan(d0["real_mel_loss"].item())
+    assert d1["real_mel_loss"].item() > 0.0
+    for k in ("ddo/loss_real", "ddo/loss_fake", "ddo/delta_std", "flow_loss"):
+        assert d1[k].item() == pytest.approx(d0[k].item(), rel=1e-6), k
+    assert loss1.item() == pytest.approx(loss0.item() + d1["real_mel_loss"].item(), rel=1e-6)
+    assert math.isnan(d1["aux_mel_loss"].item())  # the anchor's own mel term: no null rows here
+
+    # weight scales it linearly, and an all-fake batch has nothing to anchor
+    _, d2 = run(2.0)
+    assert d2["real_mel_loss"].item() == pytest.approx(2 * d1["real_mel_loss"].item(), rel=1e-5)
+    _, d3 = run(1.0, torch.ones(6, dtype=torch.bool))
+    assert math.isnan(d3["real_mel_loss"].item())
+
+    # theta's parameters get a gradient from it
+    torch.manual_seed(1)
+    model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0, use_aux_mel_loss=True)
+    _attach(model, real_mel_weight=1.0, beta=0.0)  # beta 0: the DDO term is a constant
+    model.train()
+    loss, d = model(wav, is_fake=is_fake)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.transformer.parameters())
 
 
 def test_attach_rejects_an_unknown_delta_normalize():

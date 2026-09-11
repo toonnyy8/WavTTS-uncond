@@ -113,6 +113,7 @@ class CFM(nn.Module):
         self.ddo_beta = 1.0
         self.ddo_delta_normalize = "mean"
         self.ddo_anchor_weight = 1.0
+        self.ddo_real_mel_weight = 0.0
 
     @property
     def device(self):
@@ -337,8 +338,12 @@ class CFM(nn.Module):
         beta: float,
         delta_normalize: str = "mean",
         anchor_weight: float = 1.0,
+        real_mel_weight: float = 0.0,
     ) -> None:
         """Freeze `ref` as p_ref and switch forward() onto the DDO path.
+
+        real_mel_weight > 0 adds the auxiliary mel term on the real rows, outside Δ: a
+        perceptual anchor for a round in which the DDO real term has saturated (spec 3.10).
 
         The reference is stored in a **one-element list**, not as an attribute. A bare
         `self.ddo_ref = ref` would go through `nn.Module.__setattr__`, which registers any
@@ -366,6 +371,7 @@ class CFM(nn.Module):
         self.ddo_beta = float(beta)
         self.ddo_delta_normalize = delta_normalize
         self.ddo_anchor_weight = float(anchor_weight)
+        self.ddo_real_mel_weight = float(real_mel_weight)
 
     @property
     def ddo_ref(self) -> "CFM | None":
@@ -585,6 +591,27 @@ class CFM(nn.Module):
             total_loss = total_loss + anchor_loss
             anchor_value = anchor_loss.detach()
 
+        # The mel anchor on the real rows, outside Δ. The DDO real term stops pulling once
+        # β·Δ_real clears ~3 -- in round 1 that took 200-300 updates -- and from then on
+        # nothing in the objective holds θ to real speech; the fake term alone says only
+        # "away from p_ref's samples", and silence is one cheap direction away. This keeps
+        # x_pred spectrally faithful on real rows for the rest of the round. Not on the
+        # null rows (they carry it already via the anchor) and never on fake rows, which
+        # have no target worth reconstructing. Off by default so round 1 reproduces.
+        real_mel_value = nan
+        if self.ddo_real_mel_weight > 0 and self.use_aux_mel_loss and self.aux_mel_loss is not None:
+            mel_idx = (~is_fake & ~null_flags).nonzero(as_tuple=True)[0]
+            if mel_idx.numel() > 0:
+                _, x_pred = self._predictions(raw_pred[mel_idx].float(), φ[mel_idx].float(), time[mel_idx].float())
+                mel_kwargs = {}
+                if self.aux_mel_loss_masked:
+                    mel_kwargs.update(frame_mask=mask[mel_idx], frame_lengths=lens[mel_idx])
+                real_mel = self.ddo_real_mel_weight * self.aux_mel_loss(
+                    x_pred / self.latents_scale, x1[mel_idx] / self.latents_scale, **mel_kwargs
+                )
+                total_loss = total_loss + real_mel
+                real_mel_value = real_mel.detach()
+
         # flow_loss over the real rows is a divergence alarm, not a quality metric: DDO
         # trades likelihood for sample quality, so it is *expected* to rise. Past roughly
         # 2x the pretraining value the round has been pushed too far (spec S4).
@@ -595,6 +622,7 @@ class CFM(nn.Module):
         loss_dict["flow_loss"] = flow_value
         loss_dict["aux_mel_loss"] = aux_mel_value
         loss_dict["anchor_loss"] = anchor_value
+        loss_dict["real_mel_loss"] = real_mel_value
 
         return total_loss, loss_dict
 
