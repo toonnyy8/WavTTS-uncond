@@ -303,7 +303,20 @@ class Trainer:
                 random.setstate(tuple(rng_state["python"]))
                 torch.set_rng_state(rng_state["torch"])
                 if rng_state["cuda"] is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state_all(rng_state["cuda"])
+                    # One state per device was saved, so a checkpoint from a 4-gpu run has 4 of
+                    # them and set_rng_state_all indexes straight past the end of a 2-gpu box --
+                    # a hard crash on what is otherwise a perfectly good resume. Restore what
+                    # maps onto the devices that exist; any device with no saved state keeps the
+                    # one seed_everything already gave it. Only the per-device noise draws ride
+                    # on this, and those are already unreproducible across a gpu-count change.
+                    saved = list(rng_state["cuda"])
+                    for i in range(min(len(saved), torch.cuda.device_count())):
+                        torch.cuda.set_rng_state(saved[i], i)
+                    if self.is_main and len(saved) != torch.cuda.device_count():
+                        print(
+                            f"WavTTS: checkpoint carries {len(saved)} cuda rng states, this run has "
+                            f"{torch.cuda.device_count()} device(s); restored the overlap"
+                        )
             if self.is_main:
                 print(
                     f"Resume mode: full-state resume (model + optimizer + scheduler"
