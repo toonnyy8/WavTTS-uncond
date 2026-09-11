@@ -15,6 +15,16 @@
 # inside 50 updates, so the round is 300 updates and every 50 is judged on the paired
 # 144-clip protocol.
 #
+# Calibration record (R2MelCal2: 150 updates, beta_mel 1e-4, delta_space x, P_std 1.6):
+#   ddo/delta_v_std    5.5e-4 @50   1.5e-3 @100   3.5e-3 @140   (x-space; no spike at the
+#                      extreme-t batch that put the v-space probe at 0.95)
+#   ddo/delta_mel_std  8.6e-3 @50   0.059  @100   0.078  @140
+#   ratio v/mel ~ 0.026-0.064, taken as 0.04.
+# The x-space Delta_v is 3-6x smaller than round 1's v-space one at the same update, so
+# beta goes 100 -> 400 to keep round 1's logit scale (beta*std reaching ~2-3 by update
+# 200-300, where the sigmoid brakes), and beta_mel = 400 * 0.04 = 16 gives the two
+# channels equal say. Both are units, not new choices: the paper's 0.02 over 3072 dims.
+#
 # Launch (after make_pretrained_init.py into this run's save_dir):
 #   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2_mel.yaml
 
@@ -193,7 +203,7 @@ ddo:
   # way, and the smaller beta buys more UTMOS at the price of more silence drift. Listen
   # before trusting UTMOS on this axis. beta=30 is the first alternative to try in round 2.
   # ---------------------------------------------------------------------------------
-  beta: 100.0
+  beta: 400.0  # x-space units, see the calibration record in the header
 
   delta_normalize: mean  # mean | sum. mean, because clips span 0.3–30 s: a single global
                          # beta cannot put beta*Delta at O(1) for both ends of a 100x
@@ -204,9 +214,9 @@ ddo:
                       # this arm (state_null_prob is 0, so there are no null rows); it is
                       # here for a future CFG-arm port (spec S3.4)
 
-  beta_mel: 0.0  # CALIBRATED BY THE R2MelCal PROBE -- see the record in the header once it
-                 # has run. Delta_mel = -(mel_theta - mel_ref) per row in raw log-mel L1 units,
-                 # logit = beta*Delta_v + beta_mel*Delta_mel, one sigmoid (spec S3.10)
+  beta_mel: 16.0  # = beta * 0.04, the calibrated v/mel spread ratio (header). Delta_mel =
+                  # -(mel_theta - mel_ref) per row in raw log-mel L1 units, logit =
+                  # beta*Delta_v + beta_mel*Delta_mel, one sigmoid (spec S3.10)
   delta_space: x  # the space Delta_v's per-row loss is measured in: x-space MSE: with P_std 1.6, rows at t > 0.95 land in ~6% of batches, and the
                   # v-space loss weights them 100-2500x -- one such row saturates the logit (spec S3.10)
   real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
