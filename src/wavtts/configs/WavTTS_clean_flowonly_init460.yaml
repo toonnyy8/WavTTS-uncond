@@ -1,0 +1,143 @@
+# WavTTS_clean.yaml with the auxiliary mel loss weighted to zero: the objective is the
+# flow term alone. Data, framing, augmentation, architecture, LR and epoch budget are all
+# unchanged, and the run starts from the weights WavTTS_clean.yaml reached at update
+# 277500 rather than from noise, so what it measures is what the mel term is still
+# contributing at that point — not whether a model can be trained without it from cold.
+#
+# Read that caveat literally: these weights spent 277500 updates being shaped by a loss
+# that included the mel term, and they keep whatever that bought. A cold flow-only run is
+# a different experiment and this one cannot stand in for it.
+#
+# flow_loss IS comparable against the source arm — same target, same space, and the
+# source arm logs it as its own scalar. total loss is not: one has the mel term in it.
+#
+# The init is weights only. make_pretrained_init.py strips the checkpoint to its EMA and
+# zeroes the EMA step, so optimizer, LR schedule and update counter all start at zero,
+# warmup included. Prepare it with:
+#   python scripts/make_pretrained_init.py \
+#     ckpts/WavTTS_Uncond_Large_RPE_Clean_LibriTTS_460/model_last.pt \
+#     ckpts/WavTTS_Uncond_Large_RPE_Clean_FlowOnly_Init460_LibriTTS_460
+# No config argument, and none is wanted: this arm keeps every module the source had, so
+# the state dict loads key-for-key. (Dropping the module instead of zeroing its weight
+# does need the config argument, to filter the source's now-orphaned mel buffers out —
+# Trainer.load_checkpoint loads strictly and 14 leftover tensors abort the run.)
+#
+# Two GPUs, not four — the other cards are in use. The update is held at 19200 frames by
+# accumulating instead: 2 ranks x 3 accumulation steps x 3200 frames. Launch:
+#   CUDA_VISIBLE_DEVICES=2,3 NUM_PROCESSES=2 scripts/train_loop.sh WavTTS_clean_flowonly_init460.yaml
+# Both variables matter. Without them the supervisor takes four processes on whatever
+# cards are visible, which is a different update size and someone else's GPU.
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
+  batch_size_per_gpu: 3200  # 2 x RTX 4090 (24 GB), bf16 + activation checkpointing. Each
+                            # rank pulls its own batch (accelerate's split_batches=False) and
+                            # accumulates 3 of them, so 2 x 3 x 3200 is the same 19200-frame
+                            # update every other arm runs. Half the cards, so roughly half the
+                            # throughput; the schedule and the LR are untouched
+  batch_size_type: frame  # frame | sample
+  max_samples: 384  # 6x the old 64, so the frame budget stays the binding cap: even all-short
+                    # clips would be 190k frames, far past the 4800 a GPU's batch may hold
+  num_workers: 16  # per process; 2 x 16 = 32 = the machine's core count
+
+optim:
+  epochs: 177  # unchanged from the single-GPU run, so the model still makes 177 passes over
+               # the same 244.6 h. The update count is not identical: a 4800-frame budget
+               # packs worse against long clips than 19200 did (two 30 s clips no longer share
+               # a batch), so an epoch is 5151 updates rather than 4705 and the run is 912k
+               # updates instead of 833k — same data, ~9% more padding. The LR horizon follows
+               # len(dataloader), so decay still lands its floor on the last update
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates (trainer scales by num_processes internally)
+  grad_accumulation_steps: 3  # 2 ranks x 3 x 3200 = 19200 frames/update
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+
+model:
+  name: WavTTS_Uncond_Large_RPE_Clean_FlowOnly_Init460  # model name; FlowOnly = no aux mel
+    # term, Init460 = started from the LibriTTS_460 clean run's weights rather than noise
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True   # kept on so CFM still builds MelSpectrogramLoss and its 14
+                             # registered buffers (7 STFT windows + 7 mel filterbanks) stay in
+                             # the state dict, key-compatible with every other arm in both
+                             # directions. Zeroing the weight rather than removing the module
+                             # is what makes this arm's checkpoints interchangeable with theirs
+    aux_mel_loss_weight: 0.0  # the one thing this arm changes. MelSpectrogramLoss returns
+                              # total_loss * weight, so the mel term contributes exactly zero
+                              # gradient and logs as a flat 0 — the objective is the flow term
+                              # alone. It is still computed every step, forward and backward,
+                              # which is the price of keeping the buffers
+    sample_rate: 16000
+    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
+                            # disables the mixing augmentation (only null samples mix),
+                            # so p_mix / p_concat / mix_* are left at their defaults and
+                            # never reached
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: True  # recompute activations rather than store them; kept on from
+                                  # the single-GPU run so the memory headroom stays the same
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    # length extrapolation — randomized positional encoding (Ruoss et al. 2023), see
+    # wavtts/model/rope.py. Training data tops out at 2979 frames (29.8 s), so gamma=4
+    # puts the longest clip's positions out to 11916 (119 s). Generating up to that
+    # length therefore uses positions the model trained on, with no inference-time
+    # knob: vanilla RoPE at base=10000 has its slowest dim turning once every 471 s,
+    # so nothing wraps. Reaching past 119 s means raising gamma and retraining.
+    rpe_gamma: 4.0           # per-sample stretch bound: L_t ~ U[n, n*gamma], drawn fresh
+                             # every forward. gamma=1 disables. Not a curriculum: every
+                             # batch spans contiguous through 4x from the first update
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. At 3000
+                             # every training clip sat below 1 and it never sharpened at all.
+                             # This is the only attention temperature in the model
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 160    # 160 @16k = 100Hz
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+    rand_frame_offset: True  # drop a random 0..159 leading samples per draw, so the frame
+                             # grid falls somewhere new every time a clip comes up. The
+                             # patchify is a bare stride-160 reshape, so this is the only
+                             # thing making the model's frame representation shift-tolerant;
+                             # it is also 160x more distinct targets against memorisation.
+                             # Enabled at update 157500 of this run, not from scratch.
+
+ckpts:
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 100  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # 60s sits inside the position range gamma=4 trains on (119 s), so it tests the model
+  # rather than the encoding. Past 119 s is untrained positions either way.
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
+  keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}
