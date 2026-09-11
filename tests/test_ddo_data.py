@@ -349,19 +349,21 @@ def test_gen_fake_pool_shards_compose_the_same_pool(tmp_path, capsys):
     ref_json = _ref_durations_file(tmp_path, [0.35, 0.5, 0.8])
 
     whole = tmp_path / "whole"
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, whole))
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, whole, **{"--max_batch_frames": 400}))
     expected = {p.name: sf.read(str(p), dtype="float32")[0] for p in sorted((whole / "wavs").glob("*.wav"))}
     assert len(expected) > 2
 
     sharded = tmp_path / "sharded"
     capsys.readouterr()
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "1/2"}))
+    # a budget of 400 frames holds ~5 of these half-second clips, so the pool spans several
+    # batches and both shards have work; the default would pack all of it into one batch
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "1/2", "--max_batch_frames": 400}))
     assert "not written" in capsys.readouterr().out
     assert not (sharded / "raw").exists() and not (sharded / "duration.json").exists()
     first_half = {p.name for p in (sharded / "wavs").glob("*.wav")}
     assert 0 < len(first_half) < len(expected)
 
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "0/2"}))
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "0/2", "--max_batch_frames": 400}))
     assert (sharded / "raw").exists() and (sharded / "duration.json").exists()
     got = {p.name: sf.read(str(p), dtype="float32")[0] for p in sorted((sharded / "wavs").glob("*.wav"))}
     assert got.keys() == expected.keys()
@@ -381,12 +383,12 @@ def test_gen_fake_pool_resumes_without_changing_the_pool(tmp_path, capsys):
     ref_json = _ref_durations_file(tmp_path, [0.35, 0.5, 0.8])
     out = tmp_path / "pool"
 
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out))
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out, **{"--max_batch_frames": 400}))
     first = {p.name: sf.read(str(p), dtype="float32")[0] for p in sorted((out / "wavs").glob("*.wav"))}
 
     # a complete pool costs nothing to "resume"
     capsys.readouterr()
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out))
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out, **{"--max_batch_frames": 400}))
     assert "wrote 0 new clips" in capsys.readouterr().out
 
     # drop a few clips and re-run: the missing ones come back byte-identical, because the
@@ -397,7 +399,7 @@ def test_gen_fake_pool_resumes_without_changing_the_pool(tmp_path, capsys):
     for name in list(first)[:2]:
         os.remove(out / "wavs" / name)
     capsys.readouterr()
-    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out))
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, out, **{"--max_batch_frames": 400}))
     n_written = int(re.search(r"wrote (\d+) new clips", capsys.readouterr().out).group(1))
     assert 2 <= n_written < len(first)
 
@@ -446,6 +448,74 @@ def test_fake_wavs_are_float32_and_unclipped(tmp_path, monkeypatch):
         # and the loader the trainer actually uses sees it unclipped too
         loaded, _ = torchaudio.load(str(path))
         assert loaded.abs().max().item() == pytest.approx(3.0, rel=1e-5)
+
+
+def test_plan_batches_packs_sorted_lengths_under_the_paid_budget():
+    """Batches mix lengths; what is budgeted is rows x the longest row, padding included."""
+    gen = _gen_module()
+    rng = torch.Generator().manual_seed(3)
+    lengths = (torch.randint(30, 300, (500,), generator=rng) * 160).tolist()  # 0.3-3 s, whole frames
+    budget = 3200
+    batches = gen.plan_batches(lengths, frame_samples=160, max_batch_frames=budget)
+
+    seen = sorted(i for b in batches for i in b)
+    assert seen == list(range(len(lengths))), "every clip exactly once"
+    for b in batches:
+        widest = max(-(-lengths[i] // 160) for i in b)
+        assert len(b) == 1 or len(b) * widest <= budget, "padded size must fit the budget"
+        assert lengths[b[-1]] >= lengths[b[0]], "sorted, so neighbours pad each other little"
+    paid = sum(len(b) * max(-(-lengths[i] // 160) for i in b) for b in batches)
+    useful = sum(-(-n // 160) for n in lengths)
+    assert (paid - useful) / paid < 0.05, "padding waste stays small on sorted lengths"
+
+    # equal-length grouping of the same clips: the long tail of one-of-a-kind lengths ran
+    # a batch each; mixed packing must launch far fewer
+    by_len = {}
+    for i, n in enumerate(lengths):
+        by_len.setdefault(n, []).append(i)
+    exact = sum(-(-len(m) // max(1, budget // (n // 160))) for n, m in by_len.items())
+    assert len(batches) < 0.6 * exact
+
+    assert batches == gen.plan_batches(lengths, frame_samples=160, max_batch_frames=budget), "deterministic"
+
+    # a lone clip over the budget still gets a batch of its own rather than being dropped
+    assert gen.plan_batches([160 * 50], frame_samples=160, max_batch_frames=10) == [[0]]
+
+
+def test_sample_with_lens_matches_generating_each_row_alone():
+    """A row in a mixed-length batch is the clip it would be on its own at that length.
+
+    The mask keeps padded keys out of attention, the conv position embedding and the
+    entropy scaling, so the padded lane never reaches the valid region. Row 0's noise is
+    the same stream prefix whether the tensor is [2, long] or [2, short], which is what
+    makes the two calls comparable at a fixed seed.
+    """
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_ddo import _make_cfm
+
+    torch.manual_seed(0)
+    model = _make_cfm(dit_kwargs={"attn_mask_enabled": True, "logn_ref_len": 500}).eval()
+    long, short = 1600, 960
+
+    mixed, _ = model.sample(lens=[long, short], steps=2, seed=11)
+    alone, _ = model.sample(long, batch=2, steps=2, seed=11)
+    assert mixed.shape == (2, long)
+    assert torch.allclose(mixed[0], alone[0], atol=1e-5)
+
+    mixed, _ = model.sample(lens=[short, long], steps=2, seed=11)
+    alone, _ = model.sample(short, batch=2, steps=2, seed=11)
+    assert torch.allclose(mixed[0, :short], alone[0], atol=1e-5)
+
+    mixed, _ = model.sample(lens=[short, long], steps=2, seed=11, solver="dpmpp")
+    alone, _ = model.sample(short, batch=2, steps=2, seed=11, solver="dpmpp")
+    assert torch.allclose(mixed[0, :short], alone[0], atol=1e-5)
+
+    with pytest.raises(ValueError):
+        model.sample(long, lens=[long], steps=2)
+    with pytest.raises(ValueError):
+        model.sample(steps=2)
 
 
 def test_sampled_durations_track_the_reference_distribution():

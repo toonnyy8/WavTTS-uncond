@@ -206,7 +206,13 @@ uv run python scripts/gen_fake_pool.py \
   --ref_durations data/LibriTTS_460/duration.json \
   --out data/LibriTTS_460_fake_r1 \
   --hours 50 --steps 32 --cfg_strength 0.0 --solver euler \
-  --max_batch_frames 3200 --seed 1234 --device cuda
+  --max_batch_frames 19200 --seed 1234 --device cuda:0 --shard 0/4
+#    ... and the same command with --shard 1/4 .. 3/4 on cuda:1..3: the plan is a pure
+#    function of --seed, so the shards write disjoint slices of one pool and whichever
+#    finishes last writes raw/ and duration.json. Rows of different lengths share a batch
+#    under a mask (exactly what training does; each row comes out as it would alone) and
+#    the backbone runs under bf16 autocast (--autocast none for the fp32 path): ~10 min
+#    for 50 h on four 4090s, against ~40 min for the round-1 pool's exact-length fp32 run
 
 # 3. the round itself (~2.4 h on 4x RTX 4090 for 9000 updates)
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

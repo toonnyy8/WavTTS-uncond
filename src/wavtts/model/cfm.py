@@ -217,8 +217,9 @@ class CFM(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        duration: int,  # number of samples at target_sample_rate
+        duration: int | None = None,  # number of samples at target_sample_rate, shared by every row
         *,
+        lens: int["b"] | list[int] | None = None,  # per-row sample counts instead of one duration
         batch: int = 1,
         steps: int = 32,
         cfg_strength: float = 2.0,
@@ -236,10 +237,31 @@ class CFM(nn.Module):
 
         if solver not in ("euler", "dpmpp"):
             raise ValueError(f"Unknown solver: {solver}")
+
+        # Mixed lengths in one batch, the way training already runs them: every row is padded
+        # to the longest and carries its own length through `lens` and `mask`, so attention
+        # never sees a padded key, the conv position embedding zeroes them, and the entropy
+        # scaling counts only real ones. Row i's valid region is then bit-for-bit the clip
+        # that generating it alone at lens[i] would produce -- there is no crop of a longer
+        # utterance, the model plans lens[i] samples of speech and the padding lane is
+        # simply never read. Mixed batches pack a frame budget ~2.3x tighter than equal
+        # lengths do on this corpus' length distribution (gen_fake_pool.plan_batches).
+        if lens is not None:
+            if duration is not None:
+                raise ValueError("sample() takes duration or lens, not both")
+            lens = torch.as_tensor(lens, device=device, dtype=torch.long)
+            if lens.ndim != 1 or lens.numel() == 0 or bool((lens <= 0).any()):
+                raise ValueError(f"lens must be a non-empty 1-d tensor of positive sample counts, got {lens}")
+            batch = int(lens.numel())
+            requested = int(lens.max())
+        elif duration is not None:
+            requested = int(duration)
+        else:
+            raise ValueError("sample() needs duration or lens")
         state = torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long)
 
-        requested = int(duration)
         aligned = int(math.ceil(requested / self.wav_frame_len) * self.wav_frame_len)
+        mask = lens_to_mask(lens, length=aligned) if lens is not None else None
 
         # dedicated generator: sampling with a fixed seed must not perturb the
         # global RNG (e.g. mid-training checkpoint sampling)
@@ -258,17 +280,19 @@ class CFM(nn.Module):
             # state_null_prob == 0 means the null branch was never trained, so its
             # prediction is noise: guidance is off no matter what the caller asked for
             if cfg_strength < 1e-5 or self.state_null_prob <= 0:
-                pred = self.transformer(x=x, state=state, time=t)
-                return to_v(pred)
+                pred = self.transformer(x=x, state=state, time=t, mask=mask, lens=lens)
+                # the integrator's state stays in x's dtype: under a bf16 autocast the
+                # backbone emits bf16 and the ODE must not accumulate in it
+                return to_v(pred).to(x.dtype)
 
             # classifier-free guidance against the null branch, which carries the
             # mixing augmentation: the guidance term is a classifier gradient and
             # self-extinguishes once x is unambiguously clean
-            pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True)
+            pred_cfg = self.transformer(x=x, state=state, time=t, mask=mask, lens=lens, cfg_infer=True)
             pred, neg_pred = torch.chunk(pred_cfg, 2, dim=0)
             v_pos = to_v(pred)
             v_neg = to_v(neg_pred)
-            return v_pos + (v_pos - v_neg) * cfg_strength
+            return (v_pos + (v_pos - v_neg) * cfg_strength).to(x.dtype)
 
         use_epss = use_epss and timestep_mapping == "sway_sampling"
         if use_epss:  # use Empirically Pruned Step Sampling for low NFE
@@ -300,6 +324,7 @@ class CFM(nn.Module):
             trajectory = odeint(fn, y0, t, **odeint_kwargs)
 
         out = trajectory[-1] / self.latents_scale
+        # with `lens`, row i is valid up to lens[i]; the caller crops the padding lane
         return out[:, :requested], trajectory
 
     # ---------------------------------------------------------------- DDO
