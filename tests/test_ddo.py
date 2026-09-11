@@ -465,7 +465,12 @@ def test_all_real_and_all_fake_batches_do_not_crash(flags, state_null_prob):
         "flow_loss",
         "aux_mel_loss",
         "anchor_loss",
-        "real_mel_loss",
+        "ddo/delta_v_real",
+        "ddo/delta_v_fake",
+        "ddo/delta_v_std",
+        "ddo/delta_mel_real",
+        "ddo/delta_mel_fake",
+        "ddo/delta_mel_std",
         "ddo/loss_real",
         "ddo/loss_fake",
         "ddo/delta_real",
@@ -509,45 +514,60 @@ def test_aux_mel_rides_along_with_the_anchor_only():
     assert loss_dict["anchor_loss"].item() > loss_dict["aux_mel_loss"].item()
 
 
-def test_real_mel_anchor_rides_on_real_rows_only():
-    """ddo.real_mel_weight adds the aux mel term on the real rows, outside Delta: the DDO
-    statistics are untouched, the term is absent at weight 0 and on an all-fake batch, and
-    it is exactly what it says -- the weighted mel loss of theta's x_pred on real rows."""
+def test_mel_channel_joins_the_logit():
+    """beta_mel > 0 adds Delta_mel = -(mel_theta - mel_ref) per row into the same logit:
+    ddo/delta_* = delta_v + (beta_mel / beta) * delta_mel, the v channel is unchanged by
+    it, it is exactly 0 at theta == ref, and it carries gradient to theta."""
     torch.manual_seed(0)
     wav = torch.randn(6, 1600) * 0.1
     is_fake = torch.tensor([False, True, False, True, False, True])
 
-    def run(weight, flags=is_fake):
+    def run(beta_mel, perturb):
         torch.manual_seed(1)
         model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0, use_aux_mel_loss=True)
-        _attach(model, real_mel_weight=weight)
+        ref = _attach(model, beta=2.0, beta_mel=beta_mel)
+        if perturb:
+            with torch.no_grad():
+                for p in ref.parameters():
+                    p.add_(torch.randn_like(p) * 0.01)
         model.train()
         torch.manual_seed(2)
-        return model(wav, is_fake=flags)
+        return model(wav, is_fake=is_fake)
 
-    loss0, d0 = run(0.0)
-    loss1, d1 = run(1.0)
-    assert math.isnan(d0["real_mel_loss"].item())
-    assert d1["real_mel_loss"].item() > 0.0
-    for k in ("ddo/loss_real", "ddo/loss_fake", "ddo/delta_std", "flow_loss"):
-        assert d1[k].item() == pytest.approx(d0[k].item(), rel=1e-6), k
-    assert loss1.item() == pytest.approx(loss0.item() + d1["real_mel_loss"].item(), rel=1e-6)
-    assert math.isnan(d1["aux_mel_loss"].item())  # the anchor's own mel term: no null rows here
+    _, d0 = run(0.0, perturb=True)
+    assert math.isnan(d0["ddo/delta_mel_std"].item())
+    assert d0["ddo/delta_v_real"].item() == pytest.approx(d0["ddo/delta_real"].item())
 
-    # weight scales it linearly, and an all-fake batch has nothing to anchor
-    _, d2 = run(2.0)
-    assert d2["real_mel_loss"].item() == pytest.approx(2 * d1["real_mel_loss"].item(), rel=1e-5)
-    _, d3 = run(1.0, torch.ones(6, dtype=torch.bool))
-    assert math.isnan(d3["real_mel_loss"].item())
+    loss, d1 = run(0.5, perturb=True)
+    assert d1["ddo/delta_mel_std"].item() > 0.0
+    for side in ("real", "fake"):
+        assert d1[f"ddo/delta_v_{side}"].item() == pytest.approx(d0[f"ddo/delta_v_{side}"].item(), rel=1e-5)
+        expected = d1[f"ddo/delta_v_{side}"].item() + (0.5 / 2.0) * d1[f"ddo/delta_mel_{side}"].item()
+        assert d1[f"ddo/delta_{side}"].item() == pytest.approx(expected, rel=1e-5, abs=1e-8)
+    loss.backward()  # the mel channel is differentiable through theta's x_pred
 
-    # theta's parameters get a gradient from it
-    torch.manual_seed(1)
-    model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0, use_aux_mel_loss=True)
-    _attach(model, real_mel_weight=1.0, beta=0.0)  # beta 0: the DDO term is a constant
-    model.train()
-    loss, d = model(wav, is_fake=is_fake)
-    loss.backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.transformer.parameters())
+    _, d2 = run(0.5, perturb=False)
+    assert d2["ddo/delta_mel_std"].item() == 0.0 and d2["ddo/delta_std"].item() == 0.0
+
+    model = _make_cfm(use_aux_mel_loss=False)
+    with pytest.raises(ValueError):
+        _attach(model, beta_mel=0.5)
+
+
+def test_mel_loss_per_row_reduction_matches_the_mean():
+    from wavtts.model.modules import MelSpectrogramLoss
+
+    torch.manual_seed(0)
+    mel = MelSpectrogramLoss(sample_rate=16000, n_mels=[5, 10], window_lengths=[64, 128], mel_fmin=[0, 0], mel_fmax=[None, None], weight=0.05)
+    a, b = torch.randn(3, 3200), torch.randn(3, 3200)
+    lens = torch.tensor([3200, 2400, 1600])
+    from wavtts.model.utils import lens_to_mask
+    per_row = mel(a, b, frame_mask=lens_to_mask(lens, 3200), frame_lengths=lens, reduction="none")
+    assert per_row.shape == (3,)
+    assert per_row.mean().item() == pytest.approx(mel(a, b, frame_mask=lens_to_mask(lens, 3200), frame_lengths=lens).item(), rel=1e-6)
+    assert mel(a, b, reduction="none").mean().item() == pytest.approx(mel(a, b).item(), rel=1e-6)
+    with pytest.raises(ValueError):
+        mel(a, b, reduction="sum")
 
 
 def test_attach_rejects_an_unknown_delta_normalize():

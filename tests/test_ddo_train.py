@@ -446,7 +446,7 @@ def test_ddo_config_instantiates_and_trains_one_step(ddo_run):
         "beta": 100.0,  # the round-1 calibration, recorded in the config's own comments
         "delta_normalize": "mean",
         "anchor_weight": 1.0,
-        "real_mel_weight": 0.0,
+        "beta_mel": 0.0,
     }
 
     # the DDO objective is what actually ran, and its statistics reached the logger under

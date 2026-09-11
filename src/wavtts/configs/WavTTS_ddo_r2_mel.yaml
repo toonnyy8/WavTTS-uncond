@@ -1,34 +1,22 @@
-# Round 2 of DDO finetuning. Everything WavTTS_ddo_r1.yaml says still holds; the differences
-# are the reference, the pool, and the round's length.
+# Round 2, redone with the objective changed (spec S3.10) and P_std widened. Same reference
+# (round 1's update 300) and the same pool (LibriTTS_460_fake_r2) as the round-2 probes,
+# so the comparison against them is direct: those peaked at 3.615 (LR 1e-5, update 50) and
+# 3.62 (LR 3e-6), within noise of the 3.60 they started from.
 #
-# Reference: round 1's best checkpoint, which is its update 300 -- kept as the beta=100
-# probe's model_last.pt, the same trajectory (same seed, same config) with a checkpoint
-# where round 1 had none. On 144 paired clips round 1 read UTMOS 3.60 at 300, 3.54 at
-# 500, 3.35 at 1000 and 2.67 at 9000 (below the 3.03 baseline); silence_ratio 0.071,
-# 0.080, 0.078, 0.048 against the corpus' 0.034. A round's useful part is its first few
-# hundred updates, so this one is 1500 updates with a checkpoint and samples every 250,
-# and the LR warms up over 100.
-#
-# Pool: data/LibriTTS_460_fake_r2, 50 h drawn from that checkpoint with the round-2 path
-# of gen_fake_pool.py (mixed-length batches under a mask, bf16 autocast; 32 NFE as before).
-#
-# Round-2 record (2026-09-11, 144 paired clips; the reference r1@300 scores 3.60 / 0.071):
-#   LR 1e-5, 300 updates (probes A/B, real_mel_weight 0 / 1.0): 3.36 / 0.056 -- both worse
-#     than the start, and identical to each other: at beta 100 under max_grad_norm 1.0 the
-#     mel term at weight 1.0 is a ~1% perturbation of the update direction.
-#   LR 1e-5, checkpoints every 50 (R2D1): peak at update 50, 3.615, then decline.
-#   LR 3e-6, every 50 (R2D2): 3.62 @100, 3.60 @250, 3.59 @300 -- flat, silence 0.066.
-#   LR 1e-5, real_mel_weight 20 (R2D3): silence heads to the corpus' 0.034 but UTMOS 3.12
-#     on the monitor clips; the anchor at same-magnitude weight takes over the trajectory.
-# So a second round of the recipe buys nothing measurable (+0.02, inside the +-0.03
-# noise of the protocol) and the LR-1e-5 arc peaks inside its first 50 updates. This file
-# now holds the only round-2 setting that did not lose ground -- LR 3e-6, 300 updates,
-# checkpoints every 50 -- and R2D2 *is* that run; its model_100.pt is round 2's best.
-# Before a round 3, change something the paper changes in its late rounds (P_std wider,
-# a beta re-sweep) rather than re-running this.
+# What changes:
+#   ddo.beta_mel    the discriminator reads a second channel, Delta_mel = -(mel_theta -
+#                   mel_ref) per row in raw multi-scale log-mel L1 units; the logit is
+#                   beta*Delta_v + beta_mel*Delta_mel. Calibrated so the two channels have
+#                   equal say at the first sign of movement (record below).
+#   model.cfm.P_std 0.8 -> 1.6, the paper's late-round move: the discriminator sees more
+#                   extreme noise levels. Both models are scored at the same t, so Delta's
+#                   definition is untouched.
+# LR 1e-5 with a checkpoint every 50: the LR-1e-5 arc without the mel channel peaked
+# inside 50 updates, so the round is 300 updates and every 50 is judged on the paired
+# 144-clip protocol.
 #
 # Launch (after make_pretrained_init.py into this run's save_dir):
-#   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2.yaml
+#   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2_mel.yaml
 
 hydra:
   run:
@@ -53,7 +41,7 @@ optim:
   epochs: 2  # an upper bound only — max_updates below is what ends the round. The DDO
              # dataloader is longer than pretraining's (the fake pool is concatenated in),
              # so one epoch is already more updates than a whole round
-  learning_rate: 3.0e-6  # 3x below round 1; at 1e-5 the round-2 arc peaked inside 50 updates and fell. Round 1 ran 1e-5: 20x below pretraining. The paper's diffusion runs use 5e-5
+  learning_rate: 1.0e-5  # round 1's LR; the objective is new, so the arc is re-measured every 50 updates The paper's diffusion runs use 5e-5
                          # (EDM2-S) to 1.5e-4 (CIFAR) at batch 512; this is the
                          # conservative end of the 1e-5 … 5e-5 sweep
   num_warmup_updates: 100  # a 1500-update round; round 1 peaked at ~300 with 200
@@ -83,16 +71,16 @@ optim:
   bnb_optimizer: False
 
 model:
-  name: WavTTS_Uncond_Large_RPE_Clean_DDO_R2
+  name: WavTTS_Uncond_Large_RPE_Clean_DDO_R2Mel
   backbone: DiT
   cfm:
     prediction: x_pred         # flow | x_pred
     loss_space: v         # flow | v   (v is typical for x_pred mode)
     t_sampling: logistic_normal      # uniform | logistic_normal
     P_mean: -0.8
-    P_std: 0.8  # the paper widens P_std in late rounds (EDM2-S: 1.6 -> 3.0 at round 17) to
-                # put signal on more extreme noise levels. Round 1 leaves it at the
-                # pretraining value; it is the one documented between-round change (spec S4)
+    P_std: 1.6  # widened from the pretraining 0.8, the paper's late-round move (EDM2-S:
+                # 1.6 -> 3.0 at round 17): the discriminator sees more extreme noise levels.
+                # Both models are scored at the same t, so Delta is defined as before (spec S3.10)
     t_eps: 0.02
     latents_scale: 1.0
     use_aux_mel_loss: True
@@ -216,10 +204,9 @@ ddo:
                       # this arm (state_null_prob is 0, so there are no null rows); it is
                       # here for a future CFG-arm port (spec S3.4)
 
-  beta_mel: 0.0  # > 0 opens a second discriminator channel in the multi-scale log-mel domain:
-                 # Delta_mel = -(mel_theta - mel_ref) per row, logit = beta*Delta_v +
-                 # beta_mel*Delta_mel, one sigmoid (spec S3.10). Off here; WavTTS_ddo_r2_mel.yaml
-                 # carries the calibrated value
+  beta_mel: 0.0  # CALIBRATED BY THE R2MelCal PROBE -- see the record in the header once it
+                 # has run. Delta_mel = -(mel_theta - mel_ref) per row in raw log-mel L1 units,
+                 # logit = beta*Delta_v + beta_mel*Delta_mel, one sigmoid (spec S3.10)
   real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
                         # diffusion pairing, enforced by repeating the pool's indices rather
                         # than by pool size — a 1:1-sized pool would be 244.6 h of 32-NFE

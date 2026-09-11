@@ -430,21 +430,27 @@ class MelSpectrogramLoss(nn.Module):
         x_true: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
         frame_lengths: torch.Tensor | None = None,
+        reduction: str = "mean",
     ):
         """
         Args:
             x_pred: [B, T] or [B, 1, T] Estimated Waveform
             x_true: [B, T] or [B, 1, T] Ground Truth Waveform
+            reduction: "mean" -> weighted scalar (the batch mean of the per-row loss);
+                       "none" -> weighted per-row loss [B], summed over scales. The mean of
+                       the latter is exactly the former.
         Returns:
-            Weighted scalar loss
+            Weighted scalar loss, or [B] with reduction="none"
         """
+        if reduction not in ("mean", "none"):
+            raise ValueError(f"Unknown reduction: {reduction}")
         # Ensure correct shape [B, T] for torchaudio, or [B, 1, T] is also fine but usually squeeze
         if x_pred.ndim == 3 and x_pred.shape[1] == 1:
             x_pred = x_pred.squeeze(1)
         if x_true.ndim == 3 and x_true.shape[1] == 1:
             x_true = x_true.squeeze(1)
             
-        total_loss = x_pred.new_tensor(0.0)
+        per_row = x_pred.new_zeros(x_pred.shape[0])
 
         use_mask = frame_mask is not None
         if use_mask:
@@ -501,9 +507,11 @@ class MelSpectrogramLoss(nn.Module):
                         diff.append(diff_full.new_tensor(0.0))
                 diff = torch.stack(diff, dim=0)
 
-            total_loss += diff.mean()
+            per_row = per_row + diff
 
-        return total_loss * self.weight
+        if reduction == "none":
+            return per_row * self.weight
+        return per_row.mean() * self.weight
 
     @staticmethod
     def _get_span_bounds_from_mask(mask: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:

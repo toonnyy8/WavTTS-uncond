@@ -429,22 +429,37 @@ unwrapped model 的方法，否則多卡梯度不同步。所以 **DDO 路徑做
 
 ---
 
-### 3.10 真實列的 mel 錨（Δ 之外，第 2 輪起可選）
+### 3.10 mel 當判別器的第二個通道（第 2 輪的重做；真實列的 mel 錨已移除）
 
-第 1 輪的探針顯示：β=100 下 DDO 的真實項在 200–300 步內就飽和（`βΔ_real` 過 3、`acc`→1），
-之後整個目標函數只剩假樣本項在說「離 p_ref 的樣本遠一點」，沒有任何一項把 θ 拉住在真實語音上；
-而「多一點靜音」正是離 p_ref 最便宜的方向之一（silence 0.052 → 0.071，真實語料 0.034）。
+第一版的 §3.10 把 mel 當**真實列的錨**（Δ 之外的重建項）。第 2 輪的探針證明它沒有可用區間：
+權重 1.0 時是 β=100 梯度在 `max_grad_norm 1.0` 下的 ~1% 擾動，20 時 mel 接管軌跡、silence 走向
+真實值但 UTMOS 從 3.60 掉到 3.12。這條路徑已從程式碼移除（`real_mel_weight` 不存在了）。
 
-`ddo.real_mel_weight > 0` 時，`_ddo_forward` 對**真實列**（不含 null 列，它們已有 anchor；
-永不含假列，假列沒有值得重建的目標）加上 `w · mel(x_pred_θ / scale, x1 / scale)`，
-與預訓練的 aux mel 完全相同的模組與遮罩，**只進 total loss、不進 Δ**——likelihood-ratio 的
-恆等式與 Theorem 3.1/3.3 都不受影響，成本是真實列多 7 個 STFT。
-記錄為 `real_mel_loss`。預設 0，第 1 輪可重現；第 2 輪先試 1.0，與不加錨的 β=100 做 300 步探針
-比 UTMOS 與 silence：silence 回到 0.03–0.05 且 UTMOS 增益保留，就是要的效果。
+現在的做法是**讓同一個判別器多讀一個 log-ratio 代理**。對每一列（真、假都算）：
 
-兩個被否決的替代：把 mel 距離當第二個判別通道（`Δ_mel` 加自己的 β），或直接用 mel 距離取代
-Δ 裡的 v-loss——mel loss 不是 ELBO，這兩者都讓 Δ 不再是 log-likelihood ratio 的代理，
-定理不再成立，且多一個 β 要標定。
+```
+Δ_v   = −(ℓ_θ − ℓ_ref)                    # §3.1 的 v-loss 差，逐列平均
+Δ_mel = −(mel_θ − mel_ref) / w_mel        # 兩模型 x_pred 對 x1 的多尺度 log-mel L1 差，除掉模組內權重
+logit = β·Δ_v + β_mel·Δ_mel               # 一個 sigmoid
+```
+
+`mel_ref` 用的是同一次 ref 前向的 `x_pred`（不多算前向），`no_grad`；`mel_θ` 帶梯度。一個 sigmoid
+而非兩個獨立 loss：兩個通道一起飽和，`ddo/delta_*` 記錄的就是 loss 實際看到的合成量；
+另記 `ddo/delta_v_*`、`ddo/delta_mel_*` 兩個分量。`beta_mel: 0` 時完全不計算（第 1 輪可重現）。
+`MelSpectrogramLoss` 加了 `reduction="none"` 給逐列輸出，其平均與原本的純量嚴格相等。
+
+**理論上的代價要說清楚**：mel 距離不是 ELBO，`Δ_mel` 不是 log p_θ/p_ref 的代理，Theorem 3.1/3.3
+對合成 logit 不成立。它的定位是「GAN 判別器多一個特徵」：θ 要在真實 clip 上重建得比 ref 好、
+在 p_ref 的樣本上比 ref 差，用頻譜域而非 v 空間來量「像不像」。動機是第 1 輪之後 v 通道
+只剩「遠離 p_ref 樣本」這一個方向、且最便宜的出路是靜音；頻譜通道對靜音沒有偏好（靜音的
+log-mel 與真實語音差很遠）。
+
+**β_mel 的標定**：與 §3.3 同理，先以極小的 `beta_mel`（只為了記錄統計量）跑 ~150 步，讀
+`ddo/delta_v_std` 與 `ddo/delta_mel_std`，取 `β_mel ≈ β · delta_v_std / delta_mel_std` 讓兩個通道在
+logit 裡有相同的話語權，再以 UTMOS/silence 的配對協定微調。
+
+**`P_std` 加寬到 1.6**：論文晚期輪次的做法（EDM2-S 第 17 輪起 1.6 → 3.0），讓判別器看到更極端的
+噪聲水平；兩個模型在同一個 t 上評估，不影響 Δ 的定義。第 1 輪維持 0.8。
 
 ## 4. 訓練配置
 
@@ -530,7 +545,7 @@ ddo:
 
 參考 = 第 1 輪 update 300（配對協定 3.60 / silence 0.071）。所有第 2 輪探針都從它出發、用它生的池子：
 
-| run | LR | `real_mel_weight` | 存檔 | 配對 UTMOS（最佳點） | silence |
+| run | LR | 真實列 mel 錨（已移除） | 存檔 | 配對 UTMOS（最佳點） | silence |
 |---|---|---|---|---|---|
 | ProbeA | 1e-5 | 0 | 300 | 3.36 @300 | 0.056 |
 | ProbeB | 1e-5 | 1.0 | 300 | 3.37 @300 | 0.053 |

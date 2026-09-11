@@ -113,7 +113,7 @@ class CFM(nn.Module):
         self.ddo_beta = 1.0
         self.ddo_delta_normalize = "mean"
         self.ddo_anchor_weight = 1.0
-        self.ddo_real_mel_weight = 0.0
+        self.ddo_beta_mel = 0.0
 
     @property
     def device(self):
@@ -338,12 +338,13 @@ class CFM(nn.Module):
         beta: float,
         delta_normalize: str = "mean",
         anchor_weight: float = 1.0,
-        real_mel_weight: float = 0.0,
+        beta_mel: float = 0.0,
     ) -> None:
         """Freeze `ref` as p_ref and switch forward() onto the DDO path.
 
-        real_mel_weight > 0 adds the auxiliary mel term on the real rows, outside Δ: a
-        perceptual anchor for a round in which the DDO real term has saturated (spec 3.10).
+        beta_mel > 0 opens a second discriminator channel in the multi-scale log-mel
+        domain: Δ_mel = -(mel_θ - mel_ref) per row, and the logit becomes
+        β·Δ_v + β_mel·Δ_mel (spec 3.10). Needs the aux mel module (use_aux_mel_loss).
 
         The reference is stored in a **one-element list**, not as an attribute. A bare
         `self.ddo_ref = ref` would go through `nn.Module.__setattr__`, which registers any
@@ -371,7 +372,11 @@ class CFM(nn.Module):
         self.ddo_beta = float(beta)
         self.ddo_delta_normalize = delta_normalize
         self.ddo_anchor_weight = float(anchor_weight)
-        self.ddo_real_mel_weight = float(real_mel_weight)
+        self.ddo_beta_mel = float(beta_mel)
+        if self.ddo_beta_mel > 0 and self.aux_mel_loss is None:
+            raise ValueError("beta_mel > 0 needs use_aux_mel_loss=True: the mel channel is built on that module")
+        if self.ddo_beta_mel > 0 and self.ddo_beta <= 0:
+            raise ValueError("beta_mel > 0 needs beta > 0: the two channels share one logit, scaled by beta")
 
     @property
     def ddo_ref(self) -> "CFM | None":
@@ -551,13 +556,47 @@ class CFM(nn.Module):
                 # put βΔ at O(1) for both ends, and length becomes the one feature the
                 # discriminator needs (spec S3.2). Kept as an ablation knob.
                 delta = delta * m.sum(dim=-1)
+            delta_v = delta
+
+            # The mel channel (spec S3.10). The same discriminator reads a second
+            # log-ratio proxy, the gap between the two models' multi-scale log-mel
+            # reconstruction errors on the same (x_t, t), and the logit is
+            # β·Δ_v + β_mel·Δ_mel -- one sigmoid, so the two channels saturate together
+            # and the stats below describe what the loss actually sees. Divided by the
+            # module's inner weight so β_mel is in raw log-mel L1 units. ref's x_pred
+            # comes from the ref forward already made; only θ's side carries gradient.
+            delta_mel = None
+            if self.ddo_beta_mel > 0:
+                _, x_pred_theta = self._predictions(raw_pred[idx].float(), φ[idx].float(), time[idx].float())
+                _, x_pred_ref = self._predictions(ref_pred.float(), φ[idx].float(), time[idx].float())
+                mel_kwargs = {}
+                if self.aux_mel_loss_masked:
+                    mel_kwargs.update(frame_mask=mask[idx], frame_lengths=lens[idx])
+                x1_rows = x1[idx].float() / self.latents_scale
+                mel_theta = self.aux_mel_loss(x_pred_theta / self.latents_scale, x1_rows, reduction="none", **mel_kwargs)
+                with torch.no_grad():
+                    mel_ref = self.aux_mel_loss(x_pred_ref / self.latents_scale, x1_rows, reduction="none", **mel_kwargs)
+                delta_mel = -(mel_theta - mel_ref) / self.aux_mel_loss.weight
+                delta = delta_v + (self.ddo_beta_mel / self.ddo_beta) * delta_mel
         else:
             delta = elem_loss.new_zeros((0,))
+            delta_v, delta_mel = delta, None
 
         ddo_term, loss_dict = ddo_loss(delta, is_fake[idx], alpha=self.ddo_alpha, beta=self.ddo_beta)
         total_loss = ddo_term
 
         nan = elem_loss.new_full((), float("nan"))
+        # per-channel views of Δ: delta_v_* always (equal to ddo/delta_* when the mel channel
+        # is off), delta_mel_* only when it is on
+        fake_rows_idx = is_fake[idx]
+        for name, vec in (("delta_v", delta_v), ("delta_mel", delta_mel)):
+            if vec is None or vec.numel() == 0:
+                loss_dict[f"ddo/{name}_real"] = loss_dict[f"ddo/{name}_fake"] = loss_dict[f"ddo/{name}_std"] = nan
+                continue
+            r, f = vec[~fake_rows_idx], vec[fake_rows_idx]
+            loss_dict[f"ddo/{name}_real"] = r.mean().detach() if r.numel() else nan
+            loss_dict[f"ddo/{name}_fake"] = f.mean().detach() if f.numel() else nan
+            loss_dict[f"ddo/{name}_std"] = vec.std().detach() if vec.numel() > 1 else nan
         anchor_value, aux_mel_value = nan, nan
         anchor_idx = null_flags.nonzero(as_tuple=True)[0]
         if anchor_idx.numel() > 0:
@@ -591,27 +630,6 @@ class CFM(nn.Module):
             total_loss = total_loss + anchor_loss
             anchor_value = anchor_loss.detach()
 
-        # The mel anchor on the real rows, outside Δ. The DDO real term stops pulling once
-        # β·Δ_real clears ~3 -- in round 1 that took 200-300 updates -- and from then on
-        # nothing in the objective holds θ to real speech; the fake term alone says only
-        # "away from p_ref's samples", and silence is one cheap direction away. This keeps
-        # x_pred spectrally faithful on real rows for the rest of the round. Not on the
-        # null rows (they carry it already via the anchor) and never on fake rows, which
-        # have no target worth reconstructing. Off by default so round 1 reproduces.
-        real_mel_value = nan
-        if self.ddo_real_mel_weight > 0 and self.use_aux_mel_loss and self.aux_mel_loss is not None:
-            mel_idx = (~is_fake & ~null_flags).nonzero(as_tuple=True)[0]
-            if mel_idx.numel() > 0:
-                _, x_pred = self._predictions(raw_pred[mel_idx].float(), φ[mel_idx].float(), time[mel_idx].float())
-                mel_kwargs = {}
-                if self.aux_mel_loss_masked:
-                    mel_kwargs.update(frame_mask=mask[mel_idx], frame_lengths=lens[mel_idx])
-                real_mel = self.ddo_real_mel_weight * self.aux_mel_loss(
-                    x_pred / self.latents_scale, x1[mel_idx] / self.latents_scale, **mel_kwargs
-                )
-                total_loss = total_loss + real_mel
-                real_mel_value = real_mel.detach()
-
         # flow_loss over the real rows is a divergence alarm, not a quality metric: DDO
         # trades likelihood for sample quality, so it is *expected* to rise. Past roughly
         # 2x the pretraining value the round has been pushed too far (spec S4).
@@ -622,7 +640,6 @@ class CFM(nn.Module):
         loss_dict["flow_loss"] = flow_value
         loss_dict["aux_mel_loss"] = aux_mel_value
         loss_dict["anchor_loss"] = anchor_value
-        loss_dict["real_mel_loss"] = real_mel_value
 
         return total_loss, loss_dict
 
