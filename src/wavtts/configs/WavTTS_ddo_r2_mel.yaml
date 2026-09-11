@@ -33,7 +33,13 @@
 # without it. Once it had weight, Delta_mel's spread grew to 0.18-0.30 (0.078 in the
 # calibration probe) while Delta_v stayed ~0.001: 16 * 0.2 ~ 3-5 of logit against
 # 400 * 0.001 ~ 0.4, so the "equal say" target was missed by ~10x and the mel channel owned
-# the run. R2Mel2 re-runs this file with beta_mel 4 (mel logit ~1).
+# the run. R2Mel2 (beta_mel 4, mel logit ~1) traced the same curve to within noise:
+#   @50  3.626 / 0.068     @100  3.556 / 0.047     @150  3.468 / 0.035
+# so beta_mel in [4, 16] does not change where the run goes, only how it is labelled.
+# What the channel gives is a silence/UTMOS trade-off along the round: at 50 the start's
+# UTMOS with slightly less silence, at 100 the base's silence (0.05) at UTMOS +0.53, at 150
+# the corpus' silence (0.035) at +0.44. UTMOS rewards clean silence, so which point sounds
+# best is a listening question, not one this file can settle.
 #
 # Launch (after make_pretrained_init.py into this run's save_dir):
 #   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2_mel.yaml
