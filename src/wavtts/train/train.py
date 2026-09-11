@@ -7,7 +7,8 @@ import hydra
 from omegaconf import OmegaConf
 
 from wavtts.model import CFM, Trainer
-from wavtts.model.dataset import load_dataset
+from wavtts.model.dataset import load_dataset, load_ddo_dataset
+from wavtts.model.ddo import load_ref_state_dict
 from wavtts.model.utils import seed_everything
 
 
@@ -32,6 +33,39 @@ def main(model_cfg):
         waveform_kwargs=model_cfg.model.waveform,
         **cfm_kwargs,
     )
+
+    # DDO finetuning (docs/superpowers/specs/2026-09-11-ddo-design.md). The block is
+    # optional and absent for every pretraining config, in which case not one line below
+    # this point behaves differently from before.
+    ddo_cfg = model_cfg.get("ddo", None)
+    if ddo_cfg is not None:
+        # p_ref is built from the *same* arch / cfm / waveform config as theta. Any
+        # asymmetry between the two -- a different dropout rate, loss space or t schedule --
+        # lands in Delta as an offset present on every row, which is a feature the
+        # discriminator can separate real from fake on without ever improving a sample.
+        ref = CFM(
+            transformer=model_cls(**model_arc, wav_frame_len=model_cfg.model.waveform.wav_frame_len),
+            waveform_kwargs=model_cfg.model.waveform,
+            **cfm_kwargs,
+        )
+        ref.load_state_dict(load_ref_state_dict(ddo_cfg.ref_ckpt))
+        model.attach_ddo_ref(
+            ref,
+            alpha=ddo_cfg.alpha,
+            beta=ddo_cfg.beta,
+            delta_normalize=ddo_cfg.get("delta_normalize", "mean"),
+            anchor_weight=ddo_cfg.get("anchor_weight", 1.0),
+        )
+        # Recorded, not plumbed: this study runs no CFG at all, so the fake pool is drawn
+        # guidance-free and the only correct value is 0. It lives in the config so the
+        # checkpoint's logged run config states which pool it was trained against
+        # (spec S3.4, S3.5).
+        if float(ddo_cfg.get("fake_cfg_strength", 0.0)) != 0.0:
+            print(
+                "WavTTS WARNING: ddo.fake_cfg_strength is non-zero. Fakes generated with "
+                "guidance are not samples of p_ref, and the likelihood-ratio identity DDO "
+                "rests on does not hold for them."
+            )
 
     save_dir = model_cfg.ckpts.save_dir
     if os.path.isabs(save_dir):
@@ -58,6 +92,11 @@ def main(model_cfg):
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_updates=model_cfg.ckpts.last_per_updates,
+        # both optional and absent from every pretraining config: a DDO round stops on a
+        # fixed update count, and needs a far shorter EMA than the ema_pytorch defaults
+        # (spec S3.8)
+        max_updates=model_cfg.optim.get("max_updates", None),
+        ema_kwargs=OmegaConf.to_container(model_cfg.optim.get("ema_kwargs", {}) or {}, resolve=True),
         log_per_updates=model_cfg.ckpts.get("log_per_updates", 1),
         log_samples=model_cfg.ckpts.log_samples,
         log_samples_seeds=model_cfg.ckpts.log_samples_seeds,
@@ -67,7 +106,17 @@ def main(model_cfg):
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
     )
 
-    train_dataset = load_dataset(model_cfg.datasets.name, waveform_kwargs=model_cfg.model.waveform)
+    if ddo_cfg is not None:
+        # Real corpus + offline fake pool as one dataset; the repeat count that pulls the
+        # per-batch real:fake frame ratio to real_fake_ratio is computed in there.
+        train_dataset = load_ddo_dataset(
+            model_cfg.datasets.name,
+            ddo_cfg.fake_dataset,
+            waveform_kwargs=model_cfg.model.waveform,
+            real_fake_ratio=ddo_cfg.get("real_fake_ratio", 1.0),
+        )
+    else:
+        train_dataset = load_dataset(model_cfg.datasets.name, waveform_kwargs=model_cfg.model.waveform)
     trainer.train(
         train_dataset,
         num_workers=model_cfg.datasets.num_workers,

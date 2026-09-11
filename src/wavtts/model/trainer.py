@@ -80,6 +80,7 @@ class Trainer:
         epochs,
         learning_rate,
         num_warmup_updates=20000,
+        max_updates: int | None = None,  # hard stop in updates; None = run `epochs` passes
         save_per_updates=1000,
         keep_last_n_checkpoints: int = -1,  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
         checkpoint_path=None,
@@ -155,6 +156,15 @@ class Trainer:
 
         if self.is_main:
             self.ema_model = EMA(model, include_online_model=False, **ema_kwargs)
+            # EMA deepcopies the model, and a one-element list *is* copied by deepcopy --
+            # what keeps p_ref invisible is nn.Module.__setattr__ declining to register it,
+            # not deepcopy declining to look. So the copy silently carries a second frozen
+            # p_ref (bf16, ~1.33 GiB on the large arch) that nothing will ever read: the EMA
+            # weights are only used for sample(), which never goes down the DDO path. Drop
+            # it here rather than giving CFM a __deepcopy__ -- that would change what copying
+            # a CFM means for every other caller in order to fix one of them (spec S3.8).
+            if hasattr(self.ema_model.ema_model, "_ddo_ref"):
+                self.ema_model.ema_model._ddo_ref = []
             self.ema_model.to(self.accelerator.device)
             self._print_model_param_summary(self.model)
 
@@ -166,6 +176,7 @@ class Trainer:
 
         self.epochs = epochs
         self.num_warmup_updates = num_warmup_updates
+        self.max_updates = max_updates
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
         self.last_per_updates = default(last_per_updates, save_per_updates)
@@ -185,9 +196,46 @@ class Trainer:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
+        # p_ref lives in a one-element list on the CFM (spec S3.9), so it is not in the
+        # module tree and neither .to() nor accelerator.prepare() reaches it -- the model
+        # would move to cuda while the reference stayed on cpu, and the first DDO batch
+        # would die on a device mismatch. Moved once here, after prepare has settled which
+        # device this process owns and before any batch can arrive.
+        ref = self.accelerator.unwrap_model(self.model).ddo_ref
+        if ref is not None:
+            ref.to(self.accelerator.device)
+
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    @staticmethod
+    def _scalar_logs(loss_dict: dict) -> dict[str, float]:
+        """Every finite scalar in loss_dict, keyed as it should appear in the logs.
+
+        The trainer used to name the two keys pretraining emits. The DDO path emits eleven,
+        and which of them carry a number depends on what the batch contained -- a step whose
+        sampler handed out only real rows has no ddo/loss_fake, and a clean-arm run has no
+        anchor_loss ever. So the dict is walked instead of indexed, and nan (the loss's way
+        of saying "no rows of this kind this step") is skipped rather than written: a single
+        nan poisons a tensorboard curve's autoscale for the whole run.
+
+        total_loss is logged as "loss" so the curve stays continuous across the
+        pretraining -> DDO switch; it is exactly the quantity backward() was called on.
+        """
+        out: dict[str, float] = {}
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim != 0:
+                    continue
+                value = value.item()
+            elif not isinstance(value, (int, float)):
+                continue
+            value = float(value)
+            if math.isnan(value):
+                continue
+            out["loss" if key == "total_loss" else key] = value
+        return out
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -390,14 +438,29 @@ class Trainer:
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
         # otherwise by default with split_batches=False, warmup steps change with num_processes
-        # No num_processes factor here, and the reason is easy to get backwards. The wrapped
-        # scheduler is stepped num_processes times per optimizer step, so the horizon does have
-        # to be in those units -- but len(train_dataloader) is still the GLOBAL batch count at
-        # this point: prepare() below is what rebinds the name to the per-process shard. Global
-        # batches / accumulation IS internal steps per epoch already. Multiplying again stretches
-        # the decay num_processes-fold and the LR never reaches its floor.
-        total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
-        decay_updates = total_updates - warmup_updates
+        if exists(self.max_updates):
+            # A DDO round is a few thousand updates and stops on max_updates, long before
+            # `epochs` passes are done -- and its dataloader is *longer* than pretraining's
+            # because the fake pool is concatenated in, so deriving the horizon from epochs
+            # would put the floor tens of epochs away and leave the LR essentially flat for
+            # the whole round. max_updates counts optimizer steps, so it takes the same
+            # num_processes factor warmup_updates does, for the reason spelled out below.
+            total_updates = self.max_updates * self.accelerator.num_processes
+        else:
+            # No num_processes factor here, and the reason is easy to get backwards. The
+            # wrapped scheduler is stepped num_processes times per optimizer step, so the
+            # horizon does have to be in those units -- but len(train_dataloader) is still the
+            # GLOBAL batch count at this point: prepare() below is what rebinds the name to
+            # the per-process shard. Global batches / accumulation IS internal steps per epoch
+            # already. Multiplying again stretches the decay num_processes-fold and the LR
+            # never reaches its floor.
+            total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
+        # clamped, because a horizon at or below the warmup makes LinearLR divide by its
+        # own total_iters of zero and take the run down on the first step. That is reachable
+        # by config now that max_updates exists (a 300-update beta probe against the config's
+        # 200 warmup updates is a sane thing to ask for), and a one-step decay is a more
+        # useful answer than a traceback.
+        decay_updates = max(1, total_updates - warmup_updates)
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(
@@ -444,7 +507,9 @@ class Trainer:
                     wav = batch["wav"]
                     wav_lengths = batch["wav_lengths"]
 
-                    loss, loss_dict = self.model(wav, lens=wav_lengths)
+                    # is_fake is present only when the dataset is a DDO tagged concat; a
+                    # missing key is None, which CFM.forward reads as "every row is real".
+                    loss, loss_dict = self.model(wav, lens=wav_lengths, is_fake=batch.get("is_fake"))
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -460,30 +525,26 @@ class Trainer:
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(
-                        update=str(global_update), 
-                        aux_mel_loss=loss_dict["aux_mel_loss"].item(),
-                        flow_loss=loss_dict["flow_loss"].item(),
-                        loss=loss.item()
-                    )
+                    # Nothing is indexed unconditionally: which terms a step produces depends
+                    # on the objective and on what the batch happened to contain (no fake
+                    # rows this step means no ddo/loss_fake), so the postfix shows whichever
+                    # of these the dict actually carries.
+                    scalars = self._scalar_logs(loss_dict)
+                    postfix = {"update": str(global_update), "loss": scalars.get("loss", loss.item())}
+                    for key in ("flow_loss", "aux_mel_loss", "anchor_loss", "ddo/margin", "ddo/acc"):
+                        if key in scalars:
+                            postfix[key] = scalars[key]
+                    progress_bar.set_postfix(postfix)
 
                 if self.accelerator.is_local_main_process and global_update % self.log_per_updates == 0:
-                    self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
-                    )
+                    logs = {"lr": self.scheduler.get_last_lr()[0]}
+                    logs.update(self._scalar_logs(loss_dict))
+                    logs.setdefault("loss", loss.item())  # a loss_dict without total_loss
+                    self.accelerator.log(logs, step=global_update)
 
-                    if loss_dict["flow_loss"] is not None:
-                        self.accelerator.log({"flow_loss": loss_dict["flow_loss"].item()}, step=global_update)
-                    if loss_dict["aux_mel_loss"] is not None:
-                        self.accelerator.log({"aux_mel_loss": loss_dict["aux_mel_loss"].item()}, step=global_update)
-                    
                     if self.logger == "tensorboard":
-                        self.writer.add_scalar("loss", loss.item(), global_update)
-                        self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
-                        if loss_dict["flow_loss"] is not None:
-                            self.writer.add_scalar("flow_loss", loss_dict["flow_loss"].item(), global_update)
-                        if loss_dict["aux_mel_loss"] is not None:
-                            self.writer.add_scalar("aux_mel_loss", loss_dict["aux_mel_loss"].item(), global_update)
+                        for key, value in logs.items():
+                            self.writer.add_scalar(key, value, global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)
@@ -576,6 +637,18 @@ class Trainer:
                     if self.logger == "tensorboard":
                         for k, v in metric_log.items():
                             self.writer.add_scalar(k, v, global_update)
+
+                # Checked last, so a boundary update still gets its checkpoint, samples and
+                # metrics before the run ends. Breaking both loops rather than relying on
+                # the epoch count: a DDO round's max_updates lands in the middle of an epoch
+                # by construction, and the dataloader would happily keep handing out batches.
+                if exists(self.max_updates) and global_update >= self.max_updates:
+                    break
+
+            if exists(self.max_updates) and global_update >= self.max_updates:
+                if self.is_main:
+                    print(f"Reached max_updates={self.max_updates}, stopping.")
+                break
 
         self.save_checkpoint(global_update, last=True)
 

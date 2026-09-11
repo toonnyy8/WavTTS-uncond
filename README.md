@@ -168,6 +168,119 @@ Metrics logged for each clip:
 
 All metrics are fail-safe: they skip (with a warning) rather than interrupt training.
 
+## 🥊 DDO finetuning
+
+[Direct Discriminative Optimization](https://arxiv.org/abs/2503.01103) (Zheng et al., ICML
+2025 oral) is a short finetuning stage that trades a little likelihood for sample quality.
+Maximum-likelihood training minimizes the *forward* KL, which barely penalizes putting mass
+where the data has none — at finite capacity the model covers modes rather than choosing
+them, and here that is audible as mumbling, speaker drift and non-speech hum. DDO freezes a
+copy of the model as a reference `p_ref`, reads the pair `(p_θ, p_ref)` as a GAN
+discriminator `d_θ = σ(log p_θ/p_ref)`, and optimizes the discriminative objective. No extra
+network, no alternating training, no architecture change: the loss only needs the two
+models' flow losses on the same `(x_t, t, ε)`.
+
+**This study runs no CFG on either side.** The baseline is the *clean arm pretrained
+checkpoint, sampled without guidance*, and the comparison is the *same arm after DDO, also
+sampled without guidance*, at the same NFE. That is the point of the method rather than a
+simplification: Theorem 3.3 makes DDO's optimum `p_θ* ∝ p_ref^(1−1/β) · p_data^(1/β)`, which
+is guidance-shaped but lives in the weights instead of costing a second forward at every
+sampling step. **DDO is meant to replace guidance, not to stack on top of it.**
+
+### One round, three steps
+
+```bash
+# 1. weights-only init, so the round starts at theta == p_ref with a fresh optimizer
+#    (rounds deliberately do not carry optimizer state across)
+uv run python scripts/make_pretrained_init.py \
+  ckpts/WavTTS_Uncond_Large_RPE_Clean_LibriTTS_460/model_last.pt \
+  ckpts/WavTTS_Uncond_Large_RPE_Clean_DDO_R1_LibriTTS_460 \
+  src/wavtts/configs/WavTTS_ddo_r1.yaml
+
+# 2. the offline fake pool: ~50 h sampled from the SAME weights p_ref will be
+#    (the checkpoint's EMA half), guidance-free, 32-bit float wavs, durations drawn
+#    from the real corpus' own duration.json
+uv run python scripts/gen_fake_pool.py \
+  --ckpt ckpts/WavTTS_Uncond_Large_RPE_Clean_LibriTTS_460/model_last.pt \
+  --config src/wavtts/configs/WavTTS_clean.yaml \
+  --ref_durations data/LibriTTS_460/duration.json \
+  --out data/LibriTTS_460_fake_r1 \
+  --hours 50 --steps 32 --cfg_strength 0.0 --solver euler \
+  --max_batch_frames 3200 --seed 1234 --device cuda
+
+# 3. the round itself (~2.4 h on 4x RTX 4090 for 9000 updates)
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  uv run accelerate launch --mixed_precision bf16 --num_processes 4 \
+    src/wavtts/train/train.py --config-name WavTTS_ddo_r1.yaml
+```
+
+The `ddo:` block in `src/wavtts/configs/WavTTS_ddo_r1.yaml` is what switches the objective
+on; every other config omits it and behaves exactly as before.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ddo.ref_ckpt` | — | the frozen `p_ref`; its **EMA** weights are read, and they must be the weights the pool was generated from |
+| `ddo.fake_dataset` | — | `data/<name>` written by `gen_fake_pool.py`, in the real corpus' own directory format |
+| `ddo.alpha` | 1.0 | weight on the fake term; the paper sweeps `[0.5, 6.0]`. The loss is divided by `max(α, 1)` so an α sweep is not also an LR sweep |
+| `ddo.beta` | 1.0 | scale on the log-ratio. **Calibrate it — see below.** Not a stability knob: `β < 1` extrapolates past `p_data` along `p_data/p_ref`, which is where the quality comes from and why a round must be short |
+| `ddo.delta_normalize` | mean | `mean` \| `sum`. `mean` because clips span 0.3–30 s and one global β cannot suit both ends of a 100× dimension range — otherwise length becomes the one feature the discriminator needs |
+| `ddo.anchor_weight` | 1.0 | weight on the MLE anchor kept on `null` rows. Never reached in this arm (`state_null_prob` is 0); it exists for a future CFG-arm port |
+| `ddo.real_fake_ratio` | 1.0 | target real:fake **frame** ratio per batch, enforced by repeating the pool's indices rather than by pool size |
+| `ddo.fake_cfg_strength` | 0.0 | recorded only. A guided sample is not a sample of `p_ref`, so the likelihood-ratio identity would stop holding |
+| `optim.max_updates` | 9000 | the round length, ~1% of pretraining; the run stops here regardless of `epochs` |
+| `optim.ema_kwargs` | `beta: 0.999, update_every: 1` | ~1000 updates of averaging. The `ema_pytorch` defaults average over ~100k, which would flatten a 9k-update round to nothing — and every sample and `gen/*` metric is read off the EMA weights |
+
+### Calibrating β
+
+**Do not copy the paper's `0.01–0.1`.** That range is stated for a `Δ` summed over 3072
+dimensions, magnitude `O(10³)`. This port's `Δ` is a per-element masked mean over
+variable-length rows, magnitude `O(10⁻³)` — five to six orders of magnitude smaller. Pasting
+`0.02` in puts `βΔ` at `~1e-5`, `logsigmoid` never leaves its linear midpoint, and the DDO
+term is off in all but name. Nothing errors.
+
+1. Run ~300 updates at `beta: 1.0` and read `ddo/delta_real`, `ddo/delta_fake`,
+   `ddo/delta_std`. At update 0 `θ == p_ref` exactly, so `Δ ≡ 0` and `delta_std == 0` — the
+   numbers only mean anything once the run has moved.
+2. Set `β ≈ 1 / delta_std`, which puts `βΔ` at `O(1)`.
+3. Trim with `ddo/acc`, **target 0.6–0.75**. `acc > 0.9` reached quickly ⇒ β too large,
+   sigmoid saturated, gradients gone. `acc ≈ 0.5` while `delta_std` keeps growing ⇒ β too
+   small, the DDO term is not doing anything.
+
+### What to watch
+
+`gen/utmos` and `gen/spk_sim_self` are this repo's stand-in for FID and the only real
+verdict — the paper's author sums up "as long as the FID is decreasing, the training is
+normal". Alongside them:
+
+- `ddo/delta_real`, `ddo/delta_fake` — healthy is the two drifting slowly apart
+- `ddo/margin` — their difference, the quantity the official trainer logs
+- `ddo/delta_std` — what β is calibrated against
+- `ddo/acc` — target 0.6–0.75; ties count a half, and a one-sided batch logs `nan` rather
+  than a number that looks like an accuracy but is only half of one
+- `ddo/loss_real`, `ddo/loss_fake`, `anchor_loss` — logged apart, so it is visible which term
+  is driving the update
+- `flow_loss` — **a divergence alarm, not a quality metric.** DDO trades likelihood for
+  quality, so it is *expected* to rise; past roughly 2× the pretraining value the round has
+  been pushed too far
+
+Failure looks like one of two things, and the 300-update β probe shows both without burning
+a round: `ddo/acc` stuck at 0.5 (signal too weak) or racing to 0.99 (saturated β, or the
+discriminator found a shortcut — check that the pool's durations, loudness, frame grid and
+32-bit float precision all match the real corpus).
+
+### Multiple rounds
+
+One round is not the method. Diffusion models in the paper need **12–28 rounds**, each
+short (0.3–0.8% of pretraining). Round `n+1` is this config with `ddo.ref_ckpt` and
+`ddo.fake_dataset` pointing at round `n`'s **best** checkpoint and a pool regenerated from
+it. Best, not last: a round provably does not converge — quality bottoms out mid-round and
+then gets worse again, which is why `save_per_updates` is 1000 here and nothing is rotated
+away. Rounds do not carry optimizer state, and α/β are worth re-sweeping each time.
+
+Full rationale, the four deliberate departures from the paper, and the cost model:
+[`docs/superpowers/specs/2026-09-11-ddo-design.md`](docs/superpowers/specs/2026-09-11-ddo-design.md)
+and [`docs/superpowers/plans/2026-09-11-ddo.md`](docs/superpowers/plans/2026-09-11-ddo.md).
+
 ## 🎧 Sampling
 
 ```bash
@@ -183,10 +296,13 @@ Useful flags: `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-
 ## ✅ Tests
 
 ```bash
-uv run pytest tests/test_uncond_smoke.py -v
+uv run pytest tests/ -v
 ```
 
-CPU-only smoke suite covering the mixing math (including the no-leak prefix property), CFG paths, both solvers, seed isolation, metrics, and the CLI end-to-end.
+CPU-only. `test_uncond_smoke.py` covers the mixing math (including the no-leak prefix
+property), CFG paths, both solvers, seed isolation, metrics, and the CLI end-to-end;
+`test_ddo.py`, `test_ddo_data.py` and `test_ddo_train.py` cover the DDO loss, the fake-pool
+data path and the training wiring.
 
 ## 🙏 Acknowledgements
 

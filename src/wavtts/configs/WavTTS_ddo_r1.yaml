@@ -1,0 +1,180 @@
+# Round 1 of Direct Discriminative Optimization (DDO, arXiv:2503.01103) finetuning, on
+# top of the clean arm. Architecture and data are WavTTS_clean.yaml's; the objective and
+# the schedule are not. See docs/superpowers/specs/2026-09-11-ddo-design.md.
+#
+# **This study uses no CFG.** state_null_prob stays 0, so there is no null label, the
+# mixing augmentation never fires, the MLE anchor never has a row to protect, and
+# CFM.sample switches guidance off by itself. The whole batch is the DDO objective's two
+# sides: real-positive and fake-negative. That is the point rather than a simplification —
+# DDO's claim is that it *replaces* inference-time guidance (Theorem 3.3's optimum
+# p_theta ∝ p_ref^(1-1/beta) · p_data^(1/beta) is guidance-shaped, but baked into the
+# weights), so the comparison this config is built for is "clean arm, no guidance" against
+# "clean arm + DDO, no guidance" at the same NFE (spec S3.4, S6).
+#
+# Three steps to a round, none of them run by this file:
+#   1. uv run python scripts/make_pretrained_init.py <round_n-1_ckpt> ckpts/<this run dir>
+#   2. uv run python scripts/gen_fake_pool.py --ckpt <same ckpt> --out data/<fake_dataset>
+#   3. accelerate launch ... train.py --config-name WavTTS_ddo_r1.yaml
+# Round 2 is this file with ddo.ref_ckpt and ddo.fake_dataset pointing at round 1's *best*
+# checkpoint and a pool regenerated from it — not its last checkpoint (spec S2.3).
+#
+# Launch as the clean arm does, bf16:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   accelerate launch --mixed_precision bf16 --num_processes 4 \
+#     src/wavtts/train/train.py --config-name WavTTS_ddo_r1.yaml
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # the real half; the fake half is ddo.fake_dataset below
+  batch_size_per_gpu: 2400  # halved from the clean arm's 4800, with grad_accumulation_steps
+                            # doubled to match, so an update is still 19200 frames. p_ref
+                            # adds ~1.33 GiB of bf16 weights per GPU and the batch carries
+                            # both DDO sides at once; the update size is held fixed on
+                            # purpose so the objective is the only variable in the A/B
+  batch_size_type: frame  # frame | sample
+  max_samples: 384
+  num_workers: 8
+
+optim:
+  epochs: 4  # an upper bound only — max_updates below is what ends the round. The DDO
+             # dataloader is longer than pretraining's (the fake pool is concatenated in),
+             # so one epoch is already more updates than a whole round
+  learning_rate: 1.0e-5  # 20x below pretraining. The paper's diffusion runs use 5e-5
+                         # (EDM2-S) to 1.5e-4 (CIFAR) at batch 512; this is the
+                         # conservative end of the 1e-5 … 5e-5 sweep
+  num_warmup_updates: 200  # pretraining's 20000 would never finish inside a ~9000-update
+                           # round — the LR would still be ramping when the round ends
+  max_updates: 9000  # the round length, ~1% of pretraining. DDO rounds are short and many:
+                     # the paper needs 12–28 of them for diffusion models (spec S2.3)
+  ema_kwargs:  # ema_pytorch's defaults (beta 0.9999, update_every 10) average over roughly
+    beta: 0.999          # 100k updates. A DDO round is 9k, so the defaults would average
+    update_every: 1      # essentially the entire round away — and every sample and every
+                         # gen/* metric is read off the EMA weights, so the curves would
+                         # come out flat as if nothing had trained. These put the effective
+                         # window near 1000 updates, ~10% of the round (spec S3.8)
+  grad_accumulation_steps: 2  # 4 x 2400 x 2 = 19200 frames/update, as in the clean arm
+  max_grad_norm: 1.0
+  bnb_optimizer: False
+
+model:
+  name: WavTTS_Uncond_Large_RPE_Clean_DDO_R1
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8  # the paper widens P_std in late rounds (EDM2-S: 1.6 -> 3.0 at round 17) to
+                # put signal on more extreme noise levels. Round 1 leaves it at the
+                # pretraining value; it is the one documented between-round change (spec S4)
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05  # reached only by the anchor rows, which this arm has none of:
+                               # the mel term is a perceptual regularizer, not part of the
+                               # ELBO, so it never enters Delta (spec S3.1)
+    sample_rate: 16000
+    state_null_prob: 0.0    # must stay 0. This study runs no CFG: no null label, no mixing,
+                            # no anchor rows — the entire batch is the DDO objective
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0  # spelled out rather than left to DiT's constructor, whose default is 0.1.
+                  # theta runs in train mode and p_ref in eval mode, so a non-zero dropout
+                  # means the two models score the same row under different masks; Delta
+                  # stops being a difference between models and becomes one between dropout
+                  # draws. Nothing raises — the run just stops learning (spec S3.6)
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True
+    checkpoint_activations: True  # theta only; attach_ddo_ref turns it off on p_ref, which
+                                  # runs under no_grad and has no backward to recompute for
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    rpe_gamma: 4.0  # stays on through DDO. Turning it off would finetune the model on
+                    # contiguous positions only and erode the length extrapolation it was
+                    # pretrained for. Both models are handed the *same* draw — CFM samples
+                    # the positions once and passes them to theta and p_ref (spec S3.6)
+    logn_ref_len: 500
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 160    # 160 @16k = 100Hz
+    target_rms: 1.0       # applied to the fake pool too: both halves go through one
+                          # CustomDataset with these exact kwargs, which is what erases
+                          # loudness as a real-vs-fake shortcut (spec S3.5)
+    rand_frame_offset: True  # likewise for the frame grid — generated audio sits exactly on
+                             # it, recorded audio does not, and that would be a free feature
+                             # for the discriminator
+
+ckpts:
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 10  # denser than pretraining's 100: beta is calibrated off ddo/delta_std
+                       # and ddo/acc over the first few hundred updates (spec S3.3)
+  log_samples: True
+  log_samples_seeds: [0, 1, 2, 3]
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables
+  save_per_updates: 1000  # 10x denser than pretraining, and keep_last_n_checkpoints keeps
+  last_per_updates: 500   # them all, because a DDO round does not converge *by design*:
+                          # quality bottoms out mid-round and then gets worse again, so the
+                          # checkpoint to carry into round 2 is the best one by gen/utmos and
+                          # gen/spk_sim_self, and the last one usually is not it (spec S2.3)
+  keep_last_n_checkpoints: -1  # -1 keeps all; see above — rotation would delete the answer
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}
+
+# DDO. Absent from every other config, and CFM.forward's behaviour is bit-identical to
+# pretraining without it.
+ddo:
+  ref_ckpt: ckpts/WavTTS_Uncond_Large_RPE_Clean_LibriTTS_460/model_last.pt  # frozen p_ref;
+                        # the EMA weights inside it are the ones read (load_ref_state_dict),
+                        # and they must be the same weights gen_fake_pool.py sampled from —
+                        # "the fakes are samples of p_ref" is what makes Delta a log-ratio
+  fake_dataset: LibriTTS_460_fake_r1  # data/<name>, written by scripts/gen_fake_pool.py in
+                                      # the real corpus' own directory format
+  alpha: 1.0  # weight on the fake term. The paper sweeps [0.5, 6.0] for diffusion. The loss
+              # is divided by max(alpha, 1) so the gradient scale barely moves as alpha does,
+              # and an alpha sweep is not also an LR sweep (spec S3.3)
+
+  # ---------------------------------------------------------------------------------
+  # beta: CALIBRATE THIS BEFORE THE FIRST REAL ROUND. DO NOT COPY THE PAPER'S NUMBER.
+  #
+  # The paper's beta in [0.01, 0.1] is stated for *its* Delta: a torch.sum over 3072
+  # dimensions, magnitude O(10^3). This port's Delta is a per-element masked mean over
+  # variable-length rows, magnitude O(10^-3)..O(10^-2) — five to six orders of magnitude
+  # smaller. Pasting 0.02 in here puts beta*Delta at ~1e-5, logsigmoid sits at its linear
+  # midpoint forever, and the DDO term is switched off in all but name. Nothing errors.
+  #
+  # The calibration, from spec S3.3:
+  #   1. run 300 updates at beta = 1.0 and read ddo/delta_real, ddo/delta_fake, ddo/delta_std
+  #      (at update 0 theta == p_ref exactly, so Delta ≡ 0 and delta_std == 0 — the numbers
+  #      only mean something once the run has moved)
+  #   2. set beta ≈ 1 / delta_std, which puts beta*Delta at O(1)
+  #   3. trim using ddo/acc, target 0.6–0.75. acc > 0.9 reached quickly = beta too large,
+  #      sigmoid saturated, gradients gone; acc ≈ 0.5 with delta_std still growing = beta
+  #      too small, the DDO term is not doing anything
+  # ---------------------------------------------------------------------------------
+  beta: 1.0
+
+  delta_normalize: mean  # mean | sum. mean, because clips span 0.3–30 s: a single global
+                         # beta cannot put beta*Delta at O(1) for both ends of a 100x
+                         # dimension range, and length would become the one feature the
+                         # discriminator needs. Per-row averaging is exactly the paper's
+                         # own beta ∝ 1/D rule made per-sample. sum is the ablation (S3.2)
+  anchor_weight: 1.0  # weight on the null rows' retained MLE flow loss. Never reached in
+                      # this arm (state_null_prob is 0, so there are no null rows); it is
+                      # here for a future CFG-arm port (spec S3.4)
+  real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
+                        # diffusion pairing, enforced by repeating the pool's indices rather
+                        # than by pool size — a 1:1-sized pool would be 244.6 h of 32-NFE
+                        # sampling per round (spec S3.5)
+  fake_cfg_strength: 0.0  # recorded, not used. This study runs no CFG and the pool must be
+                          # generated guidance-free: a guided sample is not a sample of
+                          # p_ref, and the likelihood-ratio identity stops holding
