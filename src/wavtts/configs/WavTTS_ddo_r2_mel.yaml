@@ -25,6 +25,16 @@
 # 200-300, where the sigmoid brakes), and beta_mel = 400 * 0.04 = 16 gives the two
 # channels equal say. Both are units, not new choices: the paper's 0.02 over 3072 dims.
 #
+# Result (R2Mel, 144 paired clips; start 3.60 / silence 0.071; v-only round 2 peaked at
+# 3.615-3.62 / 0.072):
+#   @50  3.62 / 0.066     @100  3.56 / 0.048     @150  3.48 / 0.038     (monitor: 3.10 @300)
+# The mel channel does what it was brought in for -- silence heads back to the corpus'
+# 0.034, which the v-only recipe never did -- but past update 50 UTMOS falls faster than
+# without it. Once it had weight, Delta_mel's spread grew to 0.18-0.30 (0.078 in the
+# calibration probe) while Delta_v stayed ~0.001: 16 * 0.2 ~ 3-5 of logit against
+# 400 * 0.001 ~ 0.4, so the "equal say" target was missed by ~10x and the mel channel owned
+# the run. R2Mel2 re-runs this file with beta_mel 4 (mel logit ~1).
+#
 # Launch (after make_pretrained_init.py into this run's save_dir):
 #   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2_mel.yaml
 

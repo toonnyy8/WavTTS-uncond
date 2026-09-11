@@ -571,6 +571,24 @@ ddo:
   重掃 β/α），而不是重跑同一配方。`WavTTS_ddo_r2.yaml` 改成唯一沒有退步的設定
   （LR 3e-6、300 步、每 50 存檔），R2D2 就是這個 run，`model_100.pt` 是第 2 輪的最佳點。
 
+### 第 2 輪重做：mel 通道 + `P_std 1.6`（2026-09-11）
+
+`WavTTS_ddo_r2_mel.yaml`（β 400 / β_mel 16 / `delta_space x` / `P_std 1.6`，LR 1e-5，每 50 步）：
+
+| checkpoint | 配對 UTMOS | silence |
+|---|---|---|
+| 起點 r1@300 | 3.60 | 0.071 |
+| v-only 第 2 輪最佳（D1@50 / D2@100） | 3.615 / 3.62 | 0.073 / 0.072 |
+| R2Mel@50 | **3.62** | **0.066** |
+| R2Mel@100 | 3.56 | 0.048 |
+| R2Mel@150 | 3.48 | 0.038 |
+
+mel 通道做到了引入它的目的——silence 回到真實語料的 0.034 附近，v-only 配方從未做到——但 50 步之後
+UTMOS 掉得比 v-only 快。分量：一旦有權重，`delta_mel_std` 從標定時的 0.078 漲到 0.18–0.30，
+`delta_v_std` 仍 ~0.001，logit 份額 16×0.2 ≈ 3–5 對 400×0.001 ≈ 0.4，「等話語權」差了 10 倍，
+mel 主導了整個 run。標定的教訓：通道的 spread 在有權重之後會自我放大，標定探針
+（`beta_mel` 極小）低估它一個數量級。R2Mel2 以 `beta_mel 4` 重跑（mel logit ≈ 1）。
+
 ### 監看指標
 
 既有的 `gen/utmos`、`gen/spk_sim_self`、`gen/silence_ratio`、`gen/rms` 全部留著，
