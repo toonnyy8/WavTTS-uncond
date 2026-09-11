@@ -12,10 +12,20 @@
 # Pool: data/LibriTTS_460_fake_r2, 50 h drawn from that checkpoint with the round-2 path
 # of gen_fake_pool.py (mixed-length batches under a mask, bf16 autocast; 32 NFE as before).
 #
-# real_mel_weight is the round-2 addition (spec S3.10): the DDO real term saturates within
-# ~300 updates and silence is then a cheap way "away from p_ref"; the mel term on the real
-# rows anchors x_pred's spectrum for the rest of the round. Set from the two round-2
-# probes (R2ProbeA: 0, R2ProbeB: 1.0) -- see the calibration record below.
+# Round-2 record (2026-09-11, 144 paired clips; the reference r1@300 scores 3.60 / 0.071):
+#   LR 1e-5, 300 updates (probes A/B, real_mel_weight 0 / 1.0): 3.36 / 0.056 -- both worse
+#     than the start, and identical to each other: at beta 100 under max_grad_norm 1.0 the
+#     mel term at weight 1.0 is a ~1% perturbation of the update direction.
+#   LR 1e-5, checkpoints every 50 (R2D1): peak at update 50, 3.615, then decline.
+#   LR 3e-6, every 50 (R2D2): 3.62 @100, 3.60 @250, 3.59 @300 -- flat, silence 0.066.
+#   LR 1e-5, real_mel_weight 20 (R2D3): silence heads to the corpus' 0.034 but UTMOS 3.12
+#     on the monitor clips; the anchor at same-magnitude weight takes over the trajectory.
+# So a second round of the recipe buys nothing measurable (+0.02, inside the +-0.03
+# noise of the protocol) and the LR-1e-5 arc peaks inside its first 50 updates. This file
+# now holds the only round-2 setting that did not lose ground -- LR 3e-6, 300 updates,
+# checkpoints every 50 -- and R2D2 *is* that run; its model_100.pt is round 2's best.
+# Before a round 3, change something the paper changes in its late rounds (P_std wider,
+# a beta re-sweep) rather than re-running this.
 #
 # Launch (after make_pretrained_init.py into this run's save_dir):
 #   NUM_PROCESSES=4 scripts/train_loop.sh WavTTS_ddo_r2.yaml
@@ -43,12 +53,12 @@ optim:
   epochs: 2  # an upper bound only — max_updates below is what ends the round. The DDO
              # dataloader is longer than pretraining's (the fake pool is concatenated in),
              # so one epoch is already more updates than a whole round
-  learning_rate: 1.0e-5  # 20x below pretraining. The paper's diffusion runs use 5e-5
+  learning_rate: 3.0e-6  # 3x below round 1; at 1e-5 the round-2 arc peaked inside 50 updates and fell. Round 1 ran 1e-5: 20x below pretraining. The paper's diffusion runs use 5e-5
                          # (EDM2-S) to 1.5e-4 (CIFAR) at batch 512; this is the
                          # conservative end of the 1e-5 … 5e-5 sweep
   num_warmup_updates: 100  # a 1500-update round; round 1 peaked at ~300 with 200
-  max_updates: 1500  # round 1 peaked at update 300 and was below baseline by 9000; this
-                     # covers the arc with room to see it turn (spec S2.3, S4)
+  max_updates: 300  # round 1 peaked at update 300 and was below baseline by 9000; the
+                    # round-2 probes peaked at 50-100 (spec S2.3, S4)
   lr_decay_end_factor: 0.3  # the LR floor after warmup, as a fraction of learning_rate. The
                             # paper never anneals a round to zero: CIFAR rounds are one long
                             # linear warmup with no decay at all, EDM2 rounds decay inverse-sqrt
@@ -133,8 +143,8 @@ ckpts:
   log_samples_seeds: [0, 1, 2, 3]
   log_samples_secs: [5, 15, 30, 60]
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables
-  save_per_updates: 250   # dense, and keep_last_n_checkpoints keeps them all, because a
-  last_per_updates: 250   # DDO round does not converge *by design*:
+  save_per_updates: 50    # dense, and keep_last_n_checkpoints keeps them all, because a
+  last_per_updates: 50    # DDO round does not converge *by design*:
                           # quality bottoms out mid-round and then gets worse again, so the
                           # checkpoint to carry into round 2 is the best one by gen/utmos and
                           # gen/spk_sim_self, and the last one usually is not it (spec S2.3)

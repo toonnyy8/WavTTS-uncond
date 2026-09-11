@@ -284,8 +284,11 @@ short (0.3–0.8% of pretraining). Round `n+1` is this config with a **new `mode
 `ddo.fake_dataset` pointing at round `n`'s **best** checkpoint and a pool regenerated from
 it. In practice round 1 peaked at update 300 on 144 paired clips (UTMOS 3.03 → 3.60) and
 was *below* the baseline by 9000, so the useful part of a round here is its first few
-hundred updates: `WavTTS_ddo_r2.yaml` runs 1500 with a checkpoint every 250 and starts
-from round 1's update-300 checkpoint. The name is not cosmetic: `save_dir` derives from it and the trainer resumes whatever
+hundred updates. Round 2 from that checkpoint gained nothing measurable at any tested
+setting (+0.02, inside the protocol's noise; the LR-1e-5 arc peaks inside 50 updates), so
+`WavTTS_ddo_r2.yaml` holds the one setting that did not lose ground (LR 3e-6, 300
+updates, checkpoints every 50) and a round 3 should change what the paper changes late
+(`P_std`, a β re-sweep) rather than repeat the recipe. The name is not cosmetic: `save_dir` derives from it and the trainer resumes whatever
 `model_last.pt` it finds there, so under round `n`'s name round `n+1` would full-state-resume
 round `n` at its final update — optimizer state and all — and stop after one batch. The
 trainer refuses a finished run, and `train.py` refuses a `save_dir` with no `pretrained_*.pt`
