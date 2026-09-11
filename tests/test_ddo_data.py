@@ -87,13 +87,14 @@ def test_tagged_concat_routes_indices_and_frame_lens(tmp_path):
     assert len(ds) == 2 + 3 * 3
     assert ds.target_sample_rate == SR
 
-    # the real block comes first, untagged, with the real frame lengths
-    assert [ds.get_frame_len(i) for i in range(2)] == [1.0 * SR / FRAME, 2.0 * SR / FRAME]
-    assert all(ds[i]["is_fake"] is False for i in range(2))
+    # the real block comes first, untagged. Every row's frame length carries a deterministic
+    # sub-frame dither (see _grid_dither): the true length plus something in [0, 1) frames --
+    # never less, never a whole frame -- so the sampler's budget stays conservative
+    for i, true_len in enumerate([1.0 * SR / FRAME, 2.0 * SR / FRAME]):
+        assert 0.0 <= ds.get_frame_len(i) - true_len < 1.0
+        assert ds[i]["is_fake"] is False
 
-    # and the fake block wraps modulo len(fake), so copy k of clip j is clip j.
-    # Fake frame lengths carry a deterministic sub-frame dither (see _grid_dither), so they
-    # are the true length plus something in [0, 1) frames -- never less, never a whole frame.
+    # and the fake block wraps modulo len(fake), so copy k of clip j is clip j
     for rep in range(3):
         for j in range(3):
             idx = 2 + rep * 3 + j
@@ -168,22 +169,23 @@ def test_frame_batches_mix_real_and_fake_rows():
     """Batches must contain both kinds of row, not just the dataset as a whole.
 
     DynamicBatchSampler sorts by frame length and packs neighbours with a stable sort, so
-    exactly-equal keys keep index order: real rows first, fake rows after. Real lengths are
-    dense floats (arbitrary recorded sample counts over wav_frame_len) while generated
-    lengths are whole frames, so without TaggedConcatDataset._grid_dither every fake row
-    piles onto an integer key, the pile is contiguous and longer than one frame budget, and
-    the sampler emits runs of all-fake batches. The global real:fake ratio stays perfect
-    while the per-batch ratio -- the one the DDO loss and the shared time draws actually
-    see -- is 0 or 1 nearly every step.
+    exactly-equal keys keep index order: real rows first, fake rows after. Generated
+    lengths are whole frames by construction, and so are the recorded ones here:
+    LibriTTS_460's duration.json is rounded to 0.01 s, which at 100 frames/s is exactly
+    one frame. Both halves pile onto the same integer keys, each pile is longer than one
+    frame budget, and without TaggedConcatDataset._grid_dither on *every* row the sampler
+    emits runs of all-real then all-fake batches (96.8% one-sided on the real corpus). The
+    global real:fake ratio stays perfect while the per-batch ratio -- the one the DDO loss
+    and the shared (t, eps) draws actually see -- is 0 or 1 nearly every step.
     """
     from torch.utils.data import SequentialSampler
 
     from wavtts.model.dataset import CustomDataset, DynamicBatchSampler, TaggedConcatDataset
 
     torch.manual_seed(0)
-    # only get_frame_len is exercised here, so the rows need no audio behind them
-    real_samples = torch.randint(30 * FRAME, 60 * FRAME, (600,))
-    real_durs = (real_samples.double() / SR).tolist()
+    # only get_frame_len is exercised here, so the rows need no audio behind them. Real
+    # durations are rounded to 0.01 s exactly as the corpus' prepare script writes them
+    real_durs = [round(x, 2) for x in (torch.randint(30 * FRAME, 60 * FRAME, (600,)).double() / SR).tolist()]
     fake_durs = (torch.randint(30, 60, (60,)).double() * FRAME / SR).tolist()  # whole frames
 
     real = CustomDataset([{"duration": d} for d in real_durs], durations=real_durs, wav_frame_len=FRAME)
@@ -199,9 +201,60 @@ def test_frame_batches_mix_real_and_fake_rows():
 
     # the dither only ever over-reports, and by less than one frame, so the sampler's budget
     # stays conservative and no batch grows past frames_threshold
-    for i in range(n_real, len(ds)):
-        slack = ds.get_frame_len(i) - fake.get_frame_len((i - n_real) % len(fake))
+    for i in range(len(ds)):
+        src, idx = ds._route(i)
+        slack = ds.get_frame_len(i) - src.get_frame_len(idx)
         assert 0.0 <= slack < 1.0
+
+
+def test_paired_sampler_puts_both_kinds_in_every_batch():
+    """The sampler the DDO trainer actually uses: every batch of two or more rows has a
+    real and a fake row, the budget holds, nothing is dropped or repeated, and the shuffle
+    is the parent's (seeded, per epoch)."""
+    from torch.utils.data import SequentialSampler
+
+    from wavtts.model.dataset import CustomDataset, DynamicBatchSampler, PairedDynamicBatchSampler, TaggedConcatDataset
+
+    torch.manual_seed(1)
+    # a wide length spread including clips too long to pair inside the budget
+    real_durs = [round(x, 2) for x in (torch.randint(20 * FRAME, 300 * FRAME, (400,)).double() / SR).tolist()]
+    fake_durs = (torch.randint(20, 300, (50,)).double() * FRAME / SR).tolist()
+    real = CustomDataset([{"duration": d} for d in real_durs], durations=real_durs, wav_frame_len=FRAME)
+    fake = CustomDataset([{"duration": d} for d in fake_durs], durations=fake_durs, wav_frame_len=FRAME, is_fake=True)
+    ds = TaggedConcatDataset(real, fake, fake_repeat=8)
+    n_real = len(real)
+    budget = 1200  # four of the longest clips: everything can pair, so one-sided means the tail
+
+    paired = PairedDynamicBatchSampler(ds, budget, max_samples=0, random_seed=0)
+    assert sorted(i for b in paired.batches for i in b) == list(range(len(ds)))
+    # a side is exhausted once its longest row has been placed; batches built after that
+    # point can only hold the other kind, and are the one legitimate one-sided case
+    last_real = max(range(n_real), key=ds.get_frame_len)
+    last_fake = max(range(n_real, len(ds)), key=ds.get_frame_len)
+    exhausted_at = min(next(k for k, b in enumerate(paired.batches) if i in b) for i in (last_real, last_fake))
+    for k, b in enumerate(paired.batches):
+        frames = sum(ds.get_frame_len(i) for i in b)
+        assert len(b) == 1 or frames <= budget
+        kinds = {i >= n_real for i in b}
+        if len(b) >= 2 and k <= exhausted_at:
+            assert kinds == {False, True}, f"one-sided batch of {len(b)} rows at {k}"
+        # a batch pairs rows of similar length: sorted lists consumed in lockstep
+        lens = [ds.get_frame_len(i) for i in b]
+        assert max(lens) - min(lens) < 0.5 * max(lens) + 1
+
+    plain = DynamicBatchSampler(SequentialSampler(ds), budget, max_samples=0, random_seed=0)
+    one_sided = lambda s: sum(len({i >= n_real for i in b}) == 1 for b in s.batches) / len(s.batches)  # noqa: E731
+    assert one_sided(paired) < one_sided(plain)
+    assert one_sided(paired) < 0.05  # what is left is the tail of the side that ran out last
+
+    # shuffling is seeded and per epoch, like the parent
+    first = list(iter(paired))
+    paired.set_epoch(1)
+    second = list(iter(paired))
+    assert first != second and sorted(map(tuple, first)) == sorted(map(tuple, second))
+    paired.set_epoch(0)
+    assert list(iter(paired)) == first
+    assert len(paired) == len(paired.batches) and paired.drop_last is True
 
 
 def test_fake_pool_loudness_and_grid_are_erased_by_the_shared_loader(tmp_path):

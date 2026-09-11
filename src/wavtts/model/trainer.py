@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from wavtts.model import CFM
-from wavtts.model.dataset import DynamicBatchSampler, collate_fn
+from wavtts.model.dataset import DynamicBatchSampler, PairedDynamicBatchSampler, TaggedConcatDataset, collate_fn
 from wavtts.model.utils import default, exists, peak_normalize
 
 
@@ -429,14 +429,25 @@ class Trainer:
             )
         elif self.batch_size_type == "frame":
             self.accelerator.even_batches = False
-            sampler = SequentialSampler(train_dataset)
-            batch_sampler = DynamicBatchSampler(
-                sampler,
-                self.batch_size_per_gpu,
-                max_samples=self.max_samples,
-                random_seed=resumable_with_seed,  # This enables reproducible shuffling
-                drop_residual=False,
-            )
+            if isinstance(train_dataset, TaggedConcatDataset):
+                # DDO: a batch has to hold both real and fake rows, or the loss sees only
+                # one of its two terms and the shared (t, eps) draws have nothing to pair
+                batch_sampler = PairedDynamicBatchSampler(
+                    train_dataset,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    random_seed=resumable_with_seed,
+                    drop_residual=False,
+                )
+            else:
+                sampler = SequentialSampler(train_dataset)
+                batch_sampler = DynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    random_seed=resumable_with_seed,  # This enables reproducible shuffling
+                    drop_residual=False,
+                )
             train_dataloader = DataLoader(
                 train_dataset,
                 collate_fn=collate_fn,
@@ -560,7 +571,14 @@ class Trainer:
                                 postfix[key] = scalars[key]
                         progress_bar.set_postfix(postfix)
 
-                if self.accelerator.is_local_main_process and global_update % self.log_per_updates == 0:
+                # sync_gradients, so an update is logged once: the counter only moves on the
+                # micro-batch that completes an update, and without this the first
+                # micro-batch of the next update logged the same step a second time
+                if (
+                    self.accelerator.is_local_main_process
+                    and self.accelerator.sync_gradients
+                    and global_update % self.log_per_updates == 0
+                ):
                     logs = {"lr": self.scheduler.get_last_lr()[0]}
                     logs.update(self._scalar_logs(loss_dict))
                     logs.setdefault("loss", loss.item())  # a loss_dict without total_loss

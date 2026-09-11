@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torchaudio
 from datasets import Dataset as Dataset_
 from datasets import load_from_disk
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, Sampler, SequentialSampler
 from tqdm import tqdm
 
 
@@ -172,32 +172,36 @@ class TaggedConcatDataset(Dataset):
 
     def get_frame_len(self, index):
         ds, idx = self._route(index)
-        frame_len = ds.get_frame_len(idx)
-        if ds is self.fake:
-            frame_len += self._grid_dither(index)
-        return frame_len
+        return ds.get_frame_len(idx) + self._grid_dither(index)
 
     def _grid_dither(self, index: int) -> float:
-        """A deterministic sub-frame offset, in [0, 1) frames, added to fake lengths only.
+        """A deterministic sub-frame offset, in [0, 1) frames, added to *every* row's length.
 
         Without it, DDO trains on one-sided batches. DynamicBatchSampler sorts the whole
         index space by get_frame_len and packs neighbours, and Python's sort is stable, so
-        equal keys keep index order -- every real row first, then every fake row. Real
-        lengths are `samples / wav_frame_len` for arbitrary recorded sample counts, so they
-        are dense floats; generated lengths are whole frames by construction, so they all
-        pile onto the same handful of integer keys. Each such pile is contiguous and larger
-        than one frame budget, and comes out as a run of all-fake batches. Simulated on the
-        real corpus geometry (149.5k clips, a 20% pool repeated 5x, 4800 frames/GPU) that is
-        **93% one-sided batches**: the global real:fake ratio is exactly right and the
-        per-batch ratio, which is the one the loss sees, is 0 or 1 almost every step.
+        equal keys keep index order -- every real row of a length first, then every fake
+        row of it. Generated lengths are whole frames by construction, and the real ones
+        are too: LibriTTS_460's duration.json is rounded to 0.01 s, which at 100 frames/s
+        is exactly one frame, so 74% of the real keys are integers and the rest sit a
+        float-rounding hair off one. Both halves therefore pile onto the same few thousand
+        integer keys, each pile is contiguous and far larger than one frame budget, and the
+        batches come out as runs of all-real followed by runs of all-fake. Measured on the
+        actual corpus and the round-1 pool at 2400 frames/GPU: **96.8% one-sided batches**
+        (90.0% at 4800). The global real:fake ratio is exactly right and the per-batch
+        ratio, which is the one the loss sees, is 0 or 1 almost every step.
 
-        That breaks two things the spec asks for by name: the per-batch real:fake balance
-        (3.5) and the shared time draws between paired real and fake rows (3.5's common
-        random numbers), which cannot pair anything in a batch with only one kind of row.
+        An earlier version dithered only the fake rows, on the assumption that recorded
+        lengths were dense floats. They are not here, and that version measured 96.8%
+        one-sided in the first probe run: the DDO objective then sees each update as
+        either "push every row down" or "push every row up", with nothing in the batch to
+        set one against the other. That breaks two things the spec asks for by name: the
+        per-batch real:fake balance (3.5) and the shared (t, eps) draws between paired real
+        and fake rows (3.5's common random numbers), which cannot pair anything in a batch
+        with only one kind of row.
 
-        Spreading the fake keys back across the sub-frame positions the real half already
-        occupies interleaves them: the same simulation drops to 7.9% one-sided, the
-        remainder being the very long clips where a batch holds one or two rows anyway.
+        Dithering every row spreads both halves uniformly over the sub-frame positions of
+        each integer key, so within a key they interleave in proportion to their counts and
+        a batch is one-sided only when it holds a row or two of very long audio.
 
         This only ever over-reports a length, and by less than a single frame out of a
         budget of thousands, so the sampler stays conservative and no batch grows. It is
@@ -280,6 +284,79 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
     def __len__(self):
         return len(self.batches)
+
+
+class PairedDynamicBatchSampler(DynamicBatchSampler):
+    """DynamicBatchSampler for a TaggedConcatDataset: every batch of two or more rows holds
+    both real and fake rows.
+
+    Sorting the whole index space by length and packing neighbours -- what the parent does
+    -- leaves the per-batch real:fake mix to chance, and on this corpus chance is poor:
+    with a 4800-frame budget and the sub-frame dither on every row, 21.6% of batches were
+    still one-sided, nearly all of them the one- and two-row batches that long clips
+    produce. A one-sided batch gives the DDO loss only one of its two terms and nothing to
+    pair the shared (t, eps) draws against (spec 3.5).
+
+    Here the real and the fake rows are sorted by length separately and consumed in
+    lockstep. A batch opens with whichever side's next clip is shorter, which keeps the
+    two cursors aligned in length, and then always takes from the side that has fewer
+    frames in the batch so far -- so its second row is of the other kind, or the batch
+    closes at one row because that clip did not fit. It never falls back to a same-kind
+    row: a two-row batch of one kind would be exactly the thing this sampler exists to
+    prevent, and a one-row batch costs only a little padding. Both lists carry the same
+    length distribution (the pool's durations are drawn from the real duration.json), so
+    rows at the same rank have about the same length and the packing stays as tight as
+    the plain sorted one (88.9% of the budget on the real corpus at 4800 frames, against
+    the parent's 89%). The only one-sided batches left are a clip too long to share the
+    budget with anything, and the tail of whichever side runs out last.
+
+    Shuffling per epoch, the seed and drop_last behave exactly as in the parent.
+    """
+
+    def __init__(
+        self,
+        dataset: TaggedConcatDataset,
+        frames_threshold: int,
+        max_samples=0,
+        random_seed=None,
+        drop_residual: bool = False,
+    ):
+        self.sampler = SequentialSampler(dataset)
+        self.frames_threshold = frames_threshold
+        self.max_samples = max_samples
+        self.random_seed = random_seed
+        self.epoch = 0
+
+        n_real = len(dataset.real)
+        keyed = [(dataset.get_frame_len(i), i) for i in tqdm(range(len(dataset)), desc="Sorting real and fake rows by length")]
+        sides = [sorted(k for k in keyed if k[1] < n_real), sorted(k for k in keyed if k[1] >= n_real)]
+        pos = [0, 0]
+
+        batches: list[list[int]] = []
+        batch: list[int] = []
+        frames = [0.0, 0.0]  # per side, in the current batch
+        while pos[0] < len(sides[0]) or pos[1] < len(sides[1]):
+            avail = [s for s in (0, 1) if pos[s] < len(sides[s])]
+            if not batch:
+                s = min(avail, key=lambda s: sides[s][pos[s]][0])  # the shorter next clip opens
+            else:
+                s = min(avail, key=lambda s: frames[s])  # then the side with fewer frames in it
+            frame_len, idx = sides[s][pos[s]]
+            fits = sum(frames) + frame_len <= frames_threshold and (max_samples == 0 or len(batch) < max_samples)
+            if fits or not batch:
+                # an empty batch always takes the row, so a clip over the budget still goes
+                # somewhere rather than stalling the loop
+                batch.append(idx)
+                frames[s] += frame_len
+                pos[s] += 1
+            else:
+                batches.append(batch)
+                batch, frames = [], [0.0, 0.0]
+        if batch and not (drop_residual and len(batches) > 0):
+            batches.append(batch)
+
+        self.batches = batches
+        self.drop_last = True
 
 
 # Load dataset

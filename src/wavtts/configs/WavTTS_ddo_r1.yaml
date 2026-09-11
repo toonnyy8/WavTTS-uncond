@@ -36,12 +36,13 @@ seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuf
 
 datasets:
   name: LibriTTS_460  # the real half; the fake half is ddo.fake_dataset below
-  batch_size_per_gpu: 2400  # halved from the clean arm's 4800, with grad_accumulation_steps
-                            # doubled to match, so an update is still 19200 frames. p_ref
-                            # adds ~2.66 GiB of fp32 weights per GPU (accelerate's bf16 mode is
-                            # autocast; nothing casts the weights) and the batch carries
-                            # both DDO sides at once; the update size is held fixed on
-                            # purpose so the objective is the only variable in the A/B
+  batch_size_per_gpu: 4800  # the clean arm's budget, so 4 x 4800 = the same 19200-frame update.
+                            # Measured: a DDO step peaks at 14.9 GiB of 24 at 2400 *and* at 4800
+                            # frames -- weights, Adam state and the fp32 p_ref (2.66 GiB) dominate,
+                            # activations are checkpointed. The budget matters for the batch
+                            # composition, not memory: at 2400 frames (24 s) clips over 12 s
+                            # cannot share a batch with a partner of the other kind, and 52% of
+                            # batches were one-sided; 4800 pairs everything up to ~24 s
   batch_size_type: frame  # frame | sample
   max_samples: 384
   num_workers: 8
@@ -76,7 +77,7 @@ optim:
     update_every: 1
     update_after_step: 0 # no opening stretch of plain weight copying
     power: 1.0
-  grad_accumulation_steps: 2  # 4 x 2400 x 2 = 19200 frames/update, as in the clean arm
+  grad_accumulation_steps: 1  # 4 x 4800 = 19200 frames/update, as in the clean arm
   max_grad_norm: 1.0
   bnb_optimizer: False
 

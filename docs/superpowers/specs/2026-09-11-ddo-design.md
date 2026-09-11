@@ -310,11 +310,24 @@ repeat ×5、4800 frames/GPU）：**93% 的 batch 是單邊的**——全域真�
 這同時打掉兩件本節要求的事：per-batch 的真假平衡，以及真假列共用 `t`
 （單邊 batch 沒有東西可以配對）。
 
-解法是在 `TaggedConcatDataset.get_frame_len` 裡對**假樣本列**加一個由索引決定的
-`[0, 1)` frame 次量抖動，把它們散回真實列本來就佔著的次 frame 位置。同一組模擬降到
-**7.9%**（剩下的是一個 batch 只裝一兩條的超長片段，本來就避不掉）。
-它只會高報長度、且不到一個 frame，sampler 只會更保守，不會有 batch 變大。
-仍有約 8% 單邊 batch，所以 `ddo_loss` 的空側統計與 `t` 配對邏輯必須容忍它。
+上面那句「真實長度是稠密浮點」**對本語料不成立**：`LibriTTS_460/duration.json` 只有兩位小數，
+0.01 s 在 100 frames/s 下恰好是一個 frame，74% 的真實長度落在整數格上、其餘差一個浮點誤差。
+第一次探針實測（2400 frames/GPU、只抖假樣本列）：**96.8% 單邊**，tensorboard 上 `ddo/acc`
+一個點都沒有。修正分兩層：
+
+1. `TaggedConcatDataset.get_frame_len` 對**所有列**（真假都是）加由索引決定的 `[0, 1)` frame
+   次量抖動，讓兩邊在同一個整數鍵內按比例交錯。只會高報長度、且不到一個 frame，
+   sampler 只會更保守。實測降到 2400 時 52%、4800 時 21.6%——剩下的幾乎全是一兩列的
+   長片段 batch：2400 frames 是 24 s，12 s 以上的 clip 根本裝不下一對。
+2. `PairedDynamicBatchSampler`（trainer 對 `TaggedConcatDataset` 自動選用）：真假兩列各自按
+   長度排序、鎖步消耗，每個 batch 輪流從「目前 frame 較少的那一側」取下一條，直到兩側的
+   下一條都裝不下。兩側的長度分佈相同（池子的時長就是從真實 `duration.json` 抽的），
+   同名次的 clip 長度相近，padding 與單純排序裝箱一樣緊。≥2 列的 batch 保證兩邊都有；
+   剩下的單邊只有裝不進半個預算的超長 clip 和某一側的尾巴。
+   配合 `batch_size_per_gpu: 4800`（實測記憶體 14.9 GiB，與 2400 相同——權重、Adam 與
+   fp32 的 ref 主導），24 s 以下的 clip 都能配對。
+
+`ddo_loss` 的空側統計與 `(t, ε)` 配對邏輯仍要容忍殘餘的單邊 batch。
 
 池子大小見 §5。
 
