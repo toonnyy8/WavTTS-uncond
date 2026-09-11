@@ -195,10 +195,27 @@ padding 必須排除——`lens_to_mask` 給的 mask 已經在 `CFM.forward` 裡
 **梯度尺度的正規化。** 官方 VAR 實作在最後做 `loss = loss / max(alpha, 1.0)`，
 讓梯度量級不隨 `α` 變動，於是掃 `α` 時不必重調 LR。本設計照抄，理由相同。
 
-### 3.4 CFG 幾何的保護：null 分支用 MLE anchor（與論文一致）
+### 3.4 本研究不使用 CFG：目標是 clean arm，anchor 路徑存在但不會被觸發
 
-模型的唯一條件是 `clean` / `null` 兩值 state，推論靠 `v = v_clean + w·(v_clean − v_null)`。
-`null` 分支承載混合增強，它定義了「要往哪裡推開」。
+**本研究的 DDO 一律跑在 `state_null_prob: 0` 的 clean arm（`WavTTS_clean.yaml` 系列）上，
+訓練與推論都不使用 CFG。** 那個 arm 沒有 null 標籤、混合增強從不觸發、
+`CFM.sample` 也會自行把 guidance 關掉。所以下面關於 anchor 的機制在本研究中
+**一列都不會被執行**——`null_flags` 恆為全 False，anchor 項恆為 0，
+整個 batch 都是 DDO 的正負兩側。
+
+這個選擇與 DDO 本身是同向的，不是將就：論文的主要賣點就是
+「不需要推論期 guidance 也能達到更好的 FID」，而 Theorem 3.3 說 `β<1` 的最優解
+`p_θ* ∝ p_ref^{1−1/β}·p_data^{1/β}` 本身就是往 `p_data/p_ref` 方向的外插——
+形式上與 guidance 同構。用 DDO 的動機正是把那件事搬進權重裡，而不是留在取樣迴圈裡。
+
+以下這一節記錄的是 anchor 路徑**為什麼長這樣**，給日後若要把 DDO 套到
+`state_null_prob > 0` 的 CFG arm 的人。程式碼保留這條路徑，因為它讓 `CFM.forward`
+對兩種 arm 一致，且在 clean arm 上的成本是零。
+
+---
+
+CFG arm 的唯一條件是 `clean` / `null` 兩值 state，推論靠
+`v = v_clean + w·(v_clean − v_null)`。`null` 分支承載混合增強，它定義了「要往哪裡推開」。
 
 論文對 CFG 模型的處理（VAR 實作、issue #3 作者說明）是：`p_θ`、`p_ref` 都取
 guidance-free 模型；**無條件分支的假樣本項權重設 0，改用 MLE 訓練它**。作者的理由是
@@ -219,10 +236,7 @@ trunk，`null` 若無人監督就會隨 trunk 漂移——clean 分支被銳化�
 | fake-negative | `p_ref` 生成的假樣本池 | `clean` | DDO 負項 `−α·log σ(−βΔ)` |
 
 `anchor_weight` 預設 1.0，也就是與預訓練完全相同的權重——調的是 `β`，不是它。
-**假樣本永遠是 `clean`、永遠不過混合增強**。
-
-若拿 `state_null_prob: 0` 的 clean arm（`WavTTS_clean.yaml`）做 DDO，就沒有 anchor 列。
-**第一輪建議先跑這個 arm**：少一個 CFG 幾何的干擾變數。
+**假樣本永遠是 `clean`、永遠不過混合增強**（這條在 clean arm 上自動成立）。
 
 ### 3.5 假樣本：離線生成，且必須與真實資料統計對齊
 
@@ -250,7 +264,11 @@ trunk，`null` 若無人監督就會隨 trunk 漂移——clean 分支被銳化�
    假樣本從模型出來是模型自己的量級。
 3. **frame grid。** 真實資料有 `rand_frame_offset` 的次 frame 抖動；假樣本是在 grid 上生成的。
 4. **存檔精度。** 模型輸出超出 ±1，存成 16-bit PCM 會削頂——那是真實語料絕對沒有的特徵。
-   存 `PCM_F`（32-bit float WAV）。
+   必須存 32-bit float WAV，而且**要用 `soundfile.write(..., subtype="FLOAT")`**：
+   `torchaudio.save(..., encoding="PCM_F", bits_per_sample=32)` 在本環境的
+   torchaudio 2.11 走 TorchCodec backend，**兩個參數都被靜默忽略**（只 warn），
+   寫出來的是削頂的 16-bit PCM——實測 ±2.5 的輸入讀回來 max = 1.0，
+   正好製造出這一條要防的特徵。`soundfile>=0.13.1` 是既有依賴。
 
 第 2–4 點的統一解法是：假樣本池的**目錄格式與真實資料集完全相同**
 （`data/<name>/raw` + `duration.json`），用同一個 `CustomDataset`、同一組
@@ -264,12 +282,31 @@ trunk，`null` 若無人監督就會隨 trunk 漂移——clean 分支被銳化�
 
 - 權重用 `p_ref` 的 **EMA**——必須與 Δ 裡的 ref 是同一組權重，否則「假樣本來自 `p_ref`」
   這個前提不成立。
-- `cfg_strength = 0`。論文取 guidance-free 模型當 `p_ref`/`p_θ`。
+- `cfg_strength = 0`。本研究不使用 CFG，所以這不是選項而是唯一模式；
+  clean arm 的 `CFM.sample` 本來也會把 guidance 關掉。理論上也只有這個值是對的：
+  論文取 guidance-free 模型當 `p_ref`/`p_θ`，非零會讓假樣本不是 `p_ref` 的樣本，
+  likelihood-ratio 的恆等式就不成立。
   （註：官方 VAR 腳本用 `cfg=1.0` 並稱之為 guidance-free，但 VAR 的 `t = cfg·ratio`
-  公式下那其實是逐 scale 由 0 爬到 1.0 的弱 guidance——論文與程式碼在此不一致。
-  我們採理論上正確的 0，並保留 `fake_cfg_strength` 旋鈕做 ablation。）
+  公式下那其實是逐 scale 由 0 爬到 1.0 的弱 guidance——論文與程式碼在此不一致。）
 - `steps=32`、`solver=euler`、`sway_sampling_coef=-1.0`，與 trainer 內建取樣一致。
   32 步的 ODE 解不等於 `p_ref` 的精確樣本，這是論文同樣接受的近似。
+
+**per-batch 的真假比例不會自己成立。** `DynamicBatchSampler` 把整個索引空間依
+`get_frame_len` 排序後貪婪打包，而 Python 的 sort 是穩定的：鍵值相同時真實列全排在
+假樣本列前面。真實長度是「任意錄音樣本數 / 160」，是稠密浮點；生成長度依建構就是整數
+frame，於是整個假樣本池堆在少數幾個整數鍵上，每一堆都遠大於一個 frame 預算，
+打包出來就是一連串純假的 batch。以實際語料幾何模擬（149.5k clips、20% 池子、
+repeat ×5、4800 frames/GPU）：**93% 的 batch 是單邊的**——全域真假比例精準命中 1.000，
+而損失實際看到的 per-batch 比例幾乎每一步都是 0 或 1。
+
+這同時打掉兩件本節要求的事：per-batch 的真假平衡，以及真假列共用 `t`
+（單邊 batch 沒有東西可以配對）。
+
+解法是在 `TaggedConcatDataset.get_frame_len` 裡對**假樣本列**加一個由索引決定的
+`[0, 1)` frame 次量抖動，把它們散回真實列本來就佔著的次 frame 位置。同一組模擬降到
+**7.9%**（剩下的是一個 batch 只裝一兩條的超長片段，本來就避不掉）。
+它只會高報長度、且不到一個 frame，sampler 只會更保守，不會有 batch 變大。
+仍有約 8% 單邊 batch，所以 `ddo_loss` 的空側統計與 `t` 配對邏輯必須容忍它。
 
 池子大小見 §5。
 
@@ -300,6 +337,11 @@ dropout**（*"to ensure steady improvement"*，因為 dropout 會讓同一個資
 
 `rpe_gamma` 在 DDO 微調期間**保持開啟**——它是訓練期增強，關掉等於只在連續位置上微調，
 會侵蝕長度外推能力。假樣本則是用連續位置（推論設定）生成的，那沒有問題：它們是資料。
+
+**`DiT` 建構子的 `dropout` 預設值是 0.1，不是 0.0。** 上一段說「所有 config 已經是 0.0」——
+config 是，建構子預設不是。任何不透過 config 建 DiT 的路徑（測試、腳本）會讓
+θ(train) 與 ref(eval) 吃到不同的 dropout mask，Δ 又變雜訊、又不報錯。
+DDO 的 config 必須把 `dropout: 0.0` 顯式寫出來，測試 helper 也是。
 
 `checkpoint_activations` 對 ref 應該關掉——ref 跑在 `no_grad` 下，重算 activation 純屬浪費。
 
@@ -338,6 +380,15 @@ EDM2 的 power-function EMA **length 0.05**。
 （例如 `beta: 0.999`、`update_every: 1` → 約 1000 updates）。
 `make_pretrained_init.py` 已經會把 EMA 的 `step` 歸零，暖機斜坡會重新開始。
 
+**`EMA` 會把 p_ref 再複製一份。** `ema_pytorch.EMA` 對 model 做 `deepcopy`，
+而單元素 list 是會被 deepcopy 複製的（§3.9 靠的是 `nn.Module.__setattr__` 不登記它，
+不是 deepcopy 不看它）。於是 `Trainer.__init__` 裡的 `EMA(model, ...)` 會把整個 p_ref
+再吃掉一份記憶體（bf16 ~1.33 GiB），而且那份 `ema_model` 的 `forward` 會對著一個
+永遠不更新的 ref 走 DDO 路徑。`state_dict()` 仍然乾淨（ref 還是隱形的），
+checkpoint 不受影響，純粹是白吃記憶體。Trainer 建完 EMA 後補一行
+`self.ema_model.ema_model._ddo_ref = []` 清掉——EMA 權重只拿來 `sample()`，
+不需要 ref。不替 `CFM` 加 `__deepcopy__` 去偷偷修掉，那會改動 deepcopy 的語義。
+
 ### 3.9 參考模型的擺放
 
 ref 不能出現在 `nn.Module` 的樹裡，否則：optimizer 會收它的參數、EMA 會平均它、
@@ -366,7 +417,7 @@ ddo:
   delta_normalize: mean   # mean | sum，見 §3.2
   anchor_weight: 1.0      # null 列保留的 CFM flow loss 權重
   real_fake_ratio: 1.0    # 每個 batch 的真:假 frame 比；論文擴散版是 1:1
-  fake_cfg_strength: 0.0  # 記錄用；實際值在生成池子時決定
+  fake_cfg_strength: 0.0  # 記錄用；本研究不使用 CFG，恆為 0
 ```
 
 `optim` / `ckpts` 的改動（DDO 是短程微調，預訓練的排程完全不適用）：
@@ -396,7 +447,10 @@ ddo:
 - `ddo/delta_real`、`ddo/delta_fake`：兩側 Δ 的均值。健康的曲線是兩者緩慢分開。
 - `ddo/margin = delta_real − delta_fake`：官方記的量。
 - `ddo/delta_std`：batch 內 Δ 的標準差，`β` 標定讀的就是它。
-- `ddo/acc`：`mean(Δ_real > 0)/2 + mean(Δ_fake < 0)/2`，目標 0.6–0.75。
+- `ddo/acc`：兩側各半，目標 0.6–0.75。**平手算半分**（`(Δ>0) + 0.5·(Δ==0)`）：
+  每一輪的起點就是 `θ = θ_ref`、`Δ ≡ 0`，嚴格的 `> 0` 會讓一個恰好在隨機猜測的
+  判別器記成 acc = 0。一步之後兩種寫法一致。單邊 batch 記 `nan`，
+  不記一個「看起來像準確率但只有一半」的數。
 - `ddo/loss_real`、`ddo/loss_fake`、`anchor_loss`：三項分開記，才知道誰在主導。
 - `flow_loss`（真實列）：**這是發散警報，不是品質指標**。DDO 本來就是拿 likelihood
   換品質，它上升是預期行為；漲超過預訓練值的 ~2× 就是這一輪推過頭了。
@@ -445,17 +499,18 @@ the training is normal."* 本 repo 的對應物是 `gen/utmos` 與 `gen/spk_sim_
 | EMA 太長（§3.8） | 所有 `gen/*` 曲線平得像沒訓練，但 `ddo/*` 明顯在動 | 縮短 `ema_kwargs.beta` |
 | β 飽和 | `acc > 0.9`，`ddo/loss_*` 趨近 0，梯度範數塌陷 | 降 β，見 §3.3 |
 | 推過頭（**預期會發生**） | `flow_loss` 暴衝、`silence_ratio`/`clipping_rate` 異常、聽起來過度銳化 | 這是設計使然（§2.3）：挑輪中最佳 checkpoint，不是最後一個 |
-| CFG 幾何被破壞 | `gen/spk_sim_self` 下降，或最佳 `cfg_strength` 大幅偏移 | 檢查 anchor 是否生效；先跑 `state_null_prob: 0` 的 arm |
 | 假樣本池過擬合 | 後期 `ddo/delta_fake` 持續壓低但 `gen/utmos` 停滯 | 加大池子或中途重生 |
 
 **這個方法在本 repo 上失敗長什麼樣：** 一輪跑完 `gen/utmos` 沒有可見上升，
 而 `ddo/acc` 停在 0.5（訊號太弱）或衝到 0.99（捷徑或飽和）。兩者都能在
 標定階段的 300 步探針裡看出來，不必燒掉整輪。
 
-**副作用預期：** DDO 之後最佳的 `cfg_strength` 應該會**下降**——論文的主要賣點就是
-「不需要 guidance 也能達到更好的 FID」，而 Theorem 3.3 說 `β<1` 的最優解本身就是
-往 `p_data/p_ref` 方向的外插，形式上與 guidance 同構。評估時必須重掃 `cfg_strength`，
-拿舊的 2.0 去比是把改善算進誤差裡。
+**與 CFG 的關係：** 本研究不使用 CFG（§3.4），所以沒有「DDO 之後 `cfg_strength`
+該調多少」這個問題。方向是相反的——DDO 要取代的正是 guidance：Theorem 3.3 的最優解
+`p_θ* ∝ p_ref^{1−1/β}·p_data^{1/β}` 與 guidance 形式同構，差別在它進了權重，
+而不是每次取樣付兩倍 NFE。所以基線比較應該是
+**「clean arm 預訓練、無 guidance」對「clean arm + DDO、無 guidance」**，
+兩邊的 NFE 相同。
 
 ---
 
