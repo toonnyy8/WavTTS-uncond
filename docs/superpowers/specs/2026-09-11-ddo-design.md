@@ -121,6 +121,14 @@ in the early stage but does not converge to the data distribution in the final."
 
 輪與輪之間**不承接 optimizer state**（官方 VAR 腳本直接把 resume 關掉）。
 
+**每輪要有自己的 `model.name`。** `save_dir` 由它衍生，而 `Trainer.load_checkpoint` 會把目錄裡的
+`model_last.pt` 當成 full-state resume：沿用上一輪的名字，第 n+1 輪會從第 n 輪的 update 9000
+接著跑——optimizer state 一起帶過來、第一個 batch 後就因 `max_updates` 停下、再把同樣的權重
+覆寫回去，磁碟上看起來像跑完了一輪。trainer 對「已達 `max_updates` 的 run」直接拒絕 resume；
+`train.py` 在 `save_dir` 裡沒有任何 checkpoint 時也拒絕啟動（否則 θ 是隨機初始化、ref 是
+預訓練權重，Δ 全是初始化差距，而且不會報錯）。每輪的固定流程：新名字 →
+`make_pretrained_init.py` → `gen_fake_pool.py` → 訓練。
+
 ---
 
 ## 3. 移植到本 repo
@@ -250,10 +258,10 @@ trunk，`null` 若無人監督就會隨 trunk 漂移——clean 分支被銳化�
 重複假樣本池的索引，讓每個 batch 的真假 frame 數接近 `ddo.real_fake_ratio`（預設 1.0）。
 重複的只有波形，每次抽到配的 `(t, ε)`、frame offset 都是新的。
 
-**共用隨機數。** 論文真假共用同一組 `(t, ε)`。本 repo 做不到完整共用——真假兩列長度不同，
-`ε` 的形狀就不同。可做的是**共用 `t`**（純量，恆可配對）：batch 內真假列按索引配對重用
-同一批 `t` 抽樣。`ε` 的配對放棄，並記錄為與論文的偏離。
-（真正關鍵的配對是 `θ` 與 `ref` 之間的，那個我們完整保留。）
+**共用隨機數。** 論文真假共用同一組 `(t, ε)`，本 repo 兩者都共用：batch 內的列已 pad 到
+同一寬度，`ε` 在兩側形狀相同，假列直接重用配對真列在相同樣本位置上的雜訊；`t` 亦同。
+配對按位置、以 wraparound 處理兩側數量不等（`CFM._ddo_pair_rows`）；單邊 batch 無可配對，
+各自獨立抽樣。（真正關鍵的配對是 `θ` 與 `ref` 之間的，那個完整保留。）
 
 離線化引入一個論文沒有的風險：判別器可以靠**任何**能分開真假的捷徑把 Δ 拉開，
 而那些捷徑對生成品質毫無幫助。本 repo 至少有四條：
@@ -372,18 +380,21 @@ EDM CIFAR 傳統 EMA 半衰期 **0.25M images**（bs 512 → 約 500 步）；
 EDM2 的 power-function EMA **length 0.05**。
 
 本 repo 的 `EMA(model, include_online_model=False)` 吃 `ema_pytorch` 的預設值
-（`beta=0.9999`、`update_every=10`），有效平均長度約 **100k updates**。
-一輪 DDO 只有 5–9k updates——**EMA 會把整輪的改變幾乎完全平均掉**，
-而 trainer 的取樣與指標全部讀 EMA 權重，於是曲線會平得像沒訓練。
+（`beta=0.9999`、`update_every=10`）。窗口不是 `beta` 單獨決定的：`make_pretrained_init.py`
+會把 EMA 的 `step` 歸零，之後 decay 走 `1 − (1 + step/inv_gamma)^(−power)` 的斜坡、以 `beta`
+封頂。預設 `power=2/3`、`update_after_step=100` 下，斜坡到 9000 步才 0.9977，`beta` 根本
+到不了；預設值的實際窗口是 update 500 時 ~540、輪末 ~4300 updates（`update_every=10`），
+仍是半輪——而 trainer 的取樣與指標全部讀 EMA 權重，曲線會被大幅抹平。
 
-所以 DDO 的 config 必須顯式給 `ema_kwargs`，目標有效平均長度落在輪長的 5–10%
-（例如 `beta: 0.999`、`update_every: 1` → 約 1000 updates）。
-`make_pretrained_init.py` 已經會把 EMA 的 `step` 歸零，暖機斜坡會重新開始。
+只改 `beta: 0.999, update_every: 1` 也不夠：同一條斜坡下窗口是 update 500 時 ~50、
+輪末 ~430 updates，比論文的比例（CIFAR 半衰期 ≈ 490 updates，佔 2930 步一輪的 ~17%）
+短一個數量級。config 因此再給 `update_after_step: 0`、`power: 1.0`，斜坡變成
+`1 − 1/(1 + step)`，在 update 1000 達到 `beta`，之後窗口固定約 1000 updates（輪長的 ~11%）。
 
 **`EMA` 會把 p_ref 再複製一份。** `ema_pytorch.EMA` 對 model 做 `deepcopy`，
 而單元素 list 是會被 deepcopy 複製的（§3.9 靠的是 `nn.Module.__setattr__` 不登記它，
 不是 deepcopy 不看它）。於是 `Trainer.__init__` 裡的 `EMA(model, ...)` 會把整個 p_ref
-再吃掉一份記憶體（bf16 ~1.33 GiB），而且那份 `ema_model` 的 `forward` 會對著一個
+再吃掉一份記憶體（fp32 ~2.66 GiB），而且那份 `ema_model` 的 `forward` 會對著一個
 永遠不更新的 ref 走 DDO 路徑。`state_dict()` 仍然乾淨（ref 還是隱形的），
 checkpoint 不受影響，純粹是白吃記憶體。Trainer 建完 EMA 後補一行
 `self.ema_model.ema_model._ddo_ref = []` 清掉——EMA 權重只拿來 `sample()`，
@@ -426,8 +437,9 @@ ddo:
 |---|---|---|---|
 | `learning_rate` | 7.5e-5 | **1e-5**（掃 1e-5 … 5e-5） | 論文擴散版在 bs 512 下用 5e-5（EDM2-S）到 1.5e-4（CIFAR）；本 repo 的更新是 19200 frames，先保守 |
 | `num_warmup_updates` | 20000 | **200** | 20000 步暖機在一個 ~9000 步的輪次裡永遠走不完 |
+| `lr_decay_end_factor` | 1e-8（新增旋鈕，預設不變） | **0.3** | 論文每輪**不**把 LR 退到零：CIFAR 只有整輪線性暖機、無衰減；EDM2 暖機後 inverse-sqrt，輪末約 0.4× 峰值。退到 1e-8 會讓輪次後三分之一幾乎不動，等於偷偷縮短輪長。這是與論文的第五個偏離，故做成旋鈕而非寫死 |
 | `max_updates` | —（新增） | **~9000** | 明確的輪次長度（≈1% 預訓練）；到了就停 |
-| `ema_kwargs` | 預設（~100k updates） | **`beta: 0.999, update_every: 1`** | §3.8；不改的話整輪的學習會被平均掉 |
+| `ema_kwargs` | 預設（step 歸零後輪末窗口 ~4300 updates） | **`beta: 0.999, update_every: 1, update_after_step: 0, power: 1.0`** | §3.8；窗口約 1000 updates。只改 beta 到不了 0.999，不改的話半輪的學習會被平均掉 |
 | `save_per_updates` / `last_per_updates` | 10000 / 2500 | **1000 / 500** | 品質會在輪中觸底再回頭變差，挑點要密 |
 | `grad_accumulation_steps` | 視卡數 | 維持 19200 frames/update | 不動更新尺寸，變因只有目標函數 |
 | `epochs` | 實際輪數 | **只是上限** | 結束由 `max_updates` 決定；但迴圈上限仍是 `epochs`，填太小會在 `max_updates` 之前先跑完。**每次換假樣本池大小，一個 epoch 的 update 數就變了**，第 2 輪起要重算 |
@@ -495,7 +507,9 @@ the training is normal."* 本 repo 的對應物是 `gen/utmos` 與 `gen/spk_sim_
 `24 × (1 h 生成 + 2.4 h 訓練) ≈ 82 GPU·小時`（以四卡計是 ~3.5 天 wall-clock）。
 先跑 3–4 輪看斜率，再決定要不要走完。
 
-**顯存。** ref 的 bf16 權重 +1.33 GiB，ref 前向在 `no_grad` 下不留 activation。
+**顯存。** ref 的權重 +2.66 GiB（fp32：accelerate 的 bf16 mixed precision 是 autocast，不轉權重。
+不要把 ref 轉成 bf16 省這一半——LayerNorm 等 fp32 op 會讓兩邊在 update 0 就有系統性偏差），
+ref 前向在 `no_grad` 下不留 activation。
 24 GB 卡上把 `batch_size_per_gpu` 減半、`grad_accumulation_steps` 加倍即可維持更新尺寸。
 若要依 §3.7 改跑全 fp32，再減半一次。
 

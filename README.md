@@ -222,13 +222,14 @@ on; every other config omits it and behaves exactly as before.
 | `ddo.ref_ckpt` | — | the frozen `p_ref`; its **EMA** weights are read, and they must be the weights the pool was generated from |
 | `ddo.fake_dataset` | — | `data/<name>` written by `gen_fake_pool.py`, in the real corpus' own directory format |
 | `ddo.alpha` | 1.0 | weight on the fake term; the paper sweeps `[0.5, 6.0]`. The loss is divided by `max(α, 1)` so an α sweep is not also an LR sweep |
-| `ddo.beta` | 1.0 | scale on the log-ratio. **Calibrate it — see below.** Not a stability knob: `β < 1` extrapolates past `p_data` along `p_data/p_ref`, which is where the quality comes from and why a round must be short |
+| `ddo.beta` | 1.0 | scale on the log-ratio. **Calibrate it — see below.** Not a stability knob: Theorem 3.3's `β < 1` extrapolates past `p_data` along `p_data/p_ref`, which is where the quality comes from and why a round must be short. The theorem's β is *this* β divided by the row's element count (Δ is a per-element mean), so a calibrated value near 300 is a theorem-β of ~0.004 on a 5 s clip — the paper's regime |
 | `ddo.delta_normalize` | mean | `mean` \| `sum`. `mean` because clips span 0.3–30 s and one global β cannot suit both ends of a 100× dimension range — otherwise length becomes the one feature the discriminator needs |
 | `ddo.anchor_weight` | 1.0 | weight on the MLE anchor kept on `null` rows. Never reached in this arm (`state_null_prob` is 0); it exists for a future CFG-arm port |
 | `ddo.real_fake_ratio` | 1.0 | target real:fake **frame** ratio per batch, enforced by repeating the pool's indices rather than by pool size |
 | `ddo.fake_cfg_strength` | 0.0 | recorded only. A guided sample is not a sample of `p_ref`, so the likelihood-ratio identity would stop holding |
 | `optim.max_updates` | 9000 | the round length, ~1% of pretraining; the run stops here regardless of `epochs` |
-| `optim.ema_kwargs` | `beta: 0.999, update_every: 1` | ~1000 updates of averaging. The `ema_pytorch` defaults average over ~100k, which would flatten a 9k-update round to nothing — and every sample and `gen/*` metric is read off the EMA weights |
+| `optim.lr_decay_end_factor` | 0.3 | the LR floor after warmup, as a fraction of the peak. The paper never anneals a round to zero (CIFAR: warmup only; EDM2: inverse-sqrt to ~0.4× by the end); the old floor of 1e-8 would leave the last third of a round standing still |
+| `optim.ema_kwargs` | `beta: 0.999, update_every: 1, update_after_step: 0, power: 1.0` | ~1000 updates of averaging from update 1000 on. `make_pretrained_init.py` zeroes the EMA step, so `ema_pytorch`'s decay ramp sets the window rather than `beta`: under the default ramp `beta` is never reached inside a round and the window ends near 4300 updates, half the round — and every sample and `gen/*` metric is read off the EMA weights |
 
 ### Calibrating β
 
@@ -271,9 +272,13 @@ discriminator found a shortcut — check that the pool's durations, loudness, fr
 ### Multiple rounds
 
 One round is not the method. Diffusion models in the paper need **12–28 rounds**, each
-short (0.3–0.8% of pretraining). Round `n+1` is this config with `ddo.ref_ckpt` and
+short (0.3–0.8% of pretraining). Round `n+1` is this config with a **new `model.name`**, and with `ddo.ref_ckpt` and
 `ddo.fake_dataset` pointing at round `n`'s **best** checkpoint and a pool regenerated from
-it. Best, not last: a round provably does not converge — quality bottoms out mid-round and
+it. The name is not cosmetic: `save_dir` derives from it and the trainer resumes whatever
+`model_last.pt` it finds there, so under round `n`'s name round `n+1` would full-state-resume
+round `n` at its final update — optimizer state and all — and stop after one batch. The
+trainer refuses a finished run, and `train.py` refuses a `save_dir` with no `pretrained_*.pt`
+in it (that would train a random init against a pretrained `p_ref`). Best, not last: a round provably does not converge — quality bottoms out mid-round and
 then gets worse again, which is why `save_per_updates` is 1000 here and nothing is rotated
 away. Rounds do not carry optimizer state, and α/β are worth re-sweeping each time.
 

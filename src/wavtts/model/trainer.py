@@ -81,6 +81,7 @@ class Trainer:
         learning_rate,
         num_warmup_updates=20000,
         max_updates: int | None = None,  # hard stop in updates; None = run `epochs` passes
+        lr_decay_end_factor: float = 1e-8,  # LR floor the post-warmup decay lands on, x learning_rate
         save_per_updates=1000,
         keep_last_n_checkpoints: int = -1,  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
         checkpoint_path=None,
@@ -159,7 +160,8 @@ class Trainer:
             # EMA deepcopies the model, and a one-element list *is* copied by deepcopy --
             # what keeps p_ref invisible is nn.Module.__setattr__ declining to register it,
             # not deepcopy declining to look. So the copy silently carries a second frozen
-            # p_ref (bf16, ~1.33 GiB on the large arch) that nothing will ever read: the EMA
+            # p_ref (fp32, ~2.66 GiB on the large arch: accelerate's bf16 mode is autocast and
+            # leaves the weights fp32) that nothing will ever read: the EMA
             # weights are only used for sample(), which never goes down the DDO path. Drop
             # it here rather than giving CFM a __deepcopy__ -- that would change what copying
             # a CFM means for every other caller in order to fix one of them (spec S3.8).
@@ -177,6 +179,7 @@ class Trainer:
         self.epochs = epochs
         self.num_warmup_updates = num_warmup_updates
         self.max_updates = max_updates
+        self.lr_decay_end_factor = float(lr_decay_end_factor)
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
         self.last_per_updates = default(last_per_updates, save_per_updates)
@@ -341,6 +344,19 @@ class Trainer:
                     print(
                         "WavTTS WARNING: Loading checkpoint saved with per_steps logic (before f992c4e), will convert to per_updates according to grad_accumulation_steps setting, may have unexpected behaviour."
                     )
+            if exists(self.max_updates) and checkpoint["update"] >= self.max_updates:
+                # Round n+1 launched under round n's model.name lands here: same save_dir,
+                # so its model_last.pt is picked up as a resume. Going on would carry round
+                # n's optimizer state into a round that is meant to start fresh at theta ==
+                # p_ref, run for one batch, and then rewrite model_last.pt with the weights
+                # it started from -- a "round" of nothing that looks complete on disk.
+                raise RuntimeError(
+                    f"{latest_checkpoint} in {self.checkpoint_path} is a finished run "
+                    f"(update {checkpoint['update']} >= max_updates {self.max_updates}), not something to "
+                    "resume. A new round needs its own model.name / save_dir, holding only a "
+                    "pretrained_*.pt made by scripts/make_pretrained_init.py from the previous "
+                    "round's best checkpoint."
+                )
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
@@ -462,7 +478,13 @@ class Trainer:
         # useful answer than a traceback.
         decay_updates = max(1, total_updates - warmup_updates)
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
-        decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
+        # The floor is a knob because a DDO round should not anneal to zero: the paper's
+        # rounds are warmup-only (CIFAR) or warmup + inverse-sqrt to ~0.4x of the peak by the
+        # round's end (EDM2), and a floor of 1e-8 would leave the last third of a round
+        # standing still. Pretraining configs omit it and keep the 1e-8 they always had.
+        decay_scheduler = LinearLR(
+            self.optimizer, start_factor=1.0, end_factor=self.lr_decay_end_factor, total_iters=decay_updates
+        )
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
@@ -529,12 +551,14 @@ class Trainer:
                     # on the objective and on what the batch happened to contain (no fake
                     # rows this step means no ddo/loss_fake), so the postfix shows whichever
                     # of these the dict actually carries.
-                    scalars = self._scalar_logs(loss_dict)
-                    postfix = {"update": str(global_update), "loss": scalars.get("loss", loss.item())}
-                    for key in ("flow_loss", "aux_mel_loss", "anchor_loss", "ddo/margin", "ddo/acc"):
-                        if key in scalars:
-                            postfix[key] = scalars[key]
-                    progress_bar.set_postfix(postfix)
+                    if self.accelerator.is_local_main_process:
+                        # only where the bar is shown: every entry is a .item() device sync
+                        scalars = self._scalar_logs(loss_dict)
+                        postfix = {"update": str(global_update), "loss": scalars.get("loss", loss.item())}
+                        for key in ("flow_loss", "aux_mel_loss", "anchor_loss", "ddo/margin", "ddo/acc"):
+                            if key in scalars:
+                                postfix[key] = scalars[key]
+                        progress_bar.set_postfix(postfix)
 
                 if self.accelerator.is_local_main_process and global_update % self.log_per_updates == 0:
                     logs = {"lr": self.scheduler.get_last_lr()[0]}

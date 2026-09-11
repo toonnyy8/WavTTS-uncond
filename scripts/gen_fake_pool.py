@@ -176,7 +176,12 @@ def _write_wav(path: str, wav: torch.Tensor, sample_rate: int) -> None:
     data = wav.detach().to(torch.float32).cpu().numpy()
     if data.ndim > 1:
         data = data.squeeze(0)
-    sf.write(path, data.astype(np.float32), sample_rate, subtype="FLOAT")
+    # Written beside the target and renamed into place. main() takes an existing file as
+    # a finished clip when it resumes, so a run killed mid-write would otherwise leave a
+    # truncated wav that every later resume steps over as done.
+    tmp = f"{path}.tmp"  # soundfile reads the container off the extension, hence format=
+    sf.write(tmp, data.astype(np.float32), sample_rate, format="WAV", subtype="FLOAT")
+    os.replace(tmp, path)
 
 
 def _quantile_report(name: str, values: list[float]) -> str:

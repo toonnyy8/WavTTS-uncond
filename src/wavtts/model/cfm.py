@@ -396,24 +396,48 @@ class CFM(nn.Module):
         m = mask.to(loss.dtype)
         return (loss * m).sum(dim=-1) / m.sum(dim=-1).clamp_min(1.0)
 
-    def _ddo_sample_time(self, batch: int, is_fake: bool["b"], *, dtype, device) -> float["b"]:
-        """One t per row, with the fake rows reusing the real rows' draws.
+    def _ddo_pair_rows(self, is_fake: bool["b"]) -> tuple[torch.Tensor, torch.Tensor]:
+        """(fake_idx, partner_idx): every fake row paired with a real row of the same batch.
 
-        Common random numbers are what makes Δ low-variance (spec S3.5). The paper shares
-        both t and ε between the real and fake batches; we can only share t, because the
-        two sides have different lengths and therefore incompatible ε shapes. Pairing is
-        by position with wraparound, since the two sides are rarely the same size.
+        Common random numbers are what makes Δ low-variance (spec S3.5): the paper draws
+        one (t, ε) and reuses it across the real and the fake batch. Both are shared here
+        too. The rows of a batch are padded to one width, so ε has the same shape on both
+        sides and a fake row can simply reuse its partner's noise at the same sample
+        positions; t is a scalar per row and pairs trivially. Pairing is by position with
+        wraparound, since the two sides are rarely the same size. A one-sided batch pairs
+        nothing and both sides come back empty.
+        """
+        real_idx = (~is_fake).nonzero(as_tuple=True)[0]
+        fake_idx = is_fake.nonzero(as_tuple=True)[0]
+        if real_idx.numel() == 0 or fake_idx.numel() == 0:
+            empty = fake_idx.new_zeros((0,))
+            return empty, empty
+        partner = real_idx[torch.arange(fake_idx.numel(), device=is_fake.device) % real_idx.numel()]
+        return fake_idx, partner
+
+    def _ddo_sample_time(self, batch: int, is_fake: bool["b"], *, dtype, device) -> float["b"]:
+        """One t per row, with each fake row reusing its partner real row's draw.
 
         The full batch is drawn first and then partly overwritten, so the number of RNG
         draws per step does not depend on how many fake rows the sampler happened to pick.
         """
         time = self._sample_time(batch, dtype=dtype, device=device)
-        real_idx = (~is_fake).nonzero(as_tuple=True)[0]
-        fake_idx = is_fake.nonzero(as_tuple=True)[0]
-        if real_idx.numel() > 0 and fake_idx.numel() > 0:
-            pair = real_idx[torch.arange(fake_idx.numel(), device=device) % real_idx.numel()]
-            time = time.index_copy(0, fake_idx, time[pair])
+        fake_idx, partner = self._ddo_pair_rows(is_fake)
+        if fake_idx.numel() > 0:
+            time = time.index_copy(0, fake_idx, time[partner])
         return time
+
+    def _ddo_sample_noise(self, x1: float["b nw"], is_fake: bool["b"]) -> float["b nw"]:
+        """x0 per row, with each fake row reusing its partner real row's noise.
+
+        Same RNG accounting as _ddo_sample_time: a full batch of noise is drawn and the
+        fake rows are then overwritten, so the draw count never depends on the batch mix.
+        """
+        x0 = torch.randn_like(x1)
+        fake_idx, partner = self._ddo_pair_rows(is_fake)
+        if fake_idx.numel() > 0:
+            x0 = x0.index_copy(0, fake_idx, x0[partner])
+        return x0
 
     def _ddo_forward(self, inp: float["b nw"], *, lens: int["b"] | None, is_fake: bool["b"] | None):
         batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, self.device
@@ -442,7 +466,7 @@ class CFM(nn.Module):
         )
 
         x1 = x1 * self.latents_scale
-        x0 = torch.randn_like(x1)
+        x0 = self._ddo_sample_noise(x1, is_fake)
         time = self._ddo_sample_time(batch, is_fake, dtype=dtype, device=device)
         t = time.unsqueeze(-1)
         φ = (1 - t) * x0 + t * x1

@@ -179,6 +179,32 @@ def test_max_updates_shortens_the_lr_horizon(tmp_path):
     assert trainer.scheduler.get_last_lr()[0] == pytest.approx(1e-4 * 1e-8, rel=1e-3)
 
 
+def test_lr_decay_end_factor_sets_the_floor(tmp_path):
+    """The paper never anneals a round to zero (CIFAR: warmup only; EDM2: inverse-sqrt to
+    ~0.4x by the end), so the floor is a knob, and the default stays the 1e-8 pretraining
+    always had."""
+    torch.manual_seed(0)
+    trainer = _trainer(_tiny_cfm(), tmp_path, max_updates=3, lr_decay_end_factor=0.3)
+    trainer.train(_WavDataset(n=20), num_workers=1, resumable_with_seed=None)
+    assert trainer.scheduler.get_last_lr()[0] == pytest.approx(1e-4 * 0.3, rel=1e-3)
+
+
+def test_resuming_a_finished_round_is_refused(tmp_path):
+    """Round n+1 launched under round n's model.name finds round n's model_last.pt in the
+    same save_dir and would full-state-resume it: optimizer state carried across rounds,
+    update already at max_updates, one batch, and the file rewritten with the weights it
+    started from. The trainer refuses rather than producing a round of nothing."""
+    torch.manual_seed(0)
+    trainer = _trainer(_tiny_cfm(), tmp_path, max_updates=2)
+    trainer.train(_WavDataset(n=20), num_workers=1, resumable_with_seed=None)
+    assert (tmp_path / "model_last.pt").exists()
+
+    torch.manual_seed(0)
+    again = _trainer(_tiny_cfm(), tmp_path, max_updates=2)
+    with pytest.raises(RuntimeError, match="finished run"):
+        again.train(_WavDataset(n=20), num_workers=1, resumable_with_seed=None)
+
+
 def test_loss_dict_logging_skips_nan():
     """nan means "no rows of this kind this step", and must not reach the logger.
 
@@ -363,6 +389,10 @@ def ddo_run(tmp_path_factory):
         **OmegaConf.to_container(cfg.model.cfm, resolve=True),
     )
     _ema_checkpoint(tmp_path / "ref.pt", ref_template)
+    # what make_pretrained_init.py writes into a fresh save_dir: the round starts at theta ==
+    # p_ref, which train.py now checks for before it will run a DDO config at all
+    (tmp_path / "ckpts").mkdir()
+    _ema_checkpoint(tmp_path / "ckpts" / "pretrained_ref.pt", ref_template)
 
     captured = {}
     with pytest.MonkeyPatch.context() as mp:
@@ -429,6 +459,19 @@ def test_ddo_config_instantiates_and_trains_one_step(ddo_run):
     assert all("anchor_loss" not in lg for lg in logs)
 
 
+def test_ddo_refuses_to_start_without_an_init(ddo_run, tmp_path):
+    """An empty save_dir means theta would start from a random init against a pretrained
+    p_ref, and the run would go ahead on a Delta that is all initialisation gap."""
+    import copy
+
+    import wavtts.train.train as train_mod
+
+    cfg = copy.deepcopy(ddo_run["cfg"])
+    cfg.ckpts.save_dir = str(tmp_path / "never_initialised")
+    with pytest.raises(SystemExit, match="holds no checkpoint"):
+        train_mod.main.__wrapped__(cfg)
+
+
 def test_ddo_config_keeps_the_no_cfg_and_no_dropout_invariants():
     """Two config values that break DDO silently if they drift.
 
@@ -445,11 +488,16 @@ def test_ddo_config_keeps_the_no_cfg_and_no_dropout_invariants():
     assert cfg.model.arch.dropout == 0.0
     assert cfg.ddo.fake_cfg_strength == 0.0
     assert cfg.ddo.delta_normalize == "mean"
-    # the EMA that the spec's S3.8 insists on: the ema_pytorch defaults (0.9999 every 10
-    # updates, ~100k updates of averaging) would flatten a 9k-update round to nothing
+    # the EMA that the spec's S3.8 insists on. make_pretrained_init.py zeroes the EMA step,
+    # so ema_pytorch's decay ramp sets the window, not beta: under the default ramp beta is
+    # never reached inside a 9k-update round, and power 1.0 is what gets it there by 1000
     assert cfg.optim.ema_kwargs.beta == 0.999
     assert cfg.optim.ema_kwargs.update_every == 1
+    assert cfg.optim.ema_kwargs.update_after_step == 0
+    assert cfg.optim.ema_kwargs.power == 1.0
     assert cfg.optim.max_updates == 9000
+    # the paper never anneals a round to zero; 1e-8 would freeze the last third of it
+    assert cfg.optim.lr_decay_end_factor == 0.3
 
 
 def test_checkpoint_has_no_ref_weights(ddo_run):

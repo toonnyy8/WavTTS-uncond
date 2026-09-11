@@ -252,10 +252,10 @@ def test_load_ref_state_dict_prefers_ema(tmp_path):
 # ---------------------------------------------------------------- Task A3: CFM path
 
 
-def _make_cfm(*, rpe_gamma=1.0, state_null_prob=0.0, use_aux_mel_loss=False, **overrides):
+def _make_cfm(*, rpe_gamma=1.0, state_null_prob=0.0, use_aux_mel_loss=False, dit_kwargs=None, **overrides):
     from wavtts.model import CFM
 
-    transformer = _make_dit(rpe_gamma=rpe_gamma)
+    transformer = _make_dit(rpe_gamma=rpe_gamma, **(dit_kwargs or {}))
     _reinit_nonzero(transformer)
     kwargs = dict(
         waveform_kwargs={"wav_frame_len": 160},
@@ -278,7 +278,16 @@ def _attach(model, *, alpha=1.0, beta=1.0, **kwargs):
     return ref
 
 
-def test_delta_is_exactly_zero_when_ref_equals_theta():
+@pytest.mark.parametrize(
+    "dit_kwargs",
+    [
+        {},
+        # the production config's flags: masked attention, and activation checkpointing on
+        # theta that attach_ddo_ref switches off on p_ref -- the two forwards must still agree
+        {"attn_mask_enabled": True, "checkpoint_activations": True},
+    ],
+)
+def test_delta_is_exactly_zero_when_ref_equals_theta(dit_kwargs):
     """The load-bearing test: p_ref is a bit-for-bit copy of p_theta, so Delta must be 0.
 
     It fails if the two models draw their own randomized RoPE positions (spec S3.6) and
@@ -287,7 +296,7 @@ def test_delta_is_exactly_zero_when_ref_equals_theta():
     """
     torch.manual_seed(0)
     alpha = 3.0
-    model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0)
+    model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0, dit_kwargs=dit_kwargs)
     _attach(model, alpha=alpha, beta=1.0)
     model.train()  # randomized positions are a training-mode augmentation
 
@@ -391,6 +400,30 @@ def test_real_and_fake_rows_share_time_draws():
     fake_idx = is_fake.nonzero(as_tuple=True)[0]
     paired = real_idx[torch.arange(fake_idx.numel()) % real_idx.numel()]
     assert torch.equal(time[fake_idx], time[paired])
+
+
+def test_real_and_fake_rows_share_noise_draws():
+    """The paper's common random numbers are (t, eps), not t alone. The rows of a batch are
+    padded to one width, so eps has the same shape on both sides and a fake row can reuse
+    its partner real row's noise at the same sample positions."""
+    torch.manual_seed(0)
+    model = _make_cfm(state_null_prob=0.0)
+    is_fake = torch.tensor([False, True, True, False, True])
+    x1 = torch.randn(5, 1600)
+
+    fake_idx, partner = model._ddo_pair_rows(is_fake)
+    assert torch.equal(fake_idx, torch.tensor([1, 2, 4]))
+    assert torch.equal(partner, torch.tensor([0, 3, 0]))  # by position, wrapping around
+
+    x0 = model._ddo_sample_noise(x1, is_fake)
+    assert x0.shape == x1.shape
+    assert torch.equal(x0[fake_idx], x0[partner])
+    assert not torch.equal(x0[0], x0[3])  # the real rows keep independent draws
+
+    # a one-sided batch pairs nothing and still gets a full batch of noise
+    fake_idx, partner = model._ddo_pair_rows(torch.zeros(5, dtype=torch.bool))
+    assert fake_idx.numel() == 0 and partner.numel() == 0
+    assert model._ddo_sample_noise(x1, torch.zeros(5, dtype=torch.bool)).shape == x1.shape
 
 
 def test_ddo_backward_gives_grads_to_theta_only():

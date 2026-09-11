@@ -73,6 +73,21 @@ def main(model_cfg):
     else:
         checkpoint_path = str(files("wavtts").joinpath(f"../../{save_dir}"))
 
+    if ddo_cfg is not None:
+        # theta has to start at p_ref, and Trainer.load_checkpoint only makes that happen if
+        # save_dir already holds the pretrained_*.pt that make_pretrained_init.py writes. An
+        # empty save_dir would train a randomly initialised theta against a pretrained
+        # reference: Delta is then all initialisation gap, and nothing raises.
+        has_init = os.path.isdir(checkpoint_path) and any(
+            f.endswith((".pt", ".safetensors")) for f in os.listdir(checkpoint_path)
+        )
+        if not has_init:
+            raise SystemExit(
+                f"DDO: {checkpoint_path} holds no checkpoint, so theta would not start at p_ref. Run\n"
+                f"  uv run python scripts/make_pretrained_init.py {ddo_cfg.ref_ckpt} {checkpoint_path}\n"
+                "first (a new round needs its own model.name, so this directory is fresh)."
+            )
+
     # init trainer
     trainer = Trainer(
         model,
@@ -96,6 +111,7 @@ def main(model_cfg):
         # fixed update count, and needs a far shorter EMA than the ema_pytorch defaults
         # (spec S3.8)
         max_updates=model_cfg.optim.get("max_updates", None),
+        lr_decay_end_factor=model_cfg.optim.get("lr_decay_end_factor", 1e-8),
         ema_kwargs=OmegaConf.to_container(model_cfg.optim.get("ema_kwargs", {}) or {}, resolve=True),
         log_per_updates=model_cfg.ckpts.get("log_per_updates", 1),
         log_samples=model_cfg.ckpts.log_samples,

@@ -16,7 +16,12 @@
 #   2. uv run python scripts/gen_fake_pool.py --ckpt <same ckpt> --out data/<fake_dataset>
 #   3. accelerate launch ... train.py --config-name WavTTS_ddo_r1.yaml
 # Round 2 is this file with ddo.ref_ckpt and ddo.fake_dataset pointing at round 1's *best*
-# checkpoint and a pool regenerated from it — not its last checkpoint (spec S2.3).
+# checkpoint and a pool regenerated from it — not its last checkpoint (spec S2.3) — and with
+# a NEW model.name. save_dir derives from the name and Trainer.load_checkpoint resumes
+# whatever model_last.pt it finds there: under round 1's name, round 2 would full-state-resume
+# round 1 at update 9000, optimizer state and all, and stop after one batch. The trainer
+# refuses a finished run, and train.py refuses a save_dir with no pretrained_*.pt in it, but
+# the fix on your side is the name.
 #
 # Launch as the clean arm does, bf16:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -33,7 +38,8 @@ datasets:
   name: LibriTTS_460  # the real half; the fake half is ddo.fake_dataset below
   batch_size_per_gpu: 2400  # halved from the clean arm's 4800, with grad_accumulation_steps
                             # doubled to match, so an update is still 19200 frames. p_ref
-                            # adds ~1.33 GiB of bf16 weights per GPU and the batch carries
+                            # adds ~2.66 GiB of fp32 weights per GPU (accelerate's bf16 mode is
+                            # autocast; nothing casts the weights) and the batch carries
                             # both DDO sides at once; the update size is held fixed on
                             # purpose so the objective is the only variable in the A/B
   batch_size_type: frame  # frame | sample
@@ -51,12 +57,25 @@ optim:
                            # round — the LR would still be ramping when the round ends
   max_updates: 9000  # the round length, ~1% of pretraining. DDO rounds are short and many:
                      # the paper needs 12–28 of them for diffusion models (spec S2.3)
-  ema_kwargs:  # ema_pytorch's defaults (beta 0.9999, update_every 10) average over roughly
-    beta: 0.999          # 100k updates. A DDO round is 9k, so the defaults would average
-    update_every: 1      # essentially the entire round away — and every sample and every
-                         # gen/* metric is read off the EMA weights, so the curves would
-                         # come out flat as if nothing had trained. These put the effective
-                         # window near 1000 updates, ~10% of the round (spec S3.8)
+  lr_decay_end_factor: 0.3  # the LR floor after warmup, as a fraction of learning_rate. The
+                            # paper never anneals a round to zero: CIFAR rounds are one long
+                            # linear warmup with no decay at all, EDM2 rounds decay inverse-sqrt
+                            # to ~0.4x of the peak by the end. The trainer's old floor of 1e-8
+                            # would leave the last third of the round standing still, which
+                            # quietly shortens the round (spec S4)
+  ema_kwargs:  # Every sample and every gen/* metric is read off the EMA weights, so the EMA
+               # window must be a fraction of the round (the paper's CIFAR half-life is 0.25M
+               # images ≈ 490 updates, ~17% of a 2930-update round). beta alone does not set
+               # it: make_pretrained_init.py zeroes the EMA step, and ema_pytorch then ramps
+               # the decay as 1 - (1 + step/inv_gamma)^-power, capped at beta. Under its
+               # defaults (power 2/3, update_after_step 100) the ramp is still at 0.9977 after
+               # 9000 updates and beta is never reached: the window would be ~50 updates at
+               # update 500 and ~430 at the round's end. power 1.0 turns the ramp into
+               # 1 - 1/(1 + step), which reaches beta at update 1000 (spec S3.8)
+    beta: 0.999          # ~1000 updates of averaging once reached, ~11% of the round
+    update_every: 1
+    update_after_step: 0 # no opening stretch of plain weight copying
+    power: 1.0
   grad_accumulation_steps: 2  # 4 x 2400 x 2 = 19200 frames/update, as in the clean arm
   max_grad_norm: 1.0
   bnb_optimizer: False
@@ -160,6 +179,11 @@ ddo:
   #   3. trim using ddo/acc, target 0.6–0.75. acc > 0.9 reached quickly = beta too large,
   #      sigmoid saturated, gradients gone; acc ≈ 0.5 with delta_std still growing = beta
   #      too small, the DDO term is not doing anything
+  #
+  # Units: Theorem 3.3's beta (where beta < 1 overshoots past p_data) is *this* beta divided
+  # by the row's element count, because Delta here is a per-element mean (spec S3.2). A
+  # calibrated value of, say, 300 is a theorem-beta of ~0.004 on a 5 s clip — the paper's
+  # regime, not the "beta > 1" one it looks like.
   # ---------------------------------------------------------------------------------
   beta: 1.0
 
