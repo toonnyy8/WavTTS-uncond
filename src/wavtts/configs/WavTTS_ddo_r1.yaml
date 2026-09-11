@@ -219,6 +219,7 @@ ddo:
                  # Delta_mel = -(mel_theta - mel_ref) per row, logit = beta*Delta_v +
                  # beta_mel*Delta_mel, one sigmoid (spec S3.10). Off here; WavTTS_ddo_r2_mel.yaml
                  # carries the calibrated value
+  delta_space: v  # the space Delta_v's per-row loss is measured in: the model's own loss_space, as in round 1 (spec S3.10)
   real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
                         # diffusion pairing, enforced by repeating the pool's indices rather
                         # than by pool size — a 1:1-sized pool would be 244.6 h of 32-NFE

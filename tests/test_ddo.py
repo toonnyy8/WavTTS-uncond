@@ -554,6 +554,43 @@ def test_mel_channel_joins_the_logit():
         _attach(model, beta_mel=0.5)
 
 
+def test_delta_space_x_measures_the_x_mse_and_is_zero_at_ref():
+    """delta_space='x' changes only Delta: the x-space MSE per row replaces the v-space
+    one (which is that MSE times 1/(1-t)^2), flow_loss stays in the model's space, and
+    theta == ref still gives exactly 0."""
+    torch.manual_seed(0)
+    wav = torch.randn(6, 1600) * 0.1
+    is_fake = torch.tensor([False, True, False, True, False, True])
+
+    torch.manual_seed(1)
+    model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0)
+    _attach(model, delta_space="x")
+    model.train()
+    _, d = model(wav, is_fake=is_fake)
+    assert d["ddo/delta_std"].item() == 0.0
+
+    def run(space):
+        torch.manual_seed(1)
+        model = _make_cfm(rpe_gamma=4.0, state_null_prob=0.0)
+        ref = _attach(model, delta_space=space)
+        with torch.no_grad():
+            for p in ref.parameters():
+                p.add_(torch.randn_like(p) * 0.01)
+        model.train()
+        torch.manual_seed(2)
+        return model(wav, is_fake=is_fake)
+
+    _, dv = run(None)
+    _, dx = run("x")
+    assert dv["flow_loss"].item() == pytest.approx(dx["flow_loss"].item(), rel=1e-6)  # untouched
+    assert dx["ddo/delta_std"].item() > 0.0 and dx["ddo/delta_std"].item() != dv["ddo/delta_std"].item()
+    # x-space Delta is the v-space one with the 1/(1-t)^2 weight removed, so it is smaller
+    assert dx["ddo/delta_std"].item() < dv["ddo/delta_std"].item()
+
+    with pytest.raises(ValueError):
+        _attach(_make_cfm(), delta_space="mel")
+
+
 def test_mel_loss_per_row_reduction_matches_the_mean():
     from wavtts.model.modules import MelSpectrogramLoss
 

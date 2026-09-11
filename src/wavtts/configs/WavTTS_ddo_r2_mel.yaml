@@ -207,6 +207,8 @@ ddo:
   beta_mel: 0.0  # CALIBRATED BY THE R2MelCal PROBE -- see the record in the header once it
                  # has run. Delta_mel = -(mel_theta - mel_ref) per row in raw log-mel L1 units,
                  # logit = beta*Delta_v + beta_mel*Delta_mel, one sigmoid (spec S3.10)
+  delta_space: x  # the space Delta_v's per-row loss is measured in: x-space MSE: with P_std 1.6, rows at t > 0.95 land in ~6% of batches, and the
+                  # v-space loss weights them 100-2500x -- one such row saturates the logit (spec S3.10)
   real_fake_ratio: 1.0  # target real:fake *frame* ratio per batch. 1.0 is the paper's 1:1
                         # diffusion pairing, enforced by repeating the pool's indices rather
                         # than by pool size — a 1:1-sized pool would be 244.6 h of 32-NFE

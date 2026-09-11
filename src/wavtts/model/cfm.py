@@ -114,6 +114,7 @@ class CFM(nn.Module):
         self.ddo_delta_normalize = "mean"
         self.ddo_anchor_weight = 1.0
         self.ddo_beta_mel = 0.0
+        self.ddo_delta_space = None  # None = the model's own loss_space; "x" = x-space MSE
 
     @property
     def device(self):
@@ -339,12 +340,20 @@ class CFM(nn.Module):
         delta_normalize: str = "mean",
         anchor_weight: float = 1.0,
         beta_mel: float = 0.0,
+        delta_space: str | None = None,
     ) -> None:
         """Freeze `ref` as p_ref and switch forward() onto the DDO path.
 
         beta_mel > 0 opens a second discriminator channel in the multi-scale log-mel
         domain: Δ_mel = -(mel_θ - mel_ref) per row, and the logit becomes
         β·Δ_v + β_mel·Δ_mel (spec 3.10). Needs the aux mel module (use_aux_mel_loss).
+
+        delta_space picks the space Δ_v's per-row loss is measured in. None keeps the
+        model's own loss_space (round 1). "x" measures it as the x-space MSE instead: the
+        v-space loss of an x_pred model is that MSE times 1/(1-t)^2, which at t > 0.95 is
+        100-2500x the typical row, and once P_std is widened such rows land in ~6% of
+        batches and each one saturates the logit on its own (spec 3.10). Only Δ changes;
+        flow_loss, the anchor and everything logged stay in the model's loss_space.
 
         The reference is stored in a **one-element list**, not as an attribute. A bare
         `self.ddo_ref = ref` would go through `nn.Module.__setattr__`, which registers any
@@ -373,6 +382,9 @@ class CFM(nn.Module):
         self.ddo_delta_normalize = delta_normalize
         self.ddo_anchor_weight = float(anchor_weight)
         self.ddo_beta_mel = float(beta_mel)
+        if delta_space not in (None, "x", "v", "flow"):
+            raise ValueError(f"Unknown delta_space: {delta_space}")
+        self.ddo_delta_space = delta_space
         if self.ddo_beta_mel > 0 and self.aux_mel_loss is None:
             raise ValueError("beta_mel > 0 needs use_aux_mel_loss=True: the mel channel is built on that module")
         if self.ddo_beta_mel > 0 and self.ddo_beta <= 0:
@@ -395,8 +407,8 @@ class CFM(nn.Module):
             raise ValueError(f"Unknown prediction: {self.prediction}")
         return v_pred, x_pred
 
-    def _elementwise_loss(self, raw_pred, φ, x1, time) -> float["b nw"]:
-        """The flow loss per waveform sample, in fp32.
+    def _elementwise_loss(self, raw_pred, φ, x1, time, space: str | None = None) -> float["b nw"]:
+        """The flow loss per waveform sample, in fp32, in `space` (default: self.loss_space).
 
         Everything is cast **before** the squaring, not after. Δ is the difference of two
         nearly identical models' losses; early in a DDO round their relative gap is ~1e-3,
@@ -406,8 +418,9 @@ class CFM(nn.Module):
         """
         raw_pred, φ, x1, time = raw_pred.float(), φ.float(), x1.float(), time.float()
         v_pred, x_pred = self._predictions(raw_pred, φ, time)
+        space = space or self.loss_space
 
-        if self.loss_space in ("flow", "v"):
+        if space in ("flow", "v"):
             # One branch for two spaces, because for this interpolant they share a target:
             # x1 - x0 == (x1 - φ)/(1 - t) identically, so "flow" needs no x0 to reconstruct
             # it. The only difference from the pooled path is the clamped denominator that
@@ -416,11 +429,11 @@ class CFM(nn.Module):
             # t_eps of 1 would blow up and swallow the batch.
             denom = (1.0 - time).clamp_min(self.t_eps).unsqueeze(-1)
             return F.mse_loss(v_pred, (x1 - φ) / denom, reduction="none")
-        if self.loss_space == "x":
+        if space == "x":
             return F.mse_loss(x_pred, x1, reduction="none")
-        raise ValueError(f"Unknown loss_space: {self.loss_space}")
+        raise ValueError(f"Unknown loss_space: {space}")
 
-    def _per_sample_loss(self, raw_pred, φ, x1, time, mask) -> float["b"]:
+    def _per_sample_loss(self, raw_pred, φ, x1, time, mask, space: str | None = None) -> float["b"]:
         """Per-row masked mean of the flow loss, in fp32 -- the ℓ that Δ is built from.
 
         Deliberately *not* shared with the pooled `loss[mask].mean()` in forward(): a mean
@@ -428,7 +441,7 @@ class CFM(nn.Module):
         rows differ in length, and folding the two together would silently redefine the
         loss every already-trained arm was fitted with.
         """
-        loss = self._elementwise_loss(raw_pred, φ, x1, time)
+        loss = self._elementwise_loss(raw_pred, φ, x1, time, space=space)
         m = mask.to(loss.dtype)
         return (loss * m).sum(dim=-1) / m.sum(dim=-1).clamp_min(1.0)
 
@@ -545,8 +558,15 @@ class CFM(nn.Module):
                     positions=None if positions is None else positions[idx],
                 )
             m = mask[idx].to(elem_loss.dtype)
-            loss_theta = (elem_loss[idx] * m).sum(dim=-1) / m.sum(dim=-1).clamp_min(1.0)
-            loss_ref = self._per_sample_loss(ref_pred, φ[idx], x1[idx], time[idx], mask[idx])
+            if self.ddo_delta_space is None or self.ddo_delta_space == self.loss_space:
+                loss_theta = (elem_loss[idx] * m).sum(dim=-1) / m.sum(dim=-1).clamp_min(1.0)
+            else:
+                # Δ in its own space (x for a widened P_std, spec S3.10); the elementwise
+                # loss above stays in the model's space for flow_loss and the anchor
+                loss_theta = self._per_sample_loss(
+                    raw_pred[idx], φ[idx], x1[idx], time[idx], mask[idx], space=self.ddo_delta_space
+                )
+            loss_ref = self._per_sample_loss(ref_pred, φ[idx], x1[idx], time[idx], mask[idx], space=self.ddo_delta_space)
             # Δ = -(ℓ_θ - ℓ_ref): a *lower* loss under θ means θ assigns the row more
             # likelihood than ref does, which is the positive direction of the log-ratio.
             delta = -(loss_theta - loss_ref)

@@ -458,8 +458,15 @@ log-mel 與真實語音差很遠）。
 `ddo/delta_v_std` 與 `ddo/delta_mel_std`，取 `β_mel ≈ β · delta_v_std / delta_mel_std` 讓兩個通道在
 logit 裡有相同的話語權，再以 UTMOS/silence 的配對協定微調。
 
-**`P_std` 加寬到 1.6**：論文晚期輪次的做法（EDM2-S 第 17 輪起 1.6 → 3.0），讓判別器看到更極端的
-噪聲水平；兩個模型在同一個 t 上評估，不影響 Δ 的定義。第 1 輪維持 0.8。
+**`P_std` 加寬到 1.6，以及它逼出來的 `delta_space: x`**：論文晚期輪次的做法（EDM2-S 第 17 輪起
+1.6 → 3.0），讓判別器看到更極端的噪聲水平；兩個模型在同一個 t 上評估。但 x_pred 模型的 v-loss 是
+`((x_pred − x1)/(1−t))²`，t > 0.95 的列權重是典型列的 100–2500 倍（`t_eps 0.02` 封頂 2500）。
+`P_std 0.8` 下 t > 0.98 是 5.9σ 事件、從未出現；1.6 下每列 0.16%、每個 ~40 列的 batch 約 6% 會
+抽到一個。標定探針第 100 步就記到 `delta_v_std` 0.95、`flow_loss` 2.4 的 batch——一列就把 logit
+推到飽和、主導整個 update。EDM 的加權本來就是讓各噪聲水平貢獻均勻，v-loss 是反過來的。
+所以第 2 輪重做的 Δ_v 改在 **x 空間**量（`ddo.delta_space: x`：逐列 `mse(x_pred, x1)`，權重在 t 上
+平坦，且與 mel 通道同為 x 域的重建差）。只有 Δ 換空間；`flow_loss`、anchor 與所有記錄仍在模型
+自己的 loss_space。第 1 輪 config 維持 `v` 可重現。
 
 ## 4. 訓練配置
 
