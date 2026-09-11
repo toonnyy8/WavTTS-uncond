@@ -215,6 +215,7 @@ class DiT(nn.Module):
         mask: bool["b nw"] | None = None,
         cfg_infer: bool = False,  # pack clean & null state forward
         lens: int["b"] | None = None,
+        positions: int["b n"] | None = None,  # externally drawn RoPE positions, in tokens
     ):
         if x.ndim != 2:
             raise ValueError(f"WavTTS DiT expects raw waveform x [B, N], got {x.ndim}D.")
@@ -241,6 +242,7 @@ class DiT(nn.Module):
             t = torch.cat((t, t), dim=0)
             state = torch.cat((state, neg_state), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
+            positions = torch.cat((positions, positions), dim=0) if positions is not None else None
 
         t = t + self.state_embed(state)
 
@@ -248,7 +250,16 @@ class DiT(nn.Module):
         # its token order but is told it spans a longer stretch, so short training audio
         # still exercises the rotations only long audio would produce. Each row draws its
         # own stretch, so a batch spans contiguous through gamma at every update
-        if self.training and self.rpe_gamma > 1.0:
+        if positions is not None:
+            # Positions handed in win over self.training, and that override is the whole
+            # point: DDO needs p_theta and p_ref to see the *same* rotations, and every
+            # call to randomized_positions draws a fresh randperm. Letting the two models
+            # draw their own turns Delta into the loss gap between two different position
+            # assignments -- pure noise, and silent: nothing raises, training just stops
+            # working (spec S3.6). Forcing ref to eval() instead is no fix either, since
+            # contiguous-vs-randomized is still a mismatch, and a systematic one.
+            rope = self.rotary_embed(positions)
+        elif self.training and self.rpe_gamma > 1.0:
             rope = self.rotary_embed(randomized_positions(h.shape[0], seq_len, self.rpe_gamma, h.device))
         else:
             # augmentation off or inference: contiguous positions, and a [1, n, d] freqs
