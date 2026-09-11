@@ -141,7 +141,7 @@ ckpts:
   log_samples_seeds: [0, 1, 2, 3]
   log_samples_secs: [5, 15, 30, 60]
   spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables
-  save_per_updates: 1000  # 10x denser than pretraining, and keep_last_n_checkpoints keeps
+  save_per_updates: 500   # 20x denser than pretraining, and keep_last_n_checkpoints keeps
   last_per_updates: 500   # them all, because a DDO round does not converge *by design*:
                           # quality bottoms out mid-round and then gets worse again, so the
                           # checkpoint to carry into round 2 is the best one by gen/utmos and
@@ -185,8 +185,25 @@ ddo:
   # by the row's element count, because Delta here is a per-element mean (spec S3.2). A
   # calibrated value of, say, 300 is a theorem-beta of ~0.004 on a 5 s clip — the paper's
   # regime, not the "beta > 1" one it looks like.
+  #
+  # Round-1 calibration record (2026-09-11, 300-update probes from update 277500 of the
+  # clean arm, paired batches at 4800 frames/GPU, LR 1e-5, 200 warmup):
+  #   beta=1   : no brake. delta_std 7e-3 @100 -> 3.5 @200; the fake rows' flow loss went
+  #              0.29 -> ~5.6 (20x), the real rows' Delta turned negative too, acc pinned at
+  #              0.5 = "everything is fake". Destructive.
+  #   beta=100 : delta_std plateaus at 0.02-0.03 (beta*Delta ~ 2-3, the sigmoid braking as
+  #              intended); fake loss +15%, real Delta ~0. UTMOS on 144 paired clips
+  #              3.03 -> 3.60 (+0.57, 94% of clips up); silence_ratio 0.052 -> 0.071.
+  #   beta=30  : delta_std 0.13 @300; fake loss +60%. UTMOS 3.77 (+0.75, 98% up); but
+  #              silence_ratio 0.084, drifting further from the real corpus' 0.034.
+  #   Real clips score UTMOS 4.08 / silence 0.034; the p_ref pool 0.055.
+  # 100 is the paper's own regime in every unit that can be compared (their beta=0.02 over
+  # 3072 dims ~ 60 per element; 1/delta_std at the first sign of movement ~ 140), and the
+  # conservative of the two that work: the fake side saturates by update ~200-300 either
+  # way, and the smaller beta buys more UTMOS at the price of more silence drift. Listen
+  # before trusting UTMOS on this axis. beta=30 is the first alternative to try in round 2.
   # ---------------------------------------------------------------------------------
-  beta: 1.0
+  beta: 100.0
 
   delta_normalize: mean  # mean | sum. mean, because clips span 0.3–30 s: a single global
                          # beta cannot put beta*Delta at O(1) for both ends of a 100x
