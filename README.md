@@ -281,7 +281,10 @@ discriminator found a shortcut — check that the pool's durations, loudness, fr
 One round is not the method. Diffusion models in the paper need **12–28 rounds**, each
 short (0.3–0.8% of pretraining). Round `n+1` is this config with a **new `model.name`**, and with `ddo.ref_ckpt` and
 `ddo.fake_dataset` pointing at round `n`'s **best** checkpoint and a pool regenerated from
-it. The name is not cosmetic: `save_dir` derives from it and the trainer resumes whatever
+it. In practice round 1 peaked at update 300 on 144 paired clips (UTMOS 3.03 → 3.60) and
+was *below* the baseline by 9000, so the useful part of a round here is its first few
+hundred updates: `WavTTS_ddo_r2.yaml` runs 1500 with a checkpoint every 250 and starts
+from round 1's update-300 checkpoint. The name is not cosmetic: `save_dir` derives from it and the trainer resumes whatever
 `model_last.pt` it finds there, so under round `n`'s name round `n+1` would full-state-resume
 round `n` at its final update — optimizer state and all — and stop after one batch. The
 trainer refuses a finished run, and `train.py` refuses a `save_dir` with no `pretrained_*.pt`
