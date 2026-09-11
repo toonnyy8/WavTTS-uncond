@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 
 import numpy as np
 import soundfile as sf
@@ -225,12 +226,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_batch_frames", type=int, default=3200)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default=None, help="cpu | cuda | cuda:N (default: auto)")
+    parser.add_argument(
+        "--shard",
+        default="0/1",
+        help=(
+            "i/n: this process generates only the batches with index %% n == i. The clip list and "
+            "the clip -> batch plan are a pure function of --seed, so n shards launched with the "
+            "same arguments (any order, any devices) produce disjoint slices of one identical pool; "
+            "the shard that finds every clip on disk writes raw/ and duration.json"
+        ),
+    )
     return parser
+
+
+def parse_shard(spec: str) -> tuple[int, int]:
+    try:
+        idx, n = (int(x) for x in spec.split("/"))
+    except ValueError:
+        raise SystemExit(f"--shard expects i/n, got {spec!r}") from None
+    if n < 1 or not 0 <= idx < n:
+        raise SystemExit(f"--shard {spec!r}: need 0 <= i < n")
+    return idx, n
+
+
+def _write_metadata(out: str, paths: list[str], durations: list[float]) -> None:
+    """raw/ and duration.json, each staged and renamed so two shards finishing at the same
+    moment cannot half-write the same files; the content is identical either way."""
+    raw = os.path.join(out, "raw")
+    staged = f"{raw}.tmp.{os.getpid()}"
+    Dataset_.from_dict(
+        {
+            "audio_path": [os.path.abspath(p) for p in paths],
+            "duration": durations,
+            "text": [""] * len(paths),
+        }
+    ).save_to_disk(staged)
+    try:
+        os.rename(staged, raw)  # fails, rather than merges, if another shard got there first
+    except OSError:
+        shutil.rmtree(staged, ignore_errors=True)
+
+    tmp = os.path.join(out, f"duration.json.tmp.{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"duration": durations}, f)
+    os.replace(tmp, os.path.join(out, "duration.json"))
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    shard_idx, shard_n = parse_shard(args.shard)
 
     cfg = OmegaConf.load(args.config)
     sample_rate = int(cfg.model.cfm.sample_rate)
@@ -256,9 +301,11 @@ def main(argv: list[str] | None = None) -> None:
 
     model = build_model(args.ckpt, cfg, device)
 
+    mine = [(i, b) for i, b in enumerate(batches) if i % shard_n == shard_idx]
+    desc = f"Generating {len(lengths)} clips" + (f" (shard {shard_idx}/{shard_n}, {len(mine)} batches)" if shard_n > 1 else "")
     n_written = 0
     with torch.inference_mode():
-        for batch_idx, members in enumerate(tqdm(batches, desc=f"Generating {len(lengths)} clips")):
+        for batch_idx, members in tqdm(mine, desc=desc):
             # Resume at batch granularity: a partially written batch is regenerated whole so
             # that its shared seed still produces the waveforms the complete run would have.
             if all(os.path.exists(paths[i]) for i in members):
@@ -284,18 +331,20 @@ def main(argv: list[str] | None = None) -> None:
 
     durations = [n / sample_rate for n in lengths]
 
+    missing = sum(not os.path.exists(p) for p in paths)
+    if missing:
+        # another shard's slice is still being generated: the pool is not a dataset yet,
+        # and a raw/ listing clips that do not exist would make load_dataset() crash mid-epoch
+        print(
+            f"\nwrote {n_written} new clips; {missing} of {len(paths)} still missing (other shards "
+            f"unfinished?). raw/ and duration.json not written -- re-run any shard once they are."
+        )
+        return
+
     # The real corpus' format exactly: load_dataset() must read this back with no special
     # casing. text is present and empty -- nothing in an unconditional model reads it, but
     # the column exists in the real arrow and the schemas should not diverge.
-    Dataset_.from_dict(
-        {
-            "audio_path": [os.path.abspath(p) for p in paths],
-            "duration": durations,
-            "text": [""] * len(paths),
-        }
-    ).save_to_disk(os.path.join(args.out, "raw"))
-    with open(os.path.join(args.out, "duration.json"), "w", encoding="utf-8") as f:
-        json.dump({"duration": durations}, f)
+    _write_metadata(args.out, paths, durations)
 
     print(f"\nwrote {n_written} new clips ({len(paths)} in pool) to {args.out}")
     print("duration distributions, for eyeballing against each other:")

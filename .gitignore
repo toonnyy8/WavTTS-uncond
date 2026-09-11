@@ -164,3 +164,4 @@ data/LibriTTS_100_360_500_char/raw.arrow
 /data/LibriTTS_100
 /data/LibriTTS_460
 /ckpts/*/
+/data/LibriTTS_460_fake_*

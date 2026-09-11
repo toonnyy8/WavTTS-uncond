@@ -12,6 +12,7 @@ import json
 import os
 import re
 
+import numpy as np
 import pytest
 import soundfile as sf
 import torch
@@ -336,6 +337,41 @@ def test_gen_fake_pool_end_to_end(tmp_path):
     _write_corpus(tmp_path, "real", [0.5] * 20)
     pooled = load_ddo_dataset(str(tmp_path / "real"), str(out), _waveform_kwargs(), **PATHY)
     assert pooled[len(pooled) - 1]["is_fake"] is True
+
+
+def test_gen_fake_pool_shards_compose_the_same_pool(tmp_path, capsys):
+    """n shards of one plan write disjoint slices of one identical pool, and the metadata
+    only appears once every clip exists -- a raw/ listing clips that are still being
+    generated on another GPU would take the training run down mid-epoch."""
+    gen = _gen_module()
+    cfg, config_path = _tiny_config(tmp_path)
+    ckpt = _tiny_checkpoint(tmp_path, cfg)
+    ref_json = _ref_durations_file(tmp_path, [0.35, 0.5, 0.8])
+
+    whole = tmp_path / "whole"
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, whole))
+    expected = {p.name: sf.read(str(p), dtype="float32")[0] for p in sorted((whole / "wavs").glob("*.wav"))}
+    assert len(expected) > 2
+
+    sharded = tmp_path / "sharded"
+    capsys.readouterr()
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "1/2"}))
+    assert "not written" in capsys.readouterr().out
+    assert not (sharded / "raw").exists() and not (sharded / "duration.json").exists()
+    first_half = {p.name for p in (sharded / "wavs").glob("*.wav")}
+    assert 0 < len(first_half) < len(expected)
+
+    gen.main(_gen_argv(tmp_path, ckpt, config_path, ref_json, sharded, **{"--shard": "0/2"}))
+    assert (sharded / "raw").exists() and (sharded / "duration.json").exists()
+    got = {p.name: sf.read(str(p), dtype="float32")[0] for p in sorted((sharded / "wavs").glob("*.wav"))}
+    assert got.keys() == expected.keys()
+    for name in expected:
+        assert np.array_equal(got[name], expected[name]), name
+    assert json.load(open(sharded / "duration.json")) == json.load(open(whole / "duration.json"))
+    assert not list(sharded.glob("*.tmp*")), "staging files left behind"
+
+    with pytest.raises(SystemExit):
+        gen.parse_shard("2/2")
 
 
 def test_gen_fake_pool_resumes_without_changing_the_pool(tmp_path, capsys):
