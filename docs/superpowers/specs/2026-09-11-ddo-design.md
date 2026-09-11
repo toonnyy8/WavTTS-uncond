@@ -430,6 +430,7 @@ ddo:
 | `ema_kwargs` | 預設（~100k updates） | **`beta: 0.999, update_every: 1`** | §3.8；不改的話整輪的學習會被平均掉 |
 | `save_per_updates` / `last_per_updates` | 10000 / 2500 | **1000 / 500** | 品質會在輪中觸底再回頭變差，挑點要密 |
 | `grad_accumulation_steps` | 視卡數 | 維持 19200 frames/update | 不動更新尺寸，變因只有目標函數 |
+| `epochs` | 實際輪數 | **只是上限** | 結束由 `max_updates` 決定；但迴圈上限仍是 `epochs`，填太小會在 `max_updates` 之前先跑完。**每次換假樣本池大小，一個 epoch 的 update 數就變了**，第 2 輪起要重算 |
 
 `max_updates` 是新增的 trainer 選項：現行排程是 warmup + 線性衰減到
 `len(dataloader)×epochs`，DDO 輪次太短、而且 dataloader 因為併入假樣本池而變長，
@@ -457,6 +458,17 @@ ddo:
 
 作者對「訓練正不正常」的判準只有一句（issue #4）：*"As long as the FID is decreasing,
 the training is normal."* 本 repo 的對應物是 `gen/utmos` 與 `gen/spk_sim_self`。
+
+**`ddo/acc` 的曲線會是稀疏的，不是斷的。** §3.5 的次 frame 抖動把單邊 batch 壓到 ~8%，
+沒有壓到 0；單邊 batch 的 `acc` 記 `nan`，trainer 跳過不記。所以看到曲線有洞是正常的，
+洞的密度大約就是單邊 batch 的比例——反過來說，**洞變多是抖動失效的警訊**
+（例如換了一個長度全部落在整數 frame 上的真實語料）。
+
+**trainer 內建取樣的 `cfg_strength=2.0` 是寫死的。** 在 clean arm 上無害：
+`CFM.sample` 在 `state_null_prob == 0` 時自己把 guidance 關掉
+（`test_guidance_is_off_when_the_null_branch_was_never_trained` 守住這件事）。
+所以「監看曲線是無 guidance 取樣」這個宣稱成立，但它靠的是 `CFM.sample` 的內部行為，
+不是 trainer 傳了 0。日後若把 DDO 搬到 CFG arm，這一行會靜默地讓監看曲線變成 guided 取樣。
 
 ---
 
