@@ -20,6 +20,7 @@ class CustomDataset(Dataset):
         wav_frame_len: int = 160,
         target_rms: float = 0.1,  # per-utterance loudness normalization; 0 disables
         rand_frame_offset: bool = False,  # sub-frame grid jitter; see __getitem__
+        is_fake: bool = False,  # DDO: this whole dir is p_ref's output, not recorded speech
         **_,
     ):
         self.data = custom_dataset
@@ -28,6 +29,13 @@ class CustomDataset(Dataset):
         self.wav_frame_len = wav_frame_len
         self.target_rms = target_rms
         self.rand_frame_offset = rand_frame_offset
+        # A tag, not a switch: nothing below this line branches on it. The fake pool is
+        # written in the real corpus' own directory format precisely so it can come through
+        # this same __getitem__ with the same waveform_kwargs -- the RMS normalization and
+        # the sub-frame jitter below are what erase "loudness" and "sits exactly on the frame
+        # grid" as features a discriminator could separate real from fake on, without ever
+        # touching speech quality (spec 3.5, shortcuts 2 and 3).
+        self.is_fake = is_fake
 
         self._resamplers = {}
 
@@ -105,7 +113,98 @@ class CustomDataset(Dataset):
 
         return {
             "wav": audio.squeeze(0),
+            "is_fake": self.is_fake,
         }
+
+
+class TaggedConcatDataset(Dataset):
+    """Real corpus followed by `fake_repeat` copies of the fake pool, for DDO.
+
+    The paper's diffusion setting pairs real and fake 1:1 (50k generated images against
+    50k CIFAR images). A fake pool that size is unaffordable here -- 244.6 h of 32-NFE
+    sampling -- so the ratio is enforced by *sampling* rather than by pool size: the fake
+    indices are repeated until the two halves contribute comparable frame counts
+    (spec 3.5). Only the waveform repeats. Every draw still gets a fresh (t, eps) in
+    CFM.forward and a fresh sub-frame offset in CustomDataset.__getitem__, so a repeated
+    clip is never a repeated training example -- the price is that the fake half is seen
+    ~5x as often as the real half within one round, which is the pool-overfitting risk
+    the spec's risk table tracks via ddo/delta_fake against gen/utmos.
+
+    Concatenation rather than interleaving: DynamicBatchSampler sorts the whole index
+    space by frame length and packs neighbours, so real and fake of similar length land
+    in the same batch on their own. It only needs get_frame_len(idx) and
+    sampler.data_source, which is why this is a plain Dataset and frame-wise batching
+    needs no change at all.
+    """
+
+    def __init__(self, real: CustomDataset, fake: CustomDataset, fake_repeat: int = 1):
+        if fake_repeat < 1:
+            raise ValueError(f"fake_repeat must be >= 1, got {fake_repeat}")
+        if real.target_sample_rate != fake.target_sample_rate:
+            raise ValueError(
+                f"real and fake datasets disagree on sample rate "
+                f"({real.target_sample_rate} vs {fake.target_sample_rate}); the fake pool must be "
+                "generated at the model's rate so both halves go through one loading path"
+            )
+        self.real = real
+        self.fake = fake
+        self.fake_repeat = int(fake_repeat)
+
+        # DynamicBatchSampler and Trainer.train() read these off the dataset object, so the
+        # concat has to forward them rather than inherit from nothing.
+        self.target_sample_rate = real.target_sample_rate
+        self.wav_frame_len = real.wav_frame_len
+
+    def __len__(self):
+        return len(self.real) + len(self.fake) * self.fake_repeat
+
+    def _route(self, index: int) -> tuple[CustomDataset, int]:
+        n_real = len(self.real)
+        if index < n_real:
+            return self.real, index
+        # modulo, not block-repeat: which copy an index falls in is irrelevant, and wrapping
+        # keeps the mapping stable if fake_repeat changes between rounds.
+        return self.fake, (index - n_real) % len(self.fake)
+
+    def __getitem__(self, index):
+        ds, idx = self._route(index)
+        return ds[idx]
+
+    def get_frame_len(self, index):
+        ds, idx = self._route(index)
+        frame_len = ds.get_frame_len(idx)
+        if ds is self.fake:
+            frame_len += self._grid_dither(index)
+        return frame_len
+
+    def _grid_dither(self, index: int) -> float:
+        """A deterministic sub-frame offset, in [0, 1) frames, added to fake lengths only.
+
+        Without it, DDO trains on one-sided batches. DynamicBatchSampler sorts the whole
+        index space by get_frame_len and packs neighbours, and Python's sort is stable, so
+        equal keys keep index order -- every real row first, then every fake row. Real
+        lengths are `samples / wav_frame_len` for arbitrary recorded sample counts, so they
+        are dense floats; generated lengths are whole frames by construction, so they all
+        pile onto the same handful of integer keys. Each such pile is contiguous and larger
+        than one frame budget, and comes out as a run of all-fake batches. Simulated on the
+        real corpus geometry (149.5k clips, a 20% pool repeated 5x, 4800 frames/GPU) that is
+        **93% one-sided batches**: the global real:fake ratio is exactly right and the
+        per-batch ratio, which is the one the loss sees, is 0 or 1 almost every step.
+
+        That breaks two things the spec asks for by name: the per-batch real:fake balance
+        (3.5) and the shared time draws between paired real and fake rows (3.5's common
+        random numbers), which cannot pair anything in a batch with only one kind of row.
+
+        Spreading the fake keys back across the sub-frame positions the real half already
+        occupies interleaves them: the same simulation drops to 7.9% one-sided, the
+        remainder being the very long clips where a batch holds one or two rows anyway.
+
+        This only ever over-reports a length, and by less than a single frame out of a
+        budget of thousands, so the sampler stays conservative and no batch grows. It is
+        deterministic in the index, because DynamicBatchSampler builds its batches once.
+        Nothing outside the DDO path calls this.
+        """
+        return ((index * 2654435761) % self.wav_frame_len) / self.wav_frame_len
 
 
 # Dynamic Batch Sampler
@@ -233,6 +332,56 @@ def load_dataset(
     return train_dataset
 
 
+def _total_frames(dataset: CustomDataset) -> float:
+    return float(sum(dataset.get_frame_len(i) for i in range(len(dataset))))
+
+
+def load_ddo_dataset(
+    real_name: str,
+    fake_name: str,
+    waveform_kwargs: dict,
+    real_fake_ratio: float = 1.0,
+    dataset_type: str = "CustomDataset",
+) -> TaggedConcatDataset:
+    """Real corpus + offline fake pool, as one dataset for DDO finetuning.
+
+    Both halves go through load_dataset() with the *same* waveform_kwargs. That is the
+    single most important line in this file for DDO: the discriminator here is the model
+    itself, and it will happily drive Delta apart on any feature that separates the two
+    pools, whether or not that feature has anything to do with speech quality. Loudness,
+    frame-grid phase and file precision are all neutralised by sharing this one loading
+    path (spec 3.5); length distribution is neutralised upstream, by gen_fake_pool.py
+    drawing its durations from the real duration.json.
+
+    real_fake_ratio is the target real:fake *frame* ratio per batch (1.0 = the paper's
+    1:1 pairing). Since only whole repeats of the pool are available, the achieved ratio
+    is printed rather than promised.
+    """
+    real = load_dataset(real_name, dataset_type=dataset_type, waveform_kwargs=waveform_kwargs)
+    fake = load_dataset(
+        fake_name,
+        dataset_type=dataset_type,
+        waveform_kwargs={**dict(waveform_kwargs), "is_fake": True},
+    )
+
+    real_frames = _total_frames(real)
+    fake_frames = _total_frames(fake)
+    if fake_frames <= 0:
+        raise ValueError(f"fake dataset '{fake_name}' has no frames")
+    if real_fake_ratio <= 0:
+        raise ValueError(f"real_fake_ratio must be > 0, got {real_fake_ratio}")
+
+    fake_repeat = max(1, round(real_frames / (fake_frames * real_fake_ratio)))
+    achieved = real_frames / (fake_frames * fake_repeat)
+    hours = real.wav_frame_len / real.target_sample_rate / 3600
+    print(
+        f"DDO dataset: real '{real_name}' {len(real)} clips / {real_frames * hours:.2f} h, "
+        f"fake '{fake_name}' {len(fake)} clips / {fake_frames * hours:.2f} h x{fake_repeat} repeats; "
+        f"real:fake frame ratio {achieved:.3f} (requested {real_fake_ratio:.3f})"
+    )
+    return TaggedConcatDataset(real, fake, fake_repeat=fake_repeat)
+
+
 # collation
 
 
@@ -246,7 +395,17 @@ def collate_fn(batch):
         pad_len = max_wav_len - w.shape[0]
         padded_wavs.append(F.pad(w, (0, pad_len), value=0.0))
 
-    return dict(
+    out = dict(
         wav=torch.stack(padded_wavs),  # [B, T_wav]
         wav_lengths=wav_lengths,
     )
+
+    # item.get, not item["is_fake"]: callers hand this raw dicts (the smoke tests do), and
+    # anything that predates DDO has no such key. The key is emitted only when the batch
+    # actually carries the tag, so a non-DDO run's batch dict keeps exactly the shape it
+    # had -- the trainer reads it back with batch.get("is_fake"), and CFM.forward treats a
+    # missing flag as all-real anyway.
+    if any("is_fake" in item for item in batch):
+        out["is_fake"] = torch.tensor([bool(item.get("is_fake", False)) for item in batch])
+
+    return out
