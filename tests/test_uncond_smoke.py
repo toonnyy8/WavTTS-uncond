@@ -180,6 +180,31 @@ def test_train_step_backward():
     assert all(torch.isfinite(g).all() for g in grads)
 
 
+def test_train_step_with_uncertainty_loss_weight():
+    # EDM2 §B.6 / Kendall et al. 2018: a learnable log-variance reweights each
+    # sample's loss by its own timestep, trained jointly with the model.
+    model = make_model(use_uncertainty_loss_weight=True)
+    torch.manual_seed(0)
+    wav = torch.randn(4, 16000) * 0.1
+    lens = torch.tensor([16000, 12000, 16000, 8000])
+    loss, loss_dict = model(wav, lens=lens)
+    assert torch.isfinite(loss)
+    assert "uncertainty_log_var_mean" in loss_dict
+    assert torch.isfinite(loss_dict["uncertainty_log_var_mean"])
+    loss.backward()
+    uncertainty_grads = [p.grad for p in model.uncertainty_net.parameters()]
+    assert len(uncertainty_grads) > 0
+    assert all(g is not None and torch.isfinite(g).all() for g in uncertainty_grads)
+
+
+def test_uncertainty_loss_weight_disabled_by_default():
+    model = make_model()
+    assert model.uncertainty_net is None
+    torch.manual_seed(0)
+    loss, loss_dict = model(torch.randn(2, 16000) * 0.1)
+    assert set(loss_dict) == {"total_loss", "flow_loss", "aux_mel_loss"}
+
+
 def test_train_step_with_aux_mel_loss():
     model = make_model(use_aux_mel_loss=True)
     torch.manual_seed(0)

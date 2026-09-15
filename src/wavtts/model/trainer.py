@@ -476,7 +476,12 @@ class Trainer:
                         self.accelerator.log({"flow_loss": loss_dict["flow_loss"].item()}, step=global_update)
                     if loss_dict["aux_mel_loss"] is not None:
                         self.accelerator.log({"aux_mel_loss": loss_dict["aux_mel_loss"].item()}, step=global_update)
-                    
+                    if loss_dict.get("uncertainty_log_var_mean") is not None:
+                        self.accelerator.log(
+                            {"uncertainty_log_var_mean": loss_dict["uncertainty_log_var_mean"].item()},
+                            step=global_update,
+                        )
+
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
@@ -484,6 +489,10 @@ class Trainer:
                             self.writer.add_scalar("flow_loss", loss_dict["flow_loss"].item(), global_update)
                         if loss_dict["aux_mel_loss"] is not None:
                             self.writer.add_scalar("aux_mel_loss", loss_dict["aux_mel_loss"].item(), global_update)
+                        if loss_dict.get("uncertainty_log_var_mean") is not None:
+                            self.writer.add_scalar(
+                                "uncertainty_log_var_mean", loss_dict["uncertainty_log_var_mean"].item(), global_update
+                            )
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)

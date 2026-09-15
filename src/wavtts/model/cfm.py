@@ -17,7 +17,7 @@ from torch import nn
 from torchdiffeq import odeint
 
 from wavtts.model.backbones.dit import STATE_CLEAN, STATE_NULL
-from wavtts.model.modules import MelSpectrogramLoss
+from wavtts.model.modules import MelSpectrogramLoss, TimestepEmbedding
 from wavtts.model.utils import exists, get_epss_timesteps, lens_to_mask
 
 
@@ -46,6 +46,8 @@ class CFM(nn.Module):
         use_aux_mel_loss: bool = False,
         aux_mel_loss_weight: float = 0.0,
         aux_mel_loss_masked: bool = True,
+        use_uncertainty_loss_weight: bool = False,
+        uncertainty_embed_dim: int = 256,
         sample_rate: int = 16000,
         latents_scale: float = 1.0,
     ):
@@ -105,6 +107,17 @@ class CFM(nn.Module):
             )
         else:
             self.aux_mel_loss = None
+
+        # learnable per-timestep loss weighting (Kendall et al. 2018, via EDM2 §B.6):
+        # a small net predicts log-variance s(t); loss becomes loss*exp(-s) + s so
+        # timesteps the model finds inherently noisy get automatically down-weighted
+        # instead of contributing full gradient. Reuses the transformer's own
+        # timestep-embedding module (dim=1 head) rather than a bespoke MLP.
+        self.use_uncertainty_loss_weight = use_uncertainty_loss_weight
+        if self.use_uncertainty_loss_weight:
+            self.uncertainty_net = TimestepEmbedding(dim=1, freq_embed_dim=uncertainty_embed_dim)
+        else:
+            self.uncertainty_net = None
 
     @property
     def device(self):
@@ -415,9 +428,17 @@ class CFM(nn.Module):
         else:
             raise ValueError(f"Unknown loss_space: {self.loss_space}")
 
-        loss = loss[mask]
-        flow_loss = loss.mean()
-        total_loss = flow_loss
+        uncertainty_log_var = None
+        if self.use_uncertainty_loss_weight:
+            mask_f = mask.to(loss.dtype)
+            per_sample_loss = (loss * mask_f).sum(dim=-1) / mask_f.sum(dim=-1).clamp_min(1.0)
+            flow_loss = per_sample_loss.mean()  # unweighted, kept comparable across runs/logging
+            uncertainty_log_var = self.uncertainty_net(time).squeeze(-1)  # s(t)
+            total_loss = (per_sample_loss * torch.exp(-uncertainty_log_var) + uncertainty_log_var).mean()
+        else:
+            loss = loss[mask]
+            flow_loss = loss.mean()
+            total_loss = flow_loss
 
         aux_mel_loss = torch.tensor(0.0, device=device)
         if self.use_aux_mel_loss and self.aux_mel_loss is not None:
@@ -443,5 +464,7 @@ class CFM(nn.Module):
             "flow_loss": flow_loss,
             "aux_mel_loss": aux_mel_loss,
         }
+        if uncertainty_log_var is not None:
+            loss_dict["uncertainty_log_var_mean"] = uncertainty_log_var.mean().detach()
 
         return total_loss, loss_dict
