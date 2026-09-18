@@ -48,6 +48,12 @@ class CFM(nn.Module):
         aux_mel_loss_masked: bool = True,
         sample_rate: int = 16000,
         latents_scale: float = 1.0,
+        self_flow: bool = False,
+        rep_loss_weight: float = 0.8,
+        mask_ratio: float = 0.5,
+        student_layer_frac: float = 0.3,
+        teacher_layer_frac: float = 0.7,
+        rep_proj_hidden: int | None = None,
     ):
         super().__init__()
 
@@ -103,6 +109,34 @@ class CFM(nn.Module):
             )
         else:
             self.aux_mel_loss = None
+
+        # Self-Flow (Chefer, Esser et al. 2026). Dual-Timestep Scheduling noises a random
+        # half of the tokens at a second timestep, and the student is asked to predict --
+        # from that partially corrupted view -- the features an EMA teacher produces from
+        # the uniformly *cleaner* one. The asymmetry is what forces global structure: local
+        # denoising alone cannot recover a token whose neighbours are the cleaner ones.
+        self.self_flow = self_flow
+        self.rep_loss_weight = rep_loss_weight
+        self.mask_ratio = mask_ratio
+        self.rep_proj = None
+        if self_flow:
+            depth = transformer.depth
+            self.student_layer = max(1, round(student_layer_frac * depth))
+            self.teacher_layer = max(1, round(teacher_layer_frac * depth))
+            if self.student_layer >= self.teacher_layer:
+                raise ValueError(
+                    f"self-flow needs student layer < teacher layer, got "
+                    f"{self.student_layer} >= {self.teacher_layer} at depth {depth}"
+                )
+            # the paper's "lightweight projection head, ~10M parameters" at their dim=1152
+            hidden = rep_proj_hidden if rep_proj_hidden is not None else 2 * self.dim
+            self.rep_proj = nn.Sequential(
+                nn.Linear(self.dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, self.dim),
+            )
 
     @property
     def device(self):
@@ -292,11 +326,30 @@ class CFM(nn.Module):
         out = trajectory[-1] / self.latents_scale
         return out[:, :requested], trajectory
 
+    def _dual_timestep(self, batch, n_tok, seq_len, dtype, device):
+        """Dual-Timestep Scheduling: a per-token noise level tau, plus the scalar the
+        teacher sees. Two timesteps t, s are drawn from the usual distribution and a random
+        mask of ratio mask_ratio decides which tokens take s; the rest take t. The teacher
+        sees whichever of the two is *cleaner* applied uniformly -- here t=1 is data and
+        t=0 is noise, so that is the larger one (the paper's convention is inverted, and
+        its tau_min is this tau_clean)."""
+        t = self._sample_time(batch, dtype=dtype, device=device)
+        s = self._sample_time(batch, dtype=dtype, device=device)
+
+        m = torch.rand((batch, n_tok), device=device) < self.mask_ratio
+        tau_tok = torch.where(m, s.unsqueeze(-1), t.unsqueeze(-1))  # b n
+        tau_clean = torch.maximum(t, s)  # b
+
+        # tokens are wav_frame_len samples wide; spread each token's level over its samples
+        tau_wav = tau_tok.repeat_interleave(self.wav_frame_len, dim=-1)[:, :seq_len]
+        return tau_tok, tau_wav, tau_clean
+
     def forward(
         self,
         inp: float["b nw"],  # raw waveform
         *,
         lens: int["b"] | None = None,
+        teacher: nn.Module | None = None,  # EMA copy of self.transformer, for self-flow
     ):
         # handle raw waveform
         if inp.ndim != 2:
@@ -332,15 +385,45 @@ class CFM(nn.Module):
         # x0 is gaussian noise
         x0 = torch.randn_like(x1)
 
-        # time step
-        time = self._sample_time(batch, dtype=dtype, device=device)
+        # loud, not silent: a caller that forgets the teacher would otherwise train a
+        # plain flow model for days under a self-flow config
+        if self.self_flow and teacher is None:
+            raise ValueError("self_flow=True requires a teacher module in forward(teacher=...)")
+        run_self_flow = self.self_flow
+        n_tok = math.ceil(seq_len / self.wav_frame_len)
+
+        if run_self_flow:
+            # per-token noise levels; t broadcasts over the token's samples already
+            time, t, time_clean = self._dual_timestep(batch, n_tok, seq_len, dtype, device)
+        else:
+            time = self._sample_time(batch, dtype=dtype, device=device)
+            t = time.unsqueeze(-1)
 
         # sample xt (phi_t(x) in the paper)
-        t = time.unsqueeze(-1)
         φ = (1 - t) * x0 + t * x1
         flow = x1 - x0
 
-        raw_pred = self.transformer(x=φ, state=state, time=time, mask=mask, lens=lens)
+        if run_self_flow:
+            # both passes must see the same randomized positions, or the features the
+            # student is asked to match were computed over a different geometry
+            rope = self.transformer.make_rope(batch, n_tok, device)
+            raw_pred, h_student = self.transformer(
+                x=φ, state=state, time=time, mask=mask, lens=lens, rope=rope, hidden_at=self.student_layer
+            )
+            with torch.no_grad():
+                φ_clean = (1 - time_clean.unsqueeze(-1)) * x0 + time_clean.unsqueeze(-1) * x1
+                h_teacher = teacher(
+                    x=φ_clean,
+                    state=state,
+                    time=time_clean,
+                    mask=mask,
+                    lens=lens,
+                    rope=rope,
+                    hidden_at=self.teacher_layer,
+                    hidden_only=True,
+                )
+        else:
+            raw_pred = self.transformer(x=φ, state=state, time=time, mask=mask, lens=lens)
 
         # interpret prediction
         if self.prediction == "flow":
@@ -348,7 +431,7 @@ class CFM(nn.Module):
             x_pred = φ + (1.0 - t) * v_pred
         elif self.prediction == "x_pred":
             x_pred = raw_pred
-            v_pred = self._x_to_v(x_pred, φ, time)
+            v_pred = self._x_to_v(x_pred, φ, t)
         else:
             raise ValueError(f"Unknown prediction: {self.prediction}")
 
@@ -356,8 +439,10 @@ class CFM(nn.Module):
         if self.loss_space == "flow":
             loss = F.mse_loss(v_pred, flow, reduction="none")
         elif self.loss_space == "v":
-            # v-loss (same target flow, but v_pred computed from x_pred) & use clamp_min
-            denom = (1.0 - time).clamp_min(self.t_eps)
+            # v-loss (same target flow, but v_pred computed from x_pred) & use clamp_min.
+            # Built from `t` rather than `time`: under dual-timestep scheduling `time` is
+            # per token while `t` is the same levels at sample resolution.
+            denom = (1.0 - t).clamp_min(self.t_eps)
             while denom.ndim < φ.ndim:
                 denom = denom.unsqueeze(-1)
             target = (x1 - φ) / denom
@@ -370,6 +455,15 @@ class CFM(nn.Module):
         loss = loss[mask]
         flow_loss = loss.mean()
         total_loss = flow_loss
+
+        rep_loss = torch.tensor(0.0, device=device)
+        if run_self_flow:
+            # cosine alignment between the student's shallow features (partial, corrupt
+            # view) and the teacher's deep ones (cleaner view), over valid tokens only
+            token_mask = lens_to_mask((lens + self.wav_frame_len - 1) // self.wav_frame_len, length=h_student.shape[1])
+            sim = F.cosine_similarity(self.rep_proj(h_student), h_teacher.detach(), dim=-1)
+            rep_loss = -sim[token_mask].mean()
+            total_loss = total_loss + self.rep_loss_weight * rep_loss
 
         aux_mel_loss = torch.tensor(0.0, device=device)
         if self.use_aux_mel_loss and self.aux_mel_loss is not None:
@@ -394,6 +488,7 @@ class CFM(nn.Module):
             "total_loss": total_loss,
             "flow_loss": flow_loss,
             "aux_mel_loss": aux_mel_loss,
+            "rep_loss": rep_loss,
         }
 
         return total_loss, loss_dict

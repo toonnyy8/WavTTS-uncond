@@ -153,9 +153,16 @@ class Trainer:
 
         self.model = model
 
-        if self.is_main:
+        # Self-Flow reuses this EMA as its teacher, so every rank needs one -- otherwise
+        # the non-main ranks would compute no representation loss and the gradients would
+        # disagree across the group. Saving and sampling stay main-process only.
+        self.self_flow = bool(getattr(model, "self_flow", False))
+
+        if self.is_main or self.self_flow:
             self.ema_model = EMA(model, include_online_model=False, **ema_kwargs)
             self.ema_model.to(self.accelerator.device)
+
+        if self.is_main:
             self._print_model_param_summary(self.model)
 
             print(f"Using logger: {logger}")
@@ -444,7 +451,8 @@ class Trainer:
                     wav = batch["wav"]
                     wav_lengths = batch["wav_lengths"]
 
-                    loss, loss_dict = self.model(wav, lens=wav_lengths)
+                    teacher = self.ema_model.ema_model.transformer if self.self_flow else None
+                    loss, loss_dict = self.model(wav, lens=wav_lengths, teacher=teacher)
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -455,7 +463,7 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
-                    if self.is_main:
+                    if self.is_main or self.self_flow:
                         self.ema_model.update()
 
                     global_update += 1
@@ -464,6 +472,7 @@ class Trainer:
                         update=str(global_update), 
                         aux_mel_loss=loss_dict["aux_mel_loss"].item(),
                         flow_loss=loss_dict["flow_loss"].item(),
+                        rep_loss=loss_dict["rep_loss"].item(),
                         loss=loss.item()
                     )
 
@@ -476,6 +485,8 @@ class Trainer:
                         self.accelerator.log({"flow_loss": loss_dict["flow_loss"].item()}, step=global_update)
                     if loss_dict["aux_mel_loss"] is not None:
                         self.accelerator.log({"aux_mel_loss": loss_dict["aux_mel_loss"].item()}, step=global_update)
+                    if loss_dict["rep_loss"] is not None:
+                        self.accelerator.log({"rep_loss": loss_dict["rep_loss"].item()}, step=global_update)
                     
                     if self.logger == "tensorboard":
                         self.writer.add_scalar("loss", loss.item(), global_update)
@@ -484,6 +495,8 @@ class Trainer:
                             self.writer.add_scalar("flow_loss", loss_dict["flow_loss"].item(), global_update)
                         if loss_dict["aux_mel_loss"] is not None:
                             self.writer.add_scalar("aux_mel_loss", loss_dict["aux_mel_loss"].item(), global_update)
+                        if loss_dict["rep_loss"] is not None:
+                            self.writer.add_scalar("rep_loss", loss_dict["rep_loss"].item(), global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
                     self.save_checkpoint(global_update, last=True)

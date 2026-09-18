@@ -195,6 +195,19 @@ class DiT(nn.Module):
 
         return tokens, token_mask, token_lens
 
+    def make_rope(self, batch: int, seq_len: int, device):
+        # randomized positional encoding is a training-time augmentation: the clip keeps its
+        # token order but is told it spans a longer stretch, so short training audio still
+        # exercises the rotations only long audio would produce. Each row draws its own
+        # stretch, so a batch spans contiguous through gamma at every update.
+        # Public because Self-Flow runs two passes and its student and teacher must see the
+        # *same* positions for their features to be comparable.
+        if self.training and self.rpe_gamma > 1.0:
+            return self.rotary_embed(randomized_positions(batch, seq_len, self.rpe_gamma, device))
+        # augmentation off or inference: contiguous positions, and a [1, n, d] freqs every
+        # block broadcasts instead of a per-sample copy
+        return self.rotary_embed.forward_from_seq_len(seq_len)
+
     def _tokens_to_wav(self, tokens: torch.Tensor, target_num_samples: int):
         wav = tokens.reshape(tokens.shape[0], -1)
         return wav[:, :target_num_samples]
@@ -215,6 +228,9 @@ class DiT(nn.Module):
         mask: bool["b nw"] | None = None,
         cfg_infer: bool = False,  # pack clean & null state forward
         lens: int["b"] | None = None,
+        rope=None,  # reuse positions from another pass instead of drawing fresh ones
+        hidden_at: int | None = None,  # also return the hidden state after this many blocks
+        hidden_only: bool = False,  # stop there and return only that hidden state
     ):
         if x.ndim != 2:
             raise ValueError(f"WavTTS DiT expects raw waveform x [B, N], got {x.ndim}D.")
@@ -242,28 +258,26 @@ class DiT(nn.Module):
             state = torch.cat((state, neg_state), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
 
-        t = t + self.state_embed(state)
+        state_emb = self.state_embed(state)  # b d
+        t = t + (state_emb.unsqueeze(1) if t.ndim == 3 else state_emb)  # t is b d, or b n d
 
-        # randomized positional encoding is a training-time augmentation: the clip keeps
-        # its token order but is told it spans a longer stretch, so short training audio
-        # still exercises the rotations only long audio would produce. Each row draws its
-        # own stretch, so a batch spans contiguous through gamma at every update
-        if self.training and self.rpe_gamma > 1.0:
-            rope = self.rotary_embed(randomized_positions(h.shape[0], seq_len, self.rpe_gamma, h.device))
-        else:
-            # augmentation off or inference: contiguous positions, and a [1, n, d] freqs
-            # every block broadcasts instead of a per-sample copy
-            rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        if rope is None:
+            rope = self.make_rope(h.shape[0], seq_len, h.device)
 
         if self.long_skip_connection is not None:
             residual = h
 
-        for block in self.transformer_blocks:
+        hidden = None
+        for depth, block in enumerate(self.transformer_blocks, start=1):
             if self.checkpoint_activations:
                 # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
                 h = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), h, t, mask, rope, use_reentrant=False)
             else:
                 h = block(h, t, mask=mask, rope=rope)
+            if depth == hidden_at:
+                hidden = h
+                if hidden_only:  # the teacher wants layer k and nothing past it
+                    return hidden
 
         if self.long_skip_connection is not None:
             h = self.long_skip_connection(torch.cat((h, residual), dim=-1))
@@ -271,4 +285,7 @@ class DiT(nn.Module):
         h = self.norm_out(h, t)
         output = self.proj_out(h)
 
-        return self._tokens_to_wav(output, target_num_samples=target_num_samples)
+        wav = self._tokens_to_wav(output, target_num_samples=target_num_samples)
+        if hidden_at is not None:
+            return wav, hidden
+        return wav

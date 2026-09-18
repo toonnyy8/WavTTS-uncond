@@ -64,6 +64,7 @@ def main(model_cfg):
         log_samples_secs=model_cfg.ckpts.log_samples_secs,
         spk_ckpt_path=model_cfg.ckpts.spk_ckpt_path,
         bnb_optimizer=model_cfg.optim.bnb_optimizer,
+        ema_kwargs=OmegaConf.to_container(model_cfg.ckpts.get("ema", {}) or {}, resolve=True),
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
     )
 

@@ -31,7 +31,7 @@ class SinusPositionEmbedding(nn.Module):
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
+        emb = scale * x.unsqueeze(-1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -108,9 +108,11 @@ class AdaLayerNorm(nn.Module):
 
     def forward(self, x, emb=None):
         emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(emb, 6, dim=1)
+        if emb.ndim == 2:  # b d -> b 1 d; a per-token emb (b n d) already has the axis
+            emb = emb.unsqueeze(1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(emb, 6, dim=-1)
 
-        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        x = self.norm(x) * (1 + scale_msa) + shift_msa
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -129,9 +131,11 @@ class AdaLayerNorm_Final(nn.Module):
 
     def forward(self, x, emb):
         emb = self.linear(self.silu(emb))
-        scale, shift = torch.chunk(emb, 2, dim=1)
+        if emb.ndim == 2:  # b d -> b 1 d
+            emb = emb.unsqueeze(1)
+        scale, shift = torch.chunk(emb, 2, dim=-1)
 
-        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        x = self.norm(x) * (1 + scale) + shift
         return x
 
 
@@ -351,11 +355,11 @@ class DiTBlock(nn.Module):
         attn_output = self.attn(x=norm, mask=mask, rope=rope)
 
         # process attention output for input x
-        x = x + gate_msa.unsqueeze(1) * attn_output
+        x = x + gate_msa * attn_output
 
-        norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm = self.ff_norm(x) * (1 + scale_mlp) + shift_mlp
         ff_output = self.ff(norm)
-        x = x + gate_mlp.unsqueeze(1) * ff_output
+        x = x + gate_mlp * ff_output
 
         return x
 

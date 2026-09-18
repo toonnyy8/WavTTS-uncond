@@ -173,7 +173,7 @@ def test_train_step_backward():
     lens = torch.tensor([16000, 12000, 16000, 8000])
     loss, loss_dict = model(wav, lens=lens)
     assert torch.isfinite(loss)
-    assert set(loss_dict) == {"total_loss", "flow_loss", "aux_mel_loss"}
+    assert set(loss_dict) == {"total_loss", "flow_loss", "aux_mel_loss", "rep_loss"}
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert len(grads) > 0
@@ -772,3 +772,105 @@ def test_clean_config_instantiates_model_and_trains_one_step():
     loss, _ = model(torch.randn(2, 16000) * 0.1)
     assert torch.isfinite(loss)
     loss.backward()
+
+
+# ---------------------------------------------------------------- self-flow
+
+
+def _make_self_flow(depth=4, **kwargs):
+    import copy
+
+    from wavtts.model import CFM, DiT
+
+    torch.manual_seed(0)
+    transformer = DiT(dim=64, depth=depth, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
+    model = CFM(
+        transformer=transformer,
+        waveform_kwargs={"wav_frame_len": 160},
+        prediction="x_pred",
+        loss_space="v",
+        t_eps=0.02,
+        sample_rate=16000,
+        self_flow=True,
+        **kwargs,
+    )
+    _reinit_nonzero(model)
+    teacher = copy.deepcopy(model.transformer).requires_grad_(False)
+    return model, teacher
+
+
+def test_self_flow_layer_selection():
+    # l = 0.3D, k = 0.7D, the paper's l=8/k=20 at D=28
+    model, _ = _make_self_flow(depth=28)
+    assert (model.student_layer, model.teacher_layer) == (8, 20)
+
+
+def test_self_flow_rejects_inverted_layers():
+    import pytest
+
+    with pytest.raises(ValueError, match="student layer < teacher layer"):
+        _make_self_flow(student_layer_frac=0.7, teacher_layer_frac=0.3)
+
+
+def test_self_flow_requires_a_teacher():
+    # silently falling back to plain flow matching would waste a whole training run
+    import pytest
+
+    model, _ = _make_self_flow()
+    with pytest.raises(ValueError, match="requires a teacher"):
+        model(torch.randn(2, 16000) * 0.1)
+
+
+def test_self_flow_train_step_backward():
+    model, teacher = _make_self_flow()
+    torch.manual_seed(0)
+    wav = torch.randn(3, 16000) * 0.1
+    lens = torch.tensor([16000, 9000, 16000])
+
+    loss, loss_dict = model(wav, lens=lens, teacher=teacher)
+    assert torch.isfinite(loss)
+    # cosine similarity is bounded, so the term it contributes is too
+    assert -1.0 <= loss_dict["rep_loss"].item() <= 1.0
+    assert loss_dict["rep_loss"].item() != 0.0
+
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.rep_proj.parameters())
+    assert all(p.grad is None for p in teacher.parameters())  # teacher is EMA-driven, never trained
+
+
+def test_self_flow_noises_tokens_at_two_levels():
+    # the whole method rests on the input being heterogeneously noised
+    model, _ = _make_self_flow()
+    torch.manual_seed(0)
+    tau_tok, tau_wav, tau_clean = model._dual_timestep(4, 100, 16000, torch.float32, torch.device("cpu"))
+
+    assert tau_tok.shape == (4, 100)
+    assert tau_wav.shape == (4, 16000)
+    # exactly two distinct levels per row, and the teacher's is the cleaner (larger) one
+    for row in range(4):
+        levels = tau_tok[row].unique()
+        assert len(levels) == 2
+        assert torch.isclose(tau_clean[row], levels.max())
+    # each token's level is held across all wav_frame_len of its samples
+    assert torch.equal(tau_wav.view(4, 100, 160)[:, :, 0], tau_tok)
+    assert (tau_wav.view(4, 100, 160) == tau_tok.unsqueeze(-1)).all()
+
+
+def test_per_token_time_matches_scalar_time_when_uniform():
+    # the adaLN rework must not change what a plain scalar timestep does
+    from wavtts.model import DiT
+
+    torch.manual_seed(0)
+    dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rpe_gamma=1.0)
+    _reinit_nonzero(dit)
+    dit.eval()
+
+    x = torch.randn(2, 16000) * 0.1
+    state = torch.zeros(2, dtype=torch.long)
+    scalar_t = torch.tensor([0.3, 0.7])
+    per_token_t = scalar_t.unsqueeze(-1).expand(2, 100).contiguous()
+
+    with torch.no_grad():
+        a = dit(x=x, state=state, time=scalar_t)
+        b = dit(x=x, state=state, time=per_token_t)
+    assert torch.allclose(a, b, atol=1e-5)
