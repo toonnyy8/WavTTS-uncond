@@ -1,0 +1,95 @@
+# Self-Flow on the small model -- the quick sanity-check run. See
+# WavTTS_selfflow.yaml for what the method is and why each knob is set the way it is.
+# At depth 8 the paper's l = 0.3D, k = 0.7D land on blocks 2 and 6.
+#
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS_small_selfflow.yaml
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_100  # data/LibriTTS_100 (wav-only, 53.7 h)
+  batch_size_per_gpu: 12000  # frames @100Hz -> 120 s of audio per step, single GPU
+  batch_size_type: frame  # frame | sample
+  max_samples: 32  # max sequences per batch if use frame-wise batch_size
+  num_workers: 8
+
+optim:
+  epochs: 100
+  learning_rate: 2.0e-4
+  num_warmup_updates: 500
+  grad_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bnb_optimizer: False
+
+model:
+  name: WavTTS_Uncond_Small_SelfFlow  # model name
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -0.8
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    sample_rate: 16000
+    state_null_prob: 0.5    # prob a sample is labelled null; the rest are clean
+    p_mix: 0.5              # among null samples, prob of the mixing augmentation, so
+                            # p_null = 0.5*p_clean + 0.5*p_mixed. Any p_mix < 1 keeps
+                            # CFG self-extinguishing in the clean region; p_mix sets
+                            # how deep into it the guidance survives
+    p_concat: 0.5           # among mixed: concat (temporal switch) vs overlap
+    mix_lambda_range: [0.3, 0.7]
+    concat_point_range: [0.3, 0.7]
+    concat_xfade_ms: 20
+    # --- self-flow ---
+    self_flow: True
+    mask_ratio: 0.5          # the paper's audio setting
+    rep_loss_weight: 0.8     # gamma in L = L_gen + gamma * L_rep
+    student_layer_frac: 0.3  # l = 0.3D -> block 2 of 8
+    teacher_layer_frac: 0.7  # k = 0.7D -> block 6 of 8
+    rep_proj_hidden: null    # null -> 2*dim
+  arch:
+    dim: 384
+    depth: 8
+    heads: 6
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: False
+    use_audio_proj: True
+    audio_proj_dim: 512
+    audio_proj_hidden: 384
+    # length extrapolation, see WavTTS.yaml for what each knob does
+    rpe_gamma: 4.0         # per-sample L_t ~ U[n, n*gamma]; see WavTTS.yaml
+    logn_ref_len: 500        # see WavTTS.yaml
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 160    # 160 @16k = 100Hz
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+
+ckpts:
+  # the EMA doubles as the self-flow teacher: track every update, decay 0.9999
+  ema:
+    beta: 0.9999
+    update_every: 1
+    update_after_step: 0
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 50  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  log_samples_secs: [4, 10, 20, 40]  # one length per seed; see WavTTS.yaml
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint
+  keep_last_n_checkpoints: 5
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}

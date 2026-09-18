@@ -146,6 +146,78 @@ uv run python src/wavtts/infer/sample_uncond.py \
 | `arch.rpe_gamma` | 4.0 | per-sample stretch bound: `L_t ~ U[n, n·γ]`; `1.0` disables |
 | `arch.logn_ref_len` | 500 | entropy-invariant scaling reference (5 s), clamped at 1; `null` disables |
 
+### Self-Flow
+
+Flow matching gives the model no reason to learn semantic representations: under uniform
+noise, denoising is usually solvable from local correlation alone. The usual remedy is to
+borrow features from a frozen external encoder — which, for an unconditional raw-waveform
+model, means picking a speech encoder and writing its inductive bias into the generative
+distribution. [Self-Flow](https://bfl.ai/research/self-flow) (Chefer, Esser et al. 2026)
+gets the representations from the model itself instead. Both pieces are training-only, and
+inference is untouched.
+
+**Dual-Timestep Scheduling.** Two timesteps `t, s` are drawn per sample, and a random
+fraction `mask_ratio` of the 100 Hz tokens takes `s` while the rest take `t`. The input
+therefore carries two noise levels at once, and *that asymmetry is the whole mechanism*: a
+token whose neighbours are cleaner cannot be recovered locally, so the model has to build
+global structure. The paper's alternatives — fully masking some tokens, or an independent
+level per token — both hurt, because inference never sees anything like them; the
+dual-timestep form preserves the per-token marginal and sits between the two.
+
+**The representation loss.** An EMA teacher sees the same clip, same noise draw, noised
+uniformly at whichever of the two timesteps is *cleaner*. The student predicts the
+teacher's layer-`k` features from its own layer-`l` ones, cosine-aligned through a small
+MLP, with `l = 0.3D`, `k = 0.7D` — blocks 8 and 20 of 28, the paper's own defaults:
+
+```
+L = L_gen + γ · L_rep,   L_rep = −cos( h(x_τ)ˡ , sg[ teacher(x_τ_clean)ᵏ ] )
+```
+
+The teacher **is** the checkpoint EMA the trainer already kept, so this costs one extra
+forward per step — truncated at layer `k`, so 20 blocks of 28 — not a third copy of 664M
+weights. The only new parameters are the 10.6M projection head, and it never runs at
+inference. The extra forward is why `batch_size_per_gpu` drops to 2400 against the
+baseline's 3200, with `grad_accumulation_steps` raised to 8 to keep the update at the same
+19200 frames.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  uv run accelerate launch --mixed_precision bf16 \
+  src/wavtts/train/train.py --config-name WavTTS_selfflow.yaml
+```
+
+Three things the port had to get right, all of which fail *silently* if done wrong:
+
+- **The paper's time axis runs the other way.** There `t=1` is noise and the teacher sees
+  `min{t,s}`; here `t=1` is data, so the teacher's level is the **larger** one. Copy the
+  formula verbatim and the teacher sees a *dirtier* input than the student — the asymmetry
+  inverts, and nothing raises.
+- **The mask is drawn on tokens, not samples.** A per-sample mask would make the noise
+  level jump inside a single 160-sample frame, which the DiT has no way to represent.
+- **Student and teacher must share RoPE positions.** Randomized positional encoding redraws
+  its stretch every forward, so two independent passes compare features computed over
+  different geometry. `make_rope()` is public for exactly this reason.
+
+`rep_loss` is logged to TensorBoard next to `flow_loss`; it is `−cos`, so it runs from `0`
+toward `−1` as the alignment succeeds. `WavTTS_small_selfflow.yaml` is the quick
+sanity-check run.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `cfm.self_flow` | `True` | enable; `False` is plain flow matching with a scalar timestep |
+| `cfm.mask_ratio` | 0.5 | fraction of tokens noised at the second timestep (paper: 0.5 audio, 0.25 image, 0.1 video) |
+| `cfm.rep_loss_weight` | 0.8 | `γ` in `L = L_gen + γ·L_rep` |
+| `cfm.student_layer_frac` | 0.3 | `l = 0.3D` — block 8 of 28 |
+| `cfm.teacher_layer_frac` | 0.7 | `k = 0.7D` — block 20 of 28 |
+| `cfm.rep_proj_hidden` | `null` | projection head width; `null` → `2·dim` (10.6M params at dim 1152) |
+| `ckpts.ema` | see config | EMA doubles as the teacher, so `update_every: 1`, `beta: 0.9999` |
+
+A `self_flow` model raises if `forward()` is called without a teacher rather than quietly
+training plain flow matching — the failure that otherwise costs a week and leaves a
+perfectly normal-looking loss curve.
+
+Design notes: [`docs/superpowers/specs/2026-09-18-self-flow-design.md`](docs/superpowers/specs/2026-09-18-self-flow-design.md).
+
 ### Monitoring
 
 ```bash
