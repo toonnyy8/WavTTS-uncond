@@ -83,15 +83,13 @@ if __name__ == "__main__":
 
     tokenizer = "char"  # "pinyin" | "char"
 
-    SUB_SET = ["train-clean-100", "train-clean-360"]
-    dataset_dir = "/home/public_datasets/LibriTTS/LibriTTS"
-    # clean-100 + clean-360 = the standard "clean-460" pool; keep the name short so it
-    # reads as one dataset in ckpt/run dir names rather than a list of subsets
-    dataset_name = "LibriTTS_460"
+    SUB_SET = ["train-clean-100"]
+    dataset_dir = "/media/8tsp/dataset/LibriTTS"
+    dataset_name = "LibriTTS_100"
     save_dir = str(files("wavtts").joinpath("../../")) + f"/data/{dataset_name}"
     print(f"\nPrepare for {dataset_name}, will save to {save_dir}\n")
     main()
 
-    # For LibriTTS_100_360_500_char, sample count: 354218
-    # For LibriTTS_100_360_500_char, vocab size is: 78
-    # For LibriTTS_100_360_500_char, total 554.09 hours
+    # For LibriTTS_100, sample count: 33188
+    # For LibriTTS_100, vocab size is: 70
+    # For LibriTTS_100, total 53.69 hours
