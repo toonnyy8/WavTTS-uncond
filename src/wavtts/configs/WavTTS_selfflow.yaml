@@ -18,7 +18,7 @@
 # still 19200 frames, just split finer to leave room.
 #
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-#   accelerate launch --mixed_precision bf16 src/wavtts/train/train.py --config-name WavTTS_selfflow.yaml
+#   NUM_PROCESSES=1 scripts/train_loop.sh WavTTS_selfflow.yaml
 
 hydra:
   run:
@@ -27,14 +27,19 @@ hydra:
 seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
 
 datasets:
-  name: LibriTTS_100  # prepared data dir name under data/ (wav-only, 53.7 h)
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
   batch_size_per_gpu: 2400  # single 24 GB GPU (RTX 4090) w/ bf16; lower than the baseline's 3200 to leave room for the teacher forward
   batch_size_type: frame  # frame | sample
   max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
   num_workers: 16
 
 optim:
-  epochs: 686
+  epochs: 177  # the clean-460 budget WavTTS_clean.yaml established, so this arm stays
+               # comparable to it. At 2400 frames/batch an epoch is 5663 updates, so the run
+               # is ~1.00M updates against the 20k warmup -- ~17 days on one 4090. The LR
+               # horizon follows len(dataloader), so decay lands its floor on the last update
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
   grad_accumulation_steps: 8  # 8 x 2400 = 19200 frames/update, same as the baseline
