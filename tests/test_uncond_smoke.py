@@ -874,3 +874,50 @@ def test_per_token_time_matches_scalar_time_when_uniform():
         a = dit(x=x, state=state, time=scalar_t)
         b = dit(x=x, state=state, time=per_token_t)
     assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_mask_block_holds_one_level_across_the_block():
+    # our tokens are 10 ms raw-waveform frames, not the paper's 40 ms latents, so the mask
+    # is drawn per block to restore the paper's noise-pattern time scale
+    model, _ = _make_self_flow(mask_block=4)
+    torch.manual_seed(0)
+    tau_tok, _, _ = model._dual_timestep(4, 100, 16000, torch.float32, torch.device("cpu"))
+
+    blocks = tau_tok.view(4, 25, 4)
+    assert (blocks == blocks[:, :, :1]).all()  # one level per 4-token block
+    assert len(tau_tok[0].unique()) == 2  # still exactly the two timesteps
+
+
+def test_mask_block_handles_a_ragged_last_block():
+    model, _ = _make_self_flow(mask_block=4)
+    torch.manual_seed(0)
+    tau_tok, tau_wav, _ = model._dual_timestep(2, 13, 2080, torch.float32, torch.device("cpu"))
+    assert tau_tok.shape == (2, 13)  # 13 = 3 whole blocks + 1, truncated not padded
+    assert tau_wav.shape == (2, 2080)
+    assert (tau_tok.view(2, 13)[:, :12].reshape(2, 3, 4) == tau_tok[:, :12].reshape(2, 3, 4)[:, :, :1]).all()
+
+
+def test_mask_block_1_is_the_unblocked_draw():
+    # the default must stay bit-identical to the per-token draw
+    model, _ = _make_self_flow(mask_block=1)
+    torch.manual_seed(7)
+    a, _, _ = model._dual_timestep(3, 50, 8000, torch.float32, torch.device("cpu"))
+    torch.manual_seed(7)
+    t = model._sample_time(3, dtype=torch.float32, device=torch.device("cpu"))
+    s = model._sample_time(3, dtype=torch.float32, device=torch.device("cpu"))
+    m = torch.rand((3, 50)) < model.mask_ratio
+    assert torch.equal(a, torch.where(m, s.unsqueeze(-1), t.unsqueeze(-1)))
+
+
+def test_mask_block_run_length_matches_the_paper_time_scale():
+    # 4 x 10 ms tokens reproduce the paper's 80 ms mean run; per-token gives 20 ms
+    def mean_run_ms(block, hz=100):
+        model, _ = _make_self_flow(mask_block=block)
+        torch.manual_seed(0)
+        tau, _, _ = model._dual_timestep(1, 20000, 20000 * 160, torch.float32, torch.device("cpu"))
+        row = tau[0]
+        changes = (row[1:] != row[:-1]).sum().item() + 1
+        return len(row) / changes * 1000 / hz
+
+    assert 15 < mean_run_ms(1) < 25  # ~20 ms, the unblocked draw
+    assert 65 < mean_run_ms(4) < 95  # ~80 ms, the paper's latent-rate scale

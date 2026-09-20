@@ -51,6 +51,7 @@ class CFM(nn.Module):
         self_flow: bool = False,
         rep_loss_weight: float = 0.8,
         mask_ratio: float = 0.5,
+        mask_block: int = 1,
         student_layer_frac: float = 0.3,
         teacher_layer_frac: float = 0.7,
         rep_proj_hidden: int | None = None,
@@ -118,6 +119,7 @@ class CFM(nn.Module):
         self.self_flow = self_flow
         self.rep_loss_weight = rep_loss_weight
         self.mask_ratio = mask_ratio
+        self.mask_block = int(mask_block)
         self.rep_proj = None
         if self_flow:
             depth = transformer.depth
@@ -332,11 +334,26 @@ class CFM(nn.Module):
         mask of ratio mask_ratio decides which tokens take s; the rest take t. The teacher
         sees whichever of the two is *cleaner* applied uniformly -- here t=1 is data and
         t=0 is noise, so that is the larger one (the paper's convention is inverted, and
-        its tau_min is this tau_clean)."""
+        its tau_min is this tau_clean).
+
+        The mask is drawn over blocks of mask_block tokens rather than per token. The paper
+        draws it i.i.d. per token, but its audio tokens are 40 ms Songbloom latents while
+        ours are 10 ms raw-waveform frames, so the same i.i.d. draw gives a noise pattern
+        that alternates 4x faster in time: a mean run of 20 ms against the paper's 80 ms.
+        That matters because the whole mechanism is "your neighbours are cleaner, so local
+        denoising cannot recover you" -- and 20 ms spans only 2-4 pitch periods, which
+        interpolation handles. Blocking restores the paper's time scale. Note that ratio and
+        block size are coupled under an i.i.d. draw (a masked run averages 1/(1-mask_ratio)
+        tokens), so raising mask_ratio cannot buy the same thing without also changing how
+        much is masked; only blocking separates the two.
+        """
         t = self._sample_time(batch, dtype=dtype, device=device)
         s = self._sample_time(batch, dtype=dtype, device=device)
 
-        m = torch.rand((batch, n_tok), device=device) < self.mask_ratio
+        n_blk = math.ceil(n_tok / self.mask_block)
+        m = torch.rand((batch, n_blk), device=device) < self.mask_ratio
+        if self.mask_block > 1:
+            m = m.repeat_interleave(self.mask_block, dim=-1)[:, :n_tok]
         tau_tok = torch.where(m, s.unsqueeze(-1), t.unsqueeze(-1))  # b n
         tau_clean = torch.maximum(t, s)  # b
 

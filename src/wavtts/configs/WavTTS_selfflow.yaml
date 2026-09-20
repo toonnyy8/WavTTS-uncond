@@ -47,7 +47,10 @@ optim:
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
 
 model:
-  name: WavTTS_Uncond_Large_SelfFlow  # model name
+  name: WavTTS_Uncond_Large_SelfFlow_MB4  # model name. MB4 = mask_block 4, the arm that
+                                          # restores the paper's 80 ms mask time scale; the
+                                          # unsuffixed ckpt/run dir is the mask_block 1 arm
+                                          # this is meant to be compared against
   backbone: DiT
   cfm:
     prediction: x_pred         # flow | x_pred
@@ -73,6 +76,14 @@ model:
     self_flow: True
     mask_ratio: 0.5          # fraction of tokens noised at the second timestep. The
                              # paper's audio setting; 0.25 for image, 0.1 for video
+    mask_block: 4            # draw the mask over 4-token blocks, not per token. Our tokens are
+                             # 10 ms raw-waveform frames; the paper's audio tokens are 40 ms
+                             # Songbloom latents, so an i.i.d. draw alternates 4x faster in
+                             # time (20 ms mean run vs the paper's 80 ms). 20 ms is only 2-4
+                             # pitch periods -- interpolation handles it, and the "neighbours
+                             # are cleaner" pressure that drives the method is lost. 4 restores
+                             # the paper's scale; HuBERT, on speech, goes further still at
+                             # 10 frames x 20 ms = 200 ms spans, so 4 is a floor not a ceiling
     rep_loss_weight: 0.8     # gamma in L = L_gen + gamma * L_rep
     student_layer_frac: 0.3  # l = 0.3D -> block 8 of 28
     teacher_layer_frac: 0.7  # k = 0.7D -> block 20 of 28
