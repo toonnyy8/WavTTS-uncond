@@ -174,6 +174,15 @@ the method runs on is largely gone. `mask_block: 4` puts the run back at exactly
 length — which is why the block size is a separate knob. `mask_block: 1` is the default
 and is bit-identical to the unblocked draw.
 
+`mask_run_len` is the same idea without the block grid. The i.i.d. draw already produces
+*geometric* run lengths — that is what `1/(1−R_M)` is the mean of — so rather than scaling
+them by a block size, this draws the run lengths directly from a two-state chain: masked
+runs are `Geom(1/mask_run_len)`, and the unmasked mean follows from `mask_ratio` so the
+per-token marginal is untouched. It is the same family with the scale freed from the ratio,
+it lands anywhere rather than on a `k`-token grid, and it has no floor — `mask_block: k`
+is `mask_run_len: k/(1−R_M)` on the mean, 8.0 for `k=4` at `R_M=0.5`. Set one or the other;
+setting both raises.
+
 **The representation loss.** An EMA teacher sees the same clip, same noise draw, noised
 uniformly at whichever of the two timesteps is *cleaner*. The student predicts the
 teacher's layer-`k` features from its own layer-`l` ones, cosine-aligned through a small
@@ -223,7 +232,8 @@ sanity-check run.
 |---|---|---|
 | `cfm.self_flow` | `True` | enable; `False` is plain flow matching with a scalar timestep |
 | `cfm.mask_ratio` | 0.5 | fraction of tokens noised at the second timestep (paper: 0.5 audio, 0.25 image, 0.1 video) |
-| `cfm.mask_block` | 4 | tokens per mask block; `1` is the paper's i.i.d. draw. 4 → 79 ms runs, matching the paper's 80 ms at its 40 ms tokens |
+| `cfm.mask_block` | 4 | tokens per mask block; `1` is the paper's i.i.d. draw. 4 → 80 ms runs, matching the paper's 80 ms at its 40 ms tokens |
+| `cfm.mask_run_len` | `null` | mean masked run in tokens, drawn geometrically; replaces `mask_block` and frees the run length from the ratio. `null` → use `mask_block` |
 | `cfm.rep_loss_weight` | 0.8 | `γ` in `L = L_gen + γ·L_rep` |
 | `cfm.student_layer_frac` | 0.3 | `l = 0.3D` — block 8 of 28 |
 | `cfm.teacher_layer_frac` | 0.7 | `k = 0.7D` — block 20 of 28 |

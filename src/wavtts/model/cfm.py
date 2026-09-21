@@ -52,6 +52,7 @@ class CFM(nn.Module):
         rep_loss_weight: float = 0.8,
         mask_ratio: float = 0.5,
         mask_block: int = 1,
+        mask_run_len: float | None = None,
         student_layer_frac: float = 0.3,
         teacher_layer_frac: float = 0.7,
         rep_proj_hidden: int | None = None,
@@ -120,6 +121,28 @@ class CFM(nn.Module):
         self.rep_loss_weight = rep_loss_weight
         self.mask_ratio = mask_ratio
         self.mask_block = int(mask_block)
+        # mask_run_len replaces the block draw with a two-state chain: run lengths are
+        # geometric, so the mean masked run is a knob of its own instead of being pinned
+        # to 1/(1-mask_ratio) by the i.i.d. draw. The unmasked mean follows from the ratio,
+        # which keeps mask_ratio the primary knob (it is what the paper sweeps, and what
+        # "preserves the per-token marginal" refers to).
+        self.mask_run_len = self.unmask_run_len = None
+        if mask_run_len is not None:
+            if self.mask_block != 1:
+                raise ValueError("mask_run_len and mask_block are two ways to set the same "
+                                 f"thing; got mask_run_len={mask_run_len}, mask_block={self.mask_block}. "
+                                 f"mask_block={self.mask_block} is mask_run_len="
+                                 f"{self.mask_block / (1 - mask_ratio):.4g} at this ratio.")
+            if not 0.0 < mask_ratio < 1.0:
+                raise ValueError(f"mask_run_len needs 0 < mask_ratio < 1, got {mask_ratio}")
+            self.mask_run_len = float(mask_run_len)
+            self.unmask_run_len = self.mask_run_len * (1 - mask_ratio) / mask_ratio
+            # a run is at least one token, so a mean below 1 is unreachable
+            if self.mask_run_len < 1.0 or self.unmask_run_len < 1.0:
+                raise ValueError(
+                    f"mask_run_len={self.mask_run_len:.4g} at mask_ratio={mask_ratio} implies an "
+                    f"unmasked run of {self.unmask_run_len:.4g} tokens; both means must be >= 1"
+                )
         self.rep_proj = None
         if self_flow:
             depth = transformer.depth
@@ -328,6 +351,51 @@ class CFM(nn.Module):
         out = trajectory[-1] / self.latents_scale
         return out[:, :requested], trajectory
 
+    def _mask_tokens(self, batch: int, n_tok: int, device) -> bool["b n"]:
+        """Which tokens take the second timestep. Marginally mask_ratio either way; the
+        two draws differ in how long a masked stretch runs.
+
+        The paper draws the mask i.i.d. per token, but its audio tokens are 40 ms Songbloom
+        latents while ours are 10 ms raw-waveform frames, so the same draw alternates 4x
+        faster in time: a masked run of 20 ms against the paper's 80 ms. That matters
+        because the whole mechanism is "your neighbours are cleaner, so local denoising
+        cannot recover you", and 20 ms spans only 2-4 pitch periods, which interpolation
+        handles. Under an i.i.d. draw the run length is not free -- it is 1/(1-mask_ratio)
+        -- so the time scale needs a second knob. There are two:
+
+        mask_block   draw per block of k tokens. Mean masked run k/(1-mask_ratio). Cheap,
+                     but boundaries land on a fixed k-grid and no run is shorter than k.
+        mask_run_len draw the run lengths instead, from a two-state chain. Both runs are
+                     geometric -- which is what the i.i.d. draw already produces, just with
+                     the mean pinned -- so this is the same family with the scale freed.
+                     Continuous, no grid, and mask_run_len=1/(1-mask_ratio) reproduces the
+                     i.i.d. draw exactly.
+        """
+        if self.mask_run_len is None:
+            n_blk = math.ceil(n_tok / self.mask_block)
+            m = torch.rand((batch, n_blk), device=device) < self.mask_ratio
+            if self.mask_block > 1:
+                m = m.repeat_interleave(self.mask_block, dim=-1)[:, :n_tok]
+            return m
+
+        # Draw alternating run lengths and lay them end to end. Sampling the start state
+        # from the stationary law (rather than a coin flip) is what makes the marginal come
+        # out at exactly mask_ratio: the geometric is memoryless, so a fresh run at index 0
+        # is already in equilibrium and no length-biasing correction is needed.
+        start = (torch.rand((batch, 1), device=device) < self.mask_ratio).long()
+        # ponytail: runs are >= 1 token, so n runs always cover n tokens -- no coverage math
+        state = (torch.arange(n_tok, device=device) + start) % 2  # b n, 1 = masked
+        p = torch.where(state.bool(), 1.0 / self.mask_run_len, 1.0 / self.unmask_run_len)
+        # torch.rand can return exactly 0, and log(0) -> -inf -> a garbage index below
+        u = torch.rand((batch, n_tok), device=device).clamp_min(torch.finfo(torch.float32).tiny)
+        run_len = (u.log() / torch.log1p(-p)).floor().long() + 1  # geometric on {1, 2, ...}
+        # run boundaries are strictly increasing, so they never collide in the scatter;
+        # anything past the end lands in the throwaway column n_tok
+        bounds = run_len.cumsum(-1).clamp_(0, n_tok)
+        edges = torch.zeros((batch, n_tok + 1), dtype=torch.long, device=device)
+        edges.scatter_(1, bounds, 1)
+        return ((edges[:, :n_tok].cumsum(-1) + start) % 2).bool()
+
     def _dual_timestep(self, batch, n_tok, seq_len, dtype, device):
         """Dual-Timestep Scheduling: a per-token noise level tau, plus the scalar the
         teacher sees. Two timesteps t, s are drawn from the usual distribution and a random
@@ -336,24 +404,12 @@ class CFM(nn.Module):
         t=0 is noise, so that is the larger one (the paper's convention is inverted, and
         its tau_min is this tau_clean).
 
-        The mask is drawn over blocks of mask_block tokens rather than per token. The paper
-        draws it i.i.d. per token, but its audio tokens are 40 ms Songbloom latents while
-        ours are 10 ms raw-waveform frames, so the same i.i.d. draw gives a noise pattern
-        that alternates 4x faster in time: a mean run of 20 ms against the paper's 80 ms.
-        That matters because the whole mechanism is "your neighbours are cleaner, so local
-        denoising cannot recover you" -- and 20 ms spans only 2-4 pitch periods, which
-        interpolation handles. Blocking restores the paper's time scale. Note that ratio and
-        block size are coupled under an i.i.d. draw (a masked run averages 1/(1-mask_ratio)
-        tokens), so raising mask_ratio cannot buy the same thing without also changing how
-        much is masked; only blocking separates the two.
+        See _mask_tokens for how the mask itself is drawn.
         """
         t = self._sample_time(batch, dtype=dtype, device=device)
         s = self._sample_time(batch, dtype=dtype, device=device)
 
-        n_blk = math.ceil(n_tok / self.mask_block)
-        m = torch.rand((batch, n_blk), device=device) < self.mask_ratio
-        if self.mask_block > 1:
-            m = m.repeat_interleave(self.mask_block, dim=-1)[:, :n_tok]
+        m = self._mask_tokens(batch, n_tok, device)
         tau_tok = torch.where(m, s.unsqueeze(-1), t.unsqueeze(-1))  # b n
         tau_clean = torch.maximum(t, s)  # b
 

@@ -921,3 +921,69 @@ def test_mask_block_run_length_matches_the_paper_time_scale():
 
     assert 15 < mean_run_ms(1) < 25  # ~20 ms, the unblocked draw
     assert 65 < mean_run_ms(4) < 95  # ~80 ms, the paper's latent-rate scale
+
+
+def _runs(row):
+    # lengths of the True stretches in a 1-D bool row
+    pad = torch.zeros(1, dtype=torch.bool)
+    d = torch.cat([pad, row, pad]).int().diff()
+    return ((d == -1).nonzero() - (d == 1).nonzero()).flatten()
+
+
+def _mean_run(row):
+    return _runs(row).float().mean().item()
+
+
+def test_mask_run_len_reproduces_the_iid_draw_at_its_own_mean():
+    # mask_run_len = 1/(1-ratio) is the mean the i.i.d. draw already has, so the geometric
+    # parameterisation must land on the same process there
+    model, _ = _make_self_flow(mask_ratio=0.5, mask_run_len=2.0)
+    torch.manual_seed(0)
+    m = model._mask_tokens(4, 20000, torch.device("cpu"))
+    assert abs(m.float().mean().item() - 0.5) < 0.02
+    assert abs(_mean_run(m[0]) - 2.0) < 0.15
+    assert abs(_mean_run(~m[0]) - 2.0) < 0.15
+
+
+def test_mask_run_len_frees_the_scale_from_the_ratio():
+    # the whole point: under the i.i.d. draw a ratio of 0.25 forces a 1.33-token masked run,
+    # here the run length is set independently and the ratio still comes out at 0.25
+    model, _ = _make_self_flow(mask_ratio=0.25, mask_run_len=8.0)
+    torch.manual_seed(0)
+    m = model._mask_tokens(4, 20000, torch.device("cpu"))
+    assert abs(m.float().mean().item() - 0.25) < 0.02
+    assert abs(_mean_run(m[0]) - 8.0) < 0.8
+    assert abs(_mean_run(~m[0]) - 24.0) < 2.5  # 8 * (1-0.25)/0.25, derived from the ratio
+
+
+def test_mask_run_len_matches_mask_block_on_the_mean_without_the_grid():
+    # mask_block=4 at ratio 0.5 means an 8-token masked run; the chain hits the same mean
+    # but is not quantised to the block grid and has no floor
+    model, _ = _make_self_flow(mask_ratio=0.5, mask_run_len=8.0)
+    torch.manual_seed(0)
+    m = model._mask_tokens(4, 20000, torch.device("cpu"))
+    runs = _runs(m[0])
+    assert abs(runs.float().mean().item() - 8.0) < 0.8
+    assert (runs % 4 != 0).any()  # not on the 4-grid a block draw would produce
+    assert runs.min().item() < 4  # and no floor
+
+
+def test_mask_run_len_of_one_masks_single_tokens():
+    # p = 1/1 = 1 sends log1p(-p) to -inf; the draw has to stay finite and give runs of 1
+    model, _ = _make_self_flow(mask_ratio=0.5, mask_run_len=1.0)
+    torch.manual_seed(0)
+    m = model._mask_tokens(4, 2000, torch.device("cpu"))
+    assert _mean_run(m[0]) == 1.0
+    assert abs(m.float().mean().item() - 0.5) < 0.05
+
+
+def test_mask_run_len_and_mask_block_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="two ways to set the same thing"):
+        _make_self_flow(mask_block=4, mask_run_len=8.0)
+
+
+def test_mask_run_len_rejects_an_unreachable_mean():
+    # ratio 0.9 with an 8-token masked run implies a 0.89-token unmasked run, which no
+    # run-length draw can produce
+    with pytest.raises(ValueError, match="both means must be >= 1"):
+        _make_self_flow(mask_ratio=0.9, mask_run_len=8.0)

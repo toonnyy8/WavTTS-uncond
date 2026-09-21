@@ -84,6 +84,13 @@ model:
                              # are cleaner" pressure that drives the method is lost. 4 restores
                              # the paper's scale; HuBERT, on speech, goes further still at
                              # 10 frames x 20 ms = 200 ms spans, so 4 is a floor not a ceiling
+    mask_run_len: null       # set this instead of mask_block to draw run lengths from a
+                             # two-state chain: masked runs ~ Geom(1/mask_run_len), the
+                             # unmasked mean derived from mask_ratio so the marginal is
+                             # untouched. Same geometric family the i.i.d. draw already
+                             # produces, with the mean freed from 1/(1-mask_ratio). No block
+                             # grid and no floor. mask_block k == mask_run_len k/(1-mask_ratio)
+                             # (4 -> 8.0 here); the two cannot both be set
     rep_loss_weight: 0.8     # gamma in L = L_gen + gamma * L_rep
     student_layer_frac: 0.3  # l = 0.3D -> block 8 of 28
     teacher_layer_frac: 0.7  # k = 0.7D -> block 20 of 28

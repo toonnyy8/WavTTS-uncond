@@ -133,6 +133,35 @@ i.i.d. Bernoulli(`R_M`) 之下，一段連續被遮罩的 token 平均長 `1/(1�
 `mask_block=1` 是預設，且與原本的逐 token 抽樣**位元等價**
 （`test_mask_block_1_is_the_unblocked_draw` 釘住這點），所以這個旋鈕不會影響舊設定。
 
+#### `mask_run_len`：同一個幾何族，把尺度從比例解開
+
+i.i.d. 抽法的段長**本來就是幾何分布**——`1/(1−R_M)` 就是它的期望值。所以「改成幾何
+分布」不會得到新的分布族，真正該做的是把**均值**從 `R_M` 解開。`mask_block` 是用「乘
+以 k」達成，代價是邊界卡在 k 的格點上、而且最短段被墊到 k。
+
+`mask_run_len` 直接抽段長：遮罩段 `~ Geom(1/mask_run_len)`，未遮罩段的均值由 `R_M`
+導出（`mask_run_len·(1−R_M)/R_M`），所以 per-token 邊際維持不變、`R_M` 仍是主旋鈕
+（那是論文掃的量，也是「preserves the per-token marginal」指的量）。
+
+`mask_block=k` ≡ `mask_run_len = k/(1−R_M)`（`R_M=0.5` 時 k=4 → 8.0）。兩者互斥，
+同時設會丟 `ValueError`。
+
+實作是 renewal 形式而不是 per-token 鏈：不對稱的兩態鏈需要 sequential scan，抽段長再
+攤平則完全向量化（`_mask_tokens`）。三個會靜默出錯的地方：
+
+- **起始狀態要從穩態抽**（`rand < mask_ratio`），不是擲硬幣。幾何分布無記憶，所以在
+  index 0 開一段全新的 run 已經在平衡態，邊際才會精確落在 `R_M`；擲硬幣在
+  `R_M ≠ 0.5` 時序列開頭會偏。
+- **`torch.rand` 會回傳正好 0**，`log(0) = −inf` → `.long()` 是垃圾值 → `cumsum` 變負
+  → scatter 越界。小批量的 CPU 測試抓不到，GPU 上跑幾百次才炸。
+- **段數取 `K = n_tok`**：段長 ≥1，所以 n 段必定覆蓋 n 個 token，完全免掉覆蓋率分析。
+  代價是多一個 `(b, n)` 張量，實測 670 µs 對 `mask_block` 的 30 µs——對照 1.46 s 的
+  單步是 0.05%，不值得為此補邊界判斷。
+
+**保留下來的差異是那個下界。** `mask_block=4` 最短段是 4，幾何鏈有 8%（按 token 計）
+落在 ≤3。語音自監督的先例兩邊都有：HuBERT / wav2vec 2.0 用固定長度 span（等於有下界），
+SpanBERT 則明確測出幾何段長勝過固定長度。目前沒有本專案上的證據可以裁決。
+
 ## 成本
 
 教師**就是 trainer 本來就在維護的 checkpoint EMA**。所以代價是每步多一次 forward，
@@ -179,7 +208,12 @@ App. A.2 自己說了是「to maintain comparability to previous works」，不�
 取 0.1 是因為時間冗餘太高）。語音同屬時序模態，且論文既然是在音訊上選出 0.5 的，就
 從 0.5 起跑；時間尺度的差異交給 `mask_block` 處理，理由見〈遮罩的時間尺度〉。
 
-**兩條對照線同時在跑。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
+**`mask_block=4` 勝出。** clean-460 上兩條線各跑到 update 55000 的同步比較下，
+`mask_block=4` 優於 `mask_block=1`，兩者的 checkpoint 都保留著。這份文件不記錄評估
+指標，因為判讀是在 repo 之外做的。這個結果也把前面「4 比較像下界」的推測降級成尚未
+驗證——已知的只有 4 > 1，4 與 10/20 還沒比過。
+
+**兩條對照線的配置。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
 `WavTTS_Uncond_Large_SelfFlow_LibriTTS_460`）與 `WavTTS_selfflow.yaml`
 （`mask_block: 4`，`..._SelfFlow_MB4_LibriTTS_460`）除了這一個參數之外完全相同。分成
 兩份 config 而不是就地改一份，是因為共用一份檔案時兩條線無法各自啟停，而且 ckpt 目錄
@@ -195,6 +229,9 @@ App. A.2 自己說了是「to maintain comparability to previous works」，不�
   皆然）。這是 BYOL 式目標的常態（EMA 教師 + stop-grad 是標準的防塌陷結構，遮罩保證
   學生仍有實質工作要做）。論文沒有給健康的 cosine 區間，也只用 FID 消融來判斷，所以
   這個數字本身不構成結論——真正該看的是生成品質，而那還沒有對照數字。
-- **還沒有與 vanilla flow matching 的同步長對照數字。** 目前跑過的是 LibriTTS
-  clean-100（53.7 h）的迴圈驗證，以及 clean-460（244.6 h、149510 clips）上的
-  `mask_block` 1 對 4 兩條線；缺的是 `self_flow: False` 的那一條。
+- **還沒有與 vanilla flow matching 的同步長對照數字。** 跑過的是 LibriTTS
+  clean-100（53.7 h）的迴圈驗證，以及 clean-460（244.6 h、149510 clips）上
+  `mask_block` 1 對 4 的兩條線（4 勝）；缺的是 `self_flow: False` 的那一條，所以
+  Self-Flow 本身相對於 vanilla 的增益在本專案上仍未驗證。
+- **`mask_run_len` 已實作但沒跑過。** 單元測試涵蓋邊際、兩個段長均值、格點與下界的
+  消失、以及兩個防呆；訓練上的效果沒有數字。
