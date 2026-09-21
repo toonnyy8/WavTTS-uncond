@@ -164,6 +164,16 @@ global structure. The paper's alternatives — fully masking some tokens, or an 
 level per token — both hurt, because inference never sees anything like them; the
 dual-timestep form preserves the per-token marginal and sits between the two.
 
+The mask is drawn over `mask_block` tokens at a time rather than i.i.d. per token, because
+a token here is not a token there: the paper's audio latents are 40 ms, ours are 10 ms
+frames. At `mask_ratio 0.5` an i.i.d. draw gives a masked run of `1/(1−R_M)` = 2 tokens —
+80 ms for the paper, 20 ms for us, a noise pattern alternating four times faster. 20 ms is
+2–4 pitch periods, which interpolation handles, so the "neighbours are cleaner" pressure
+the method runs on is largely gone. `mask_block: 4` puts the run back at exactly 8 tokens = 80 ms. Note that
+`mask_ratio` cannot buy this on its own — under an i.i.d. draw the ratio *is* the run
+length — which is why the block size is a separate knob. `mask_block: 1` is the default
+and is bit-identical to the unblocked draw.
+
 **The representation loss.** An EMA teacher sees the same clip, same noise draw, noised
 uniformly at whichever of the two timesteps is *cleaner*. The student predicts the
 teacher's layer-`k` features from its own layer-`l` ones, cosine-aligned through a small
@@ -181,10 +191,15 @@ baseline's 3200, with `grad_accumulation_steps` raised to 8 to keep the update a
 19200 frames.
 
 ```bash
+# mask_block 4 -- WavTTS_selfflow_mb1.yaml is the same run at mask_block 1
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   uv run accelerate launch --mixed_precision bf16 \
   src/wavtts/train/train.py --config-name WavTTS_selfflow.yaml
 ```
+
+The two configs differ in `mask_block` and in `model.name` — and the name matters, because
+the checkpoint directory is `ckpts/${model.name}_${datasets.name}`. Give a new arm the old
+name and it resumes the old arm's weights without a word.
 
 Three things the port had to get right, all of which fail *silently* if done wrong:
 
@@ -197,6 +212,8 @@ Three things the port had to get right, all of which fail *silently* if done wro
 - **Student and teacher must share RoPE positions.** Randomized positional encoding redraws
   its stretch every forward, so two independent passes compare features computed over
   different geometry. `make_rope()` is public for exactly this reason.
+- **The paper's i.i.d. mask draw is at the wrong time scale here.** Same formula, tokens
+  four times shorter, so the noise alternates four times faster — see `mask_block` above.
 
 `rep_loss` is logged to TensorBoard next to `flow_loss`; it is `−cos`, so it runs from `0`
 toward `−1` as the alignment succeeds. `WavTTS_small_selfflow.yaml` is the quick
@@ -206,6 +223,7 @@ sanity-check run.
 |---|---|---|
 | `cfm.self_flow` | `True` | enable; `False` is plain flow matching with a scalar timestep |
 | `cfm.mask_ratio` | 0.5 | fraction of tokens noised at the second timestep (paper: 0.5 audio, 0.25 image, 0.1 video) |
+| `cfm.mask_block` | 4 | tokens per mask block; `1` is the paper's i.i.d. draw. 4 → 79 ms runs, matching the paper's 80 ms at its 40 ms tokens |
 | `cfm.rep_loss_weight` | 0.8 | `γ` in `L = L_gen + γ·L_rep` |
 | `cfm.student_layer_frac` | 0.3 | `l = 0.3D` — block 8 of 28 |
 | `cfm.teacher_layer_frac` | 0.7 | `k = 0.7D` — block 20 of 28 |
