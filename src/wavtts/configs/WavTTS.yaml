@@ -42,15 +42,6 @@ model:
     use_aux_mel_loss: True
     aux_mel_loss_weight: 0.05
     sample_rate: 16000
-    state_null_prob: 0.5    # prob a sample is labelled null; the rest are clean
-    p_mix: 0.5              # among null samples, prob of the mixing augmentation, so
-                            # p_null = 0.5*p_clean + 0.5*p_mixed. Any p_mix < 1 keeps
-                            # CFG self-extinguishing in the clean region; p_mix sets
-                            # how deep into it the guidance survives
-    p_concat: 0.5           # among mixed: concat (temporal switch) vs overlap
-    mix_lambda_range: [0.3, 0.7]
-    concat_point_range: [0.3, 0.7]
-    concat_xfade_ms: 20
   arch:
     dim: 1152
     depth: 28

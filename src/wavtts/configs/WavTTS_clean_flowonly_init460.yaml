@@ -84,10 +84,6 @@ model:
                               # alone. It is still computed every step, forward and backward,
                               # which is the price of keeping the buffers
     sample_rate: 16000
-    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
-                            # disables the mixing augmentation (only null samples mix),
-                            # so p_mix / p_concat / mix_* are left at their defaults and
-                            # never reached
   arch:
     dim: 1152
     depth: 28

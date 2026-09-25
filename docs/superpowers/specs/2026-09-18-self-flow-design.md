@@ -230,7 +230,14 @@ SNR：中位數 `t` 從 0.310 降到 0.232、q25 從 0.208 降到 0.149、`t < 0
 （格點與下界消失），所以這條線對 MB4 的差異是「`P_mean` + 段長律的形狀」，而不是單獨
 的 `P_mean`。
 
-**三條對照線的配置。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
+**負向條件與引導在 2026-09-26 從程式移除，所以有了第四條線。**
+`WavTTS_selfflow_rl8_pm12_nocfg.yaml`（`..._SelfFlow_RL8_PM12_NoCFG_LibriTTS_460`）沿用
+RL8_PM12 的 self-flow 旋鈕，但模型已經沒有 state embedding、沒有混合增強、也沒有
+`cfg_strength`——唯一的條件輸入是 timestep。它從零訓練，因為前三條的 checkpoint 都帶
+`state_embed.weight`、在新程式下載不進來（詳見 CFG 設計文件的〈移除紀錄〉）。這條線與
+前三條之間因此不只差一個旋鈕，而是差一個架構，**不能當成 RL8_PM12 的延續來讀**。
+
+**前三條對照線的配置。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
 `WavTTS_Uncond_Large_SelfFlow_LibriTTS_460`）與 `WavTTS_selfflow.yaml`
 （`mask_block: 4`，`..._SelfFlow_MB4_LibriTTS_460`）除了這一個參數之外完全相同。
 `WavTTS_selfflow_rl8_pm12.yaml`（`mask_run_len: 8` + `P_mean: −1.2`，

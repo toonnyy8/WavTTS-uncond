@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from torch import nn
 from torchdiffeq import odeint
 
-from wavtts.model.backbones.dit import STATE_CLEAN, STATE_NULL
 from wavtts.model.modules import MelSpectrogramLoss
 from wavtts.model.utils import exists, get_epss_timesteps, lens_to_mask
 
@@ -29,12 +28,6 @@ class CFM(nn.Module):
         odeint_kwargs: dict = dict(
             method="euler"  # 'midpoint'
         ),
-        p_mix: float = 0.5,
-        p_concat: float = 0.5,
-        mix_lambda_range: tuple[float, float] = (0.3, 0.7),
-        concat_point_range: tuple[float, float] = (0.3, 0.7),
-        concat_xfade_ms: float = 20.0,
-        state_null_prob: float = 0.5,
         waveform_kwargs: dict = dict(),
         prediction: str = "flow",  # "flow" | "x_pred"
         loss_space: str = "flow",  # "flow" | "v" | "x"
@@ -63,14 +56,6 @@ class CFM(nn.Module):
         waveform_kwargs = dict(waveform_kwargs)
         self.wav_frame_len = int(waveform_kwargs.pop("wav_frame_len", 160))
         self.num_channels = self.wav_frame_len
-
-        # no-leaky mixing augmentation / state conditioning
-        self.p_mix = p_mix
-        self.p_concat = p_concat
-        self.mix_lambda_range = tuple(mix_lambda_range)
-        self.concat_point_range = tuple(concat_point_range)
-        self.concat_xfade_ms = concat_xfade_ms
-        self.state_null_prob = state_null_prob
 
         # transformer
         self.transformer = transformer
@@ -189,48 +174,6 @@ class CFM(nn.Module):
             denom = denom.unsqueeze(-1)
         return (x_pred - z) / denom
 
-    def _mix_augment(self, x1: float["b nw"], lens: int["b"], mix_flags: bool["b"]):
-        """No-leaky mixing augmentation, applied to the flagged samples.
-
-        overlap: equal-power blend with a batch-roll partner (simultaneous speakers)
-        concat:  equal-power crossfade into the partner at a random switch point
-                 (temporal speaker switch)
-
-        Mixed samples carry no state of their own — the caller has already labelled
-        them null, so the speaker-inconsistent direction lives inside the
-        unconditional distribution rather than beside it.
-        """
-        batch, seq_len = x1.shape
-        device = x1.device
-        if batch < 2 or not mix_flags.any():
-            return x1  # a batch of one would roll onto itself
-
-        partner = x1.roll(1, dims=0)
-        concat_flags = torch.rand(batch, device=device) < self.p_concat
-
-        # overlap: x = sqrt(1-lam)*x1 + sqrt(lam)*partner
-        lo, hi = self.mix_lambda_range
-        lam = torch.empty((batch, 1), device=device, dtype=x1.dtype).uniform_(lo, hi)
-        overlap = torch.sqrt(1.0 - lam) * x1 + torch.sqrt(lam) * partner
-
-        # concat: switch to partner at s with an equal-power crossfade
-        # (a hard cut's click would let the model detect "mixed" from the boundary
-        #  artifact instead of speaker identity, breaking the CFG direction)
-        xfade_len = max(1, int(self.concat_xfade_ms * self.target_sample_rate / 1000.0))
-        plo, phi = self.concat_point_range
-        u = torch.empty((batch,), device=device, dtype=x1.dtype).uniform_(plo, phi)
-        s = (u * lens.to(x1.dtype)).long().clamp(min=1, max=seq_len - 1)
-        idx = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, n]
-        prog = ((idx - s.unsqueeze(-1)).to(x1.dtype) / xfade_len).clamp(0.0, 1.0)
-        g_in = torch.sin(prog * math.pi / 2)  # partner fades in
-        g_out = torch.cos(prog * math.pi / 2)  # original fades out; g_in^2 + g_out^2 = 1
-        concat = g_out * x1 + g_in * partner
-
-        mixed = torch.where(concat_flags.unsqueeze(-1), concat, overlap)
-        # ponytail: batch-roll partner; padding tails dilute the mixed content slightly,
-        # switch to dataset-level pair loading if purity ever matters.
-        return torch.where(mix_flags.unsqueeze(-1), mixed, x1)
-
     def _dpmpp_2m(self, fn, y0, t):
         """DPM-Solver++(2M) multistep, data-prediction form, for the rectified-flow
         interpolant x_t = (1-t)·x0 + t·x1 (alpha_t = t, sigma_t = 1-t,
@@ -270,7 +213,6 @@ class CFM(nn.Module):
         *,
         batch: int = 1,
         steps: int = 32,
-        cfg_strength: float = 2.0,
         sway_sampling_coef: float | None = None,
         timestep_mapping: str = "sway_sampling",
         timestep_power: float | None = None,
@@ -285,7 +227,6 @@ class CFM(nn.Module):
 
         if solver not in ("euler", "dpmpp"):
             raise ValueError(f"Unknown solver: {solver}")
-        state = torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long)
 
         requested = int(duration)
         aligned = int(math.ceil(requested / self.wav_frame_len) * self.wav_frame_len)
@@ -299,25 +240,10 @@ class CFM(nn.Module):
         y0 = torch.randn(batch, aligned, device=device, dtype=dtype, generator=generator)
 
         def fn(t, x):
-            def to_v(pred):
-                if self.prediction == "flow":
-                    return pred
-                return self._x_to_v(pred, x, t)
-
-            # state_null_prob == 0 means the null branch was never trained, so its
-            # prediction is noise: guidance is off no matter what the caller asked for
-            if cfg_strength < 1e-5 or self.state_null_prob <= 0:
-                pred = self.transformer(x=x, state=state, time=t)
-                return to_v(pred)
-
-            # classifier-free guidance against the null branch, which carries the
-            # mixing augmentation: the guidance term is a classifier gradient and
-            # self-extinguishes once x is unambiguously clean
-            pred_cfg = self.transformer(x=x, state=state, time=t, cfg_infer=True)
-            pred, neg_pred = torch.chunk(pred_cfg, 2, dim=0)
-            v_pos = to_v(pred)
-            v_neg = to_v(neg_pred)
-            return v_pos + (v_pos - v_neg) * cfg_strength
+            pred = self.transformer(x=x, time=t)
+            if self.prediction == "flow":
+                return pred
+            return self._x_to_v(pred, x, t)
 
         use_epss = use_epss and timestep_mapping == "sway_sampling"
         if use_epss:  # use Empirically Pruned Step Sampling for low NFE
@@ -435,25 +361,7 @@ class CFM(nn.Module):
             lens = torch.full((batch,), seq_len, device=device, dtype=torch.long)
         mask = lens_to_mask(lens, length=seq_len)
 
-        # The label comes first, the augmentation follows it: a sample is null with
-        # probability state_null_prob, and only null samples may be mixed. So the clean
-        # branch is pure single-speaker speech, while
-        #     p_null = (1 - p_mix) * p_clean + p_mix * p_mixed
-        # and the CFG term (v_clean - v_null) points away from speaker inconsistency
-        # AND saturates to zero once x is unambiguously clean -- p_mixed(x) vanishes
-        # there faster than any mixing weight, for any p_mix < 1. Giving mixed its own
-        # state buys the first property and loses the second: that term pushes harder
-        # the further x gets from the mixed manifold.
-        null_flags = torch.rand(batch, device=device) < self.state_null_prob
-        mix_flags = null_flags & (torch.rand(batch, device=device) < self.p_mix)
-        x1 = self._mix_augment(inp, lens, mix_flags)
-        state = torch.where(
-            null_flags,
-            torch.full((batch,), STATE_NULL, device=device, dtype=torch.long),
-            torch.full((batch,), STATE_CLEAN, device=device, dtype=torch.long),
-        )
-
-        x1 = x1 * self.latents_scale
+        x1 = inp * self.latents_scale
 
         # x0 is gaussian noise
         x0 = torch.randn_like(x1)
@@ -481,13 +389,12 @@ class CFM(nn.Module):
             # student is asked to match were computed over a different geometry
             rope = self.transformer.make_rope(batch, n_tok, device)
             raw_pred, h_student = self.transformer(
-                x=φ, state=state, time=time, mask=mask, lens=lens, rope=rope, hidden_at=self.student_layer
+                x=φ, time=time, mask=mask, lens=lens, rope=rope, hidden_at=self.student_layer
             )
             with torch.no_grad():
                 φ_clean = (1 - time_clean.unsqueeze(-1)) * x0 + time_clean.unsqueeze(-1) * x1
                 h_teacher = teacher(
                     x=φ_clean,
-                    state=state,
                     time=time_clean,
                     mask=mask,
                     lens=lens,
@@ -496,7 +403,7 @@ class CFM(nn.Module):
                     hidden_only=True,
                 )
         else:
-            raw_pred = self.transformer(x=φ, state=state, time=time, mask=mask, lens=lens)
+            raw_pred = self.transformer(x=φ, time=time, mask=mask, lens=lens)
 
         # interpret prediction
         if self.prediction == "flow":

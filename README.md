@@ -1,40 +1,35 @@
 <div align="center">
   <h1>
-  WavTTS-Uncond: Unconditional Raw-Waveform Speech Generation with a Mixed-Speech Null Branch
+  WavTTS-Uncond: Unconditional Raw-Waveform Speech Generation
   </h1>
 
   <p align="center">
-    <i>A research fork of <a href="https://github.com/cwx-worst-one/WavTTS">WavTTS</a> that turns the zero-shot TTS model into an unconditional speech generator, folding speaker-inconsistent audio into the CFG null branch so guidance points away from it without ever overshooting.</i>
+    <i>A research fork of <a href="https://github.com/cwx-worst-one/WavTTS">WavTTS</a> that turns the zero-shot TTS model into an unconditional speech generator: no text, no audio prompt, and no conditioning at all beyond the flow-matching timestep.</i>
   </p>
 </div>
 
 ## 📖 Introduction
 
-This fork rewrites WavTTS into an **unconditional pure speech generation model** operating directly on raw 16 kHz waveforms with flow matching + DiT. All text and audio-prompt conditioning is removed; the only condition is a 2-value state embedding:
+This fork rewrites WavTTS into an **unconditional pure speech generation model** operating
+directly on raw 16 kHz waveforms with flow matching + DiT. All conditioning is removed: no
+text, no audio prompt, and — since the negative branch was taken out — no state embedding
+either. The timestep is the only thing the network is told, and every clip it trains on is
+clean single-speaker speech.
 
-- `clean` — single, speaker-consistent speech
-- `null` — the CFG negative branch
+Earlier revisions carried a 2-value state condition (`clean` / `null`) and folded
+speaker-inconsistent audio — overlapped speakers, or a mid-clip switch to another speaker —
+into the null branch, so ordinary classifier-free guidance pointed away from speaker
+inconsistency and self-extinguished once `x` was unambiguously clean. That machinery is
+**gone from the code**, not switched off: no state embedding, no packed positive/negative
+forward, no mixing augmentation, no `cfg_strength`. The design and the argument that made it
+self-extinguishing are kept, with a removal note on top, in
+[`docs/superpowers/specs/2026-08-19-uncond-speech-cfg-design.md`](docs/superpowers/specs/2026-08-19-uncond-speech-cfg-design.md).
 
-**The label comes first, the augmentation follows it.** Each sample is labelled `null` with probability `state_null_prob` (0.5), and *only* null samples may be mixed with a batch-roll partner (prob `p_mix`), in one of two equal-power forms:
-
-- **overlap** — whole-utterance blend `√(1−λ)·x + √λ·partner` (simultaneous speakers)
-- **concat** — switch to the partner at a random point with an equal-power cos/sin crossfade (temporal speaker switch)
-
-Crossfading leaves no boundary artifact the model could cheat on — hence "no-leaky".
-
-So the clean branch is pure single-speaker speech, while the null branch models a mixture:
-
-```
-p_null = (1 − p_mix) · p_clean + p_mix · p_mixed
-```
-
-**Mixed audio has no state of its own** — it lives inside `null`, so ordinary CFG carries the speaker-consistency signal for free:
-
-```
-v = v_clean + w · (v_clean − v_null)
-```
-
-This points away from speaker inconsistency *and* self-extinguishes: where `x` is unambiguously clean, `p_mixed(x)` vanishes faster than any mixing weight, so `∇log p_null → ∇log p_clean` and the guidance term goes to zero — for any `p_mix < 1`. Giving mixed its own state and subtracting it directly would keep the first property and lose the second: that term is a likelihood *ratio* gradient and pushes harder the further `x` gets from the mixed manifold, the mechanism behind negative-prompt oversaturation. `p_mix` only sets how deep into the clean region guidance survives.
+One consequence worth knowing before pointing a config at an old directory: every
+checkpoint written before the removal carries `state_embed.weight`, and
+`Trainer.load_checkpoint` loads strictly, so those runs cannot be continued. To reuse the
+weights, `scripts/make_pretrained_init.py` takes a config as its third argument and filters
+the orphaned tensor out.
 
 Design documents live under [`docs/superpowers/specs/`](docs/superpowers/specs/) with the full rationale, defaults, and known limitations.
 
@@ -74,9 +69,6 @@ Key config entries in `src/wavtts/configs/WavTTS.yaml`:
 | Key | Default | Meaning |
 |---|---|---|
 | `seed` | 666 | run-level reproducibility (python/torch/cuda + dataset shuffling, cudnn deterministic) |
-| `model.cfm.state_null_prob` | 0.5 | prob a sample is labelled `null`; the rest are `clean` |
-| `model.cfm.p_mix` | 0.5 | among `null` samples, prob of the mixing augmentation |
-| `model.cfm.p_concat` | 0.5 | among mixed: concat (temporal switch) vs overlap |
 | `ckpts.logger` | tensorboard | `wandb` \| `tensorboard` \| `null` |
 | `ckpts.log_samples_seeds` | [0, 1, 2, 3] | fixed seeds for checkpoint sampling — same clips evolve across training |
 | `ckpts.log_samples_secs` | [5, 15, 30, 60] | one clip length per seed; 60 s is past the 30 s training maximum |
@@ -204,15 +196,18 @@ scheduler once per process per update and so a restored horizon would be stepped
 wrong rate.
 
 ```bash
-# mask_block 4. The other two arms: WavTTS_selfflow_mb1.yaml is the same run at
-# mask_block 1, and WavTTS_selfflow_rl8_pm12.yaml swaps the block grid for
-# mask_run_len 8 -- the same 80 ms mean run -- at a noisier P_mean of -1.2
+# mask_block 4. The other arms: WavTTS_selfflow_mb1.yaml is the same run at
+# mask_block 1; WavTTS_selfflow_rl8_pm12.yaml swaps the block grid for mask_run_len 8
+# -- the same 80 ms mean run -- at a noisier P_mean of -1.2; and
+# WavTTS_selfflow_rl8_pm12_nocfg.yaml is that same pair of knobs on the current
+# architecture, trained from cold. The first three predate the negative branch's
+# removal, so their checkpoints no longer load -- only the last one can be resumed
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   uv run accelerate launch --mixed_precision bf16 \
   src/wavtts/train/train.py --config-name WavTTS_selfflow.yaml
 ```
 
-The three configs are identical apart from those knobs and `model.name` — and the name
+The configs are identical apart from those knobs and `model.name` — and the name
 matters, because the checkpoint directory is `ckpts/${model.name}_${datasets.name}`. Give a
 new arm the old name and it resumes the old arm's weights without a word. Forking an arm
 off another one mid-run is the same mechanism in reverse: copy `model_last.pt` into the new
@@ -284,11 +279,11 @@ All metrics are fail-safe: they skip (with a warning) rather than interrupt trai
 uv run python src/wavtts/infer/sample_uncond.py \
   --ckpt ckpts/.../model_last.pt \
   --duration_sec 5 --num 4 \
-  --steps 32 --cfg_strength 2.0 \
+  --steps 32 \
   --solver euler        # euler | dpmpp (DPM-Solver++(2M))
 ```
 
-Useful flags: `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-flow interpolant), `--seed N` (deterministic, does not touch the global RNG), `--device cpu`. Raise `--cfg_strength` for a stronger push away from speaker inconsistency; there is no second guidance weight to tune.
+Useful flags: `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-flow interpolant), `--seed N` (deterministic, does not touch the global RNG), `--device cpu`. There is no guidance weight to tune — the model has no second branch to guide against.
 
 ## ✅ Tests
 
@@ -296,7 +291,7 @@ Useful flags: `--solver dpmpp` (multistep DPM-Solver++ adapted to the rectified-
 uv run pytest tests/test_uncond_smoke.py -v
 ```
 
-CPU-only smoke suite covering the mixing math (including the no-leak prefix property), CFG paths, both solvers, seed isolation, metrics, and the CLI end-to-end.
+CPU-only smoke suite covering both solvers, seed isolation, the self-flow mask draws and representation loss, the metrics, the length-extrapolation machinery, and the CLI end-to-end. One test pins the negative branch's removal: no state embedding in the state dict, and a `state=` or `cfg_strength=` argument raises rather than being ignored.
 
 ## 🙏 Acknowledgements
 

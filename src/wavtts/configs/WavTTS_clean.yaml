@@ -1,11 +1,12 @@
-# No-CFG ablation of WavTTS.yaml: every sample is labelled clean, so the null branch
-# and the mixing augmentation never fire and there is nothing to guide against.
-# Sampling ignores cfg_strength (CFM.sample switches guidance off when
-# state_null_prob == 0). Architecture, optimizer and RPE are identical to WavTTS.yaml;
-# the data no longer is — see below.
+# This was the No-CFG ablation of WavTTS.yaml, from when the model still had a state
+# condition and a mixed-speech null branch: it set state_null_prob to 0 so neither fired.
+# Both are now gone from the code entirely, so the ablation is what every config does and
+# this file differs from WavTTS.yaml only in data and batching — see below.
 #
-# Trained from scratch on clean-460 (244.6 h). The Norm/CFG arm is 100 h-only, so this pair
-# is no longer a controlled A/B on CFG — it varies CFG and training data together.
+# Trained from scratch on clean-460 (244.6 h). The arm it was an ablation of is 100 h-only,
+# so that pair was never a controlled A/B on CFG — it varied CFG and training data together.
+# Its checkpoints predate the removal and carry state_embed.weight, so they no longer load;
+# see the CFG design doc's removal note.
 #
 # Launch with bf16 — fp32 only fits 2400 frames/GPU on 24 GB:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -59,10 +60,6 @@ model:
     use_aux_mel_loss: True
     aux_mel_loss_weight: 0.05
     sample_rate: 16000
-    state_null_prob: 0.0    # no null label: pure clean training, no CFG. This also
-                            # disables the mixing augmentation (only null samples mix),
-                            # so p_mix / p_concat / mix_* are left at their defaults and
-                            # never reached
   arch:
     dim: 1152
     depth: 28

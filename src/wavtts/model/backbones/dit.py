@@ -24,12 +24,6 @@ from wavtts.model.rope import randomized_positions
 from wavtts.model.utils import lens_to_mask
 
 
-# speech-state conditioning: the only condition this model has
-STATE_CLEAN = 0  # speech
-STATE_NULL = 1  # unconditional, the CFG negative branch
-NUM_STATES = 2
-
-
 # waveform patch embedding
 
 
@@ -97,7 +91,6 @@ class DiT(nn.Module):
         super().__init__()
 
         self.time_embed = TimestepEmbedding(dim)
-        self.state_embed = nn.Embedding(NUM_STATES, dim)
         self.input_embed = InputEmbedding(
             wav_frame_len,
             dim,
@@ -142,9 +135,6 @@ class DiT(nn.Module):
         self.wav_frame_len = wav_frame_len
 
     def initialize_weights(self):
-        # State (class) embedding:
-        nn.init.normal_(self.state_embed.weight, std=0.02)
-
         # Zero-out AdaLN layers in DiT blocks:
         for block in self.transformer_blocks:
             nn.init.constant_(block.attn_norm.linear.weight, 0)
@@ -223,10 +213,8 @@ class DiT(nn.Module):
     def forward(
         self,
         x: float["b nw"],  # noised waveform
-        state: int["b"],  # speech-state condition: STATE_CLEAN / STATE_NULL
         time: float["b"] | float[""],  # time step
         mask: bool["b nw"] | None = None,
-        cfg_infer: bool = False,  # pack clean & null state forward
         lens: int["b"] | None = None,
         rope=None,  # reuse positions from another pass instead of drawing fresh ones
         hidden_at: int | None = None,  # also return the hidden state after this many blocks
@@ -250,16 +238,6 @@ class DiT(nn.Module):
 
         t = self.time_embed(time)
         h = self.input_embed(x, audio_mask=mask)
-
-        if cfg_infer:  # pack positive & negative state forward: b n d -> 2b n d
-            neg_state = torch.full_like(state, STATE_NULL)
-            h = torch.cat((h, h), dim=0)
-            t = torch.cat((t, t), dim=0)
-            state = torch.cat((state, neg_state), dim=0)
-            mask = torch.cat((mask, mask), dim=0) if mask is not None else None
-
-        state_emb = self.state_embed(state)  # b d
-        t = t + (state_emb.unsqueeze(1) if t.ndim == 3 else state_emb)  # t is b d, or b n d
 
         if rope is None:
             rope = self.make_rope(h.shape[0], seq_len, h.device)

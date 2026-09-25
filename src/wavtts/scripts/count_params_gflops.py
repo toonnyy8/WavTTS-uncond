@@ -8,7 +8,6 @@ import thop
 import torch
 
 from wavtts.model import CFM, DiT
-from wavtts.model.backbones.dit import STATE_CLEAN
 
 
 """ ~155M """
@@ -28,9 +27,8 @@ duration = 20
 num_samples = duration * target_sample_rate
 
 x = torch.randn(1, num_samples)
-state = torch.full((1,), STATE_CLEAN, dtype=torch.long)
 time = torch.tensor(0.5)
 
-flops, params = thop.profile(transformer, inputs=(x, state, time))
+flops, params = thop.profile(transformer, inputs=(x, time))
 print(f"FLOPs: {flops / 1e9} G")
 print(f"Params: {params / 1e6} M")

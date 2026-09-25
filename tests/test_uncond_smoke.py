@@ -12,49 +12,20 @@ def test_import():
 
 
 def _reinit_nonzero(model):
-    # zero-init 的 AdaLN/proj_out 會讓輸出恆為 0，正負分支無差異；測試前擾動權重
+    # zero-init 的 AdaLN/proj_out 會讓輸出恆為 0，任何比較都變成 0 == 0；測試前擾動權重
     for p in model.parameters():
         nn.init.normal_(p, std=0.02)
 
 
 def test_dit_forward_shape():
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+    from wavtts.model.backbones.dit import DiT
 
     torch.manual_seed(0)
     dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
     x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-    out = dit(x=x, state=state, time=torch.tensor(0.5))
+    out = dit(x=x, time=torch.tensor(0.5))
     assert out.shape == (2, 1600)
     assert torch.isfinite(out).all()
-
-
-def test_dit_cfg_infer_packs_clean_and_null():
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
-
-    torch.manual_seed(0)
-    dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
-    _reinit_nonzero(dit)
-    x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
-    out = dit(x=x, state=state, time=torch.tensor(0.5), cfg_infer=True)
-    assert out.shape == (4, 1600)
-    pos, neg = torch.chunk(out, 2, dim=0)
-    assert not torch.allclose(pos, neg)  # 正負分支必須產生不同輸出
-
-
-def test_dit_state_changes_output():
-    from wavtts.model.backbones.dit import NUM_STATES, STATE_CLEAN, STATE_NULL, DiT
-
-    assert (STATE_CLEAN, STATE_NULL, NUM_STATES) == (0, 1, 2)  # mixed no longer has a state
-    torch.manual_seed(0)
-    dit = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
-    _reinit_nonzero(dit)
-    x = torch.randn(1, 1600)
-    t = torch.tensor(0.5)
-    out_clean = dit(x=x, state=torch.tensor([STATE_CLEAN]), time=t)
-    out_null = dit(x=x, state=torch.tensor([STATE_NULL]), time=t)
-    assert not torch.allclose(out_clean, out_null)
 
 
 def make_model(use_aux_mel_loss=False, **kwargs):
@@ -74,96 +45,6 @@ def make_model(use_aux_mel_loss=False, **kwargs):
     )
     defaults.update(kwargs)
     return CFM(transformer=transformer, **defaults)
-
-
-def test_mix_augment_applies_only_to_flagged():
-    model = make_model()
-    torch.manual_seed(0)
-    x = torch.randn(4, 3200)
-    lens = torch.full((4,), 3200, dtype=torch.long)
-
-    flags = torch.tensor([True, False, True, False])
-    x_aug = model._mix_augment(x, lens, flags)
-    assert not torch.allclose(x_aug[0], x[0])
-    assert torch.equal(x_aug[1], x[1])  # unflagged samples pass through untouched
-    assert torch.equal(x_aug[3], x[3])
-    assert torch.equal(model._mix_augment(x, lens, torch.zeros(4, dtype=torch.bool)), x)
-
-
-def _observed_states(model, batch=4096):
-    from wavtts.model.backbones.dit import STATE_CLEAN
-
-    seen = {}
-    orig_forward = model.transformer.forward
-
-    def spy(*, x, state, **kwargs):
-        seen["state"] = state.clone()
-        seen["x"] = x.clone()
-        # the real backbone on a 4096-sample batch would be absurd; the labels are
-        # decided before it is called, so a zero of the right shape is enough
-        return torch.zeros_like(x)
-
-    model.transformer.forward = spy
-    model(torch.randn(batch, 1600) * 0.1)
-    model.transformer.forward = orig_forward
-    return seen["state"], STATE_CLEAN
-
-
-def test_label_split_is_half_clean_half_null():
-    from wavtts.model.backbones.dit import STATE_CLEAN, STATE_NULL
-
-    model = make_model(state_null_prob=0.5, p_mix=0.5)
-    torch.manual_seed(0)
-    state, _ = _observed_states(model)
-    null_frac = (state == STATE_NULL).float().mean().item()
-    assert null_frac == pytest.approx(0.5, abs=0.03)
-    assert (state == STATE_CLEAN).float().mean().item() == pytest.approx(0.5, abs=0.03)
-
-
-def test_only_null_samples_are_mixed():
-    from wavtts.model.backbones.dit import STATE_NULL
-
-    # the clean branch must stay pure single-speaker speech: a mixed sample labelled
-    # clean would have CFG guiding *toward* speaker inconsistency
-    model = make_model(state_null_prob=0.5, p_mix=1.0)
-    seen = {}
-    orig_mix = model._mix_augment
-
-    def spy_mix(x1, lens, mix_flags):
-        seen["mix"] = mix_flags.clone()
-        return orig_mix(x1, lens, mix_flags)
-
-    model._mix_augment = spy_mix
-    model.transformer.forward = lambda *, x, state, **kw: (
-        seen.__setitem__("state", state.clone()),
-        torch.zeros_like(x),
-    )[1]
-
-    torch.manual_seed(0)
-    model(torch.randn(64, 1600) * 0.1)
-
-    is_null = seen["state"] == STATE_NULL
-    assert is_null.any() and not is_null.all()  # the split actually happened
-    assert not (seen["mix"] & ~is_null).any()  # no clean sample was mixed
-    assert torch.equal(seen["mix"], is_null)  # p_mix=1.0 -> every null sample was
-
-
-def test_mix_augment_concat_prefix_preserved():
-    model = make_model(p_concat=1.0)
-    torch.manual_seed(0)
-    x = torch.randn(2, 3200)
-    lens = torch.full((2,), 3200, dtype=torch.long)
-    x_aug = model._mix_augment(x, lens, torch.ones(2, dtype=torch.bool))
-    # 切換點最早在 0.3*3200=960，之前的內容必須原封不動（no leaky：前段就是原語者）
-    assert torch.equal(x_aug[:, :900], x[:, :900])
-
-
-def test_mix_augment_batch_of_one_is_noop():
-    model = make_model()
-    x = torch.randn(1, 3200)
-    lens = torch.full((1,), 3200, dtype=torch.long)
-    x_aug = model._mix_augment(x, lens, torch.ones(1, dtype=torch.bool))
-    assert torch.equal(x_aug, x)  # roll partner would be the sample itself
 
 
 def test_train_step_backward():
@@ -190,10 +71,37 @@ def test_train_step_with_aux_mel_loss():
     loss.backward()
 
 
-@pytest.mark.parametrize("cfg_strength", [2.0, 0.0])
-def test_sample_shapes(cfg_strength):
+def test_time_is_the_only_conditioning():
+    # the negative branch is gone, not merely switched off: there is no state embedding to
+    # carry it, no packed forward to evaluate it, and no mixing augmentation to fill it
+    from wavtts.model import CFM
+    from wavtts.model.backbones import dit as dit_mod
+
+    assert not hasattr(dit_mod, "STATE_CLEAN")
+    assert not hasattr(dit_mod, "STATE_NULL")
+    assert not hasattr(dit_mod, "NUM_STATES")
+
+    dit = dit_mod.DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
+    assert not hasattr(dit, "state_embed")
+    assert not any("state_embed" in k for k in dit.state_dict())
+    with pytest.raises(TypeError):
+        dit(x=torch.randn(1, 1600), state=torch.zeros(1, dtype=torch.long), time=torch.tensor(0.5))
+    with pytest.raises(TypeError):
+        dit(x=torch.randn(1, 1600), time=torch.tensor(0.5), cfg_infer=True)
+
+    assert not hasattr(CFM, "_mix_augment")
     model = make_model()
-    out, trajectory = model.sample(8000, batch=2, steps=2, cfg_strength=cfg_strength, seed=0)
+    for knob in ("state_null_prob", "p_mix", "p_concat", "mix_lambda_range", "concat_xfade_ms"):
+        assert not hasattr(model, knob)
+    with pytest.raises(TypeError):
+        make_model(state_null_prob=0.5)
+    with pytest.raises(TypeError):
+        model.sample(1600, batch=1, steps=2, cfg_strength=2.0, seed=0)
+
+
+def test_sample_shapes():
+    model = make_model()
+    out, trajectory = model.sample(8000, batch=2, steps=2, seed=0)
     assert out.shape == (2, 8000)
     assert torch.isfinite(out).all()
     assert trajectory.shape[0] == 3  # steps+1 個時間點
@@ -353,10 +261,9 @@ def test_sample_uncond_cli(tmp_path):
     assert len(sorted(out_dir2.glob("*.wav"))) == 1
 
 
-@pytest.mark.parametrize("cfg_strength", [2.0, 0.0])
-def test_sample_dpmpp(cfg_strength):
+def test_sample_dpmpp():
     model = make_model()
-    out, trajectory = model.sample(8000, batch=2, steps=4, cfg_strength=cfg_strength, solver="dpmpp", seed=0)
+    out, trajectory = model.sample(8000, batch=2, steps=4, solver="dpmpp", seed=0)
     assert out.shape == (2, 8000)
     assert torch.isfinite(out).all()
     assert trajectory.shape[0] == 5  # steps+1 states
@@ -453,36 +360,32 @@ def _rpe_dit(**overrides):
 
 
 def test_dit_forward_runs_far_past_the_reference_length():
-    from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
     dit = _rpe_dit()
     _reinit_nonzero(dit)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
 
     for num_samples in (1600, 160 * 400):  # 10 frames, then 4x the 100-frame reference
-        out = dit(x=torch.randn(2, num_samples), state=state, time=torch.tensor(0.5))
+        out = dit(x=torch.randn(2, num_samples), time=torch.tensor(0.5))
         assert out.shape == (2, num_samples)
         assert torch.isfinite(out).all()
 
 
 def test_rpe_is_training_only_and_changes_output():
-    from wavtts.model.backbones.dit import STATE_CLEAN
 
     torch.manual_seed(0)
     dit = _rpe_dit(rpe_gamma=4.0)
     _reinit_nonzero(dit)
     x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
 
     dit.eval()
     with torch.no_grad():
-        assert torch.equal(dit(x=x, state=state, time=torch.tensor(0.5)), dit(x=x, state=state, time=torch.tensor(0.5)))
+        assert torch.equal(dit(x=x, time=torch.tensor(0.5)), dit(x=x, time=torch.tensor(0.5)))
 
     dit.train()
     with torch.no_grad():
-        a = dit(x=x, state=state, time=torch.tensor(0.5))
-        b = dit(x=x, state=state, time=torch.tensor(0.5))
+        a = dit(x=x, time=torch.tensor(0.5))
+        b = dit(x=x, time=torch.tensor(0.5))
     assert not torch.allclose(a, b)  # fresh random bounds and positions every training forward
 
 
@@ -528,7 +431,7 @@ def test_logn_reads_each_sample_length_from_the_mask_not_the_padded_width():
 
 def test_a_padded_row_attends_as_if_it_were_alone():
     """End-to-end: batching a short clip beside a long one must not change its output."""
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+    from wavtts.model.backbones.dit import DiT
 
     torch.manual_seed(0)
     dit = DiT(
@@ -550,13 +453,11 @@ def test_a_padded_row_attends_as_if_it_were_alone():
     with torch.no_grad():
         alone = dit(
             x=clip,
-            state=torch.full((1,), STATE_CLEAN, dtype=torch.long),
             time=torch.tensor(0.5),
             lens=torch.tensor([short]),
         )
         batched = dit(
             x=torch.cat([torch.nn.functional.pad(clip, (0, long - short)), torch.randn(1, long)]),
-            state=torch.full((2,), STATE_CLEAN, dtype=torch.long),
             time=torch.tensor(0.5),
             lens=torch.tensor([short, long]),
         )
@@ -564,7 +465,7 @@ def test_a_padded_row_attends_as_if_it_were_alone():
 
 
 def test_logn_reaches_the_attention_softmax():
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+    from wavtts.model.backbones.dit import DiT
 
     # 10 frames against a 4-frame reference: scale is log(10)/log(4) = 1.66, well off 1.0
     common = dict(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
@@ -577,10 +478,9 @@ def test_logn_reaches_the_attention_softmax():
     _reinit_nonzero(on)
 
     x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
     with torch.no_grad():
-        a = off(x=x, state=state, time=torch.tensor(0.5))
-        b = on(x=x, state=state, time=torch.tensor(0.5))
+        a = off(x=x, time=torch.tensor(0.5))
+        b = on(x=x, time=torch.tensor(0.5))
     assert not torch.allclose(a, b)  # folded into the softmax scale, it must still bite
 
 
@@ -594,7 +494,7 @@ def test_log_samples_secs_pairs_with_seeds():
 
 
 def test_default_config_rope_is_unchanged_when_disabled():
-    from wavtts.model.backbones.dit import STATE_CLEAN, DiT
+    from wavtts.model.backbones.dit import DiT
 
     torch.manual_seed(0)
     plain = DiT(dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160)
@@ -603,10 +503,9 @@ def test_default_config_rope_is_unchanged_when_disabled():
         dim=64, depth=2, heads=2, dim_head=32, ff_mult=2, wav_frame_len=160, rpe_gamma=1.0
     )
     x = torch.randn(2, 1600)
-    state = torch.full((2,), STATE_CLEAN, dtype=torch.long)
     with torch.no_grad():
         assert torch.equal(
-            plain(x=x, state=state, time=torch.tensor(0.5)), explicit(x=x, state=state, time=torch.tensor(0.5))
+            plain(x=x, time=torch.tensor(0.5)), explicit(x=x, time=torch.tensor(0.5))
         )
 
 
@@ -721,34 +620,6 @@ def test_signal_metrics_are_scale_invariant():
     assert clipping_rate(torch.zeros(16000)) == 0.0
 
 
-def test_clean_only_training_labels_everything_clean_and_never_mixes():
-    from wavtts.model.backbones.dit import STATE_CLEAN
-
-    model = make_model(state_null_prob=0.0, p_mix=0.5)
-    mixed = []
-    model._mix_augment = lambda x1, lens, flags: (mixed.append(flags.any().item()), x1)[1]
-    torch.manual_seed(0)
-    state, _ = _observed_states(model, batch=512)
-    assert (state == STATE_CLEAN).all()
-    assert mixed == [False]  # only null samples may mix, and there are none
-
-
-def test_guidance_is_off_when_the_null_branch_was_never_trained():
-    # a clean-only model's null branch is untrained noise; sample() must ignore
-    # cfg_strength rather than steer with it
-    clean_only = make_model(state_null_prob=0.0)
-    _reinit_nonzero(clean_only.transformer)
-    a, _ = clean_only.sample(1600, batch=1, steps=2, cfg_strength=2.0, seed=0)
-    b, _ = clean_only.sample(1600, batch=1, steps=2, cfg_strength=0.0, seed=0)
-    assert torch.equal(a, b)
-
-    with_cfg = make_model(state_null_prob=0.5)
-    _reinit_nonzero(with_cfg.transformer)
-    c, _ = with_cfg.sample(1600, batch=1, steps=2, cfg_strength=2.0, seed=0)
-    d, _ = with_cfg.sample(1600, batch=1, steps=2, cfg_strength=0.0, seed=0)
-    assert not torch.allclose(c, d)  # otherwise the check above is vacuous
-
-
 def test_clean_config_instantiates_model_and_trains_one_step():
     from importlib.resources import files as pkg_files
 
@@ -758,7 +629,6 @@ def test_clean_config_instantiates_model_and_trains_one_step():
     from wavtts.model import CFM
 
     cfg = OmegaConf.load(str(pkg_files("wavtts").joinpath("configs/WavTTS_clean.yaml")))
-    assert cfg.model.cfm.state_null_prob == 0.0
     arch = OmegaConf.to_container(cfg.model.arch, resolve=True)
     arch.update(dim=64, depth=2, heads=2)
     cfm_kwargs = OmegaConf.to_container(cfg.model.cfm, resolve=True)
@@ -866,13 +736,12 @@ def test_per_token_time_matches_scalar_time_when_uniform():
     dit.eval()
 
     x = torch.randn(2, 16000) * 0.1
-    state = torch.zeros(2, dtype=torch.long)
     scalar_t = torch.tensor([0.3, 0.7])
     per_token_t = scalar_t.unsqueeze(-1).expand(2, 100).contiguous()
 
     with torch.no_grad():
-        a = dit(x=x, state=state, time=scalar_t)
-        b = dit(x=x, state=state, time=per_token_t)
+        a = dit(x=x, time=scalar_t)
+        b = dit(x=x, time=per_token_t)
     assert torch.allclose(a, b, atol=1e-5)
 
 

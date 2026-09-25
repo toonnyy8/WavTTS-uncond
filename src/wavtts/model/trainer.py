@@ -549,7 +549,6 @@ class Trainer:
                                 generated, _ = gen_model.sample(
                                     duration=int(gen_sec * target_sample_rate),
                                     steps=32,
-                                    cfg_strength=2.0,
                                     sway_sampling_coef=-1.0,
                                     seed=gen_seed,
                                 )

@@ -1,7 +1,31 @@
 # WavTTS 無條件語音生成 + 混合語音負樣本 CFG — 設計文件
 
 日期：2026-08-19
-狀態：已與作者於對話中確認方向（從零訓練、batch-roll 混合、就地修改）
+狀態：**已移除（2026-09-26）**。下面描述的整套機制不再存在於程式中——見〈移除紀錄〉。
+
+## 移除紀錄（2026-09-26）
+
+負向條件與引導整套從程式移除，不是設成 0 關掉。被刪的是：`dit.py` 的
+`STATE_CLEAN` / `STATE_NULL` / `NUM_STATES`、`state_embed`、`forward()` 的 `state` 與
+`cfg_infer` 參數與打包分支；`cfm.py` 的 `_mix_augment`、`state_null_prob`、`p_mix`、
+`p_concat`、`mix_lambda_range`、`concat_point_range`、`concat_xfade_ms`，以及 `sample()`
+的 `cfg_strength` 與引導項。模型現在唯一的條件輸入是 timestep，訓練資料一律是單語者
+乾淨語音。九份 config 的對應欄位一併刪除；`sample_uncond.py` 的 `--cfg_strength` 也沒了。
+
+三個後果值得記住：
+
+- **舊 checkpoint 全部不能續訓。** 每一份都帶 `state_embed.weight`，而
+  `Trainer.load_checkpoint` 是 `strict=True`。要沿用權重得走
+  `scripts/make_pretrained_init.py` 並給第三個參數（目標 config），讓它把這個孤兒
+  tensor 濾掉；那條路只搬權重，optimizer、LR 排程與 update 計數器都歸零。
+- **`WavTTS_clean.yaml` 不再是消融。** 它本來就設 `state_null_prob: 0.0`，是這套機制的
+  對照組；現在每份 config 都是那個行為，所以它與 `WavTTS.yaml` 的差別只剩資料與批次。
+- **少了 2304 個參數**（`nn.Embedding(2, 1152)`），其餘架構不動。
+
+這份文件保留，因為它記著被移除的東西是什麼、以及當初為什麼那樣設計——尤其是
+〈負分支選擇：自我限制性質〉那一節的論證（把 mixed 併進 null 讓引導項變成分類器梯度而
+自我熄火，給 mixed 獨立 state 則變成似然比梯度而越推越用力）。那個論證沒有被推翻，只是
+不再有程式碼實作它。要復原就是 revert 那個 commit，而不是重新推導。
 
 ## 目標
 
