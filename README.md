@@ -196,19 +196,29 @@ The teacher **is** the checkpoint EMA the trainer already kept, so this costs on
 forward per step — truncated at layer `k`, so 20 blocks of 28 — not a third copy of 664M
 weights. The only new parameters are the 10.6M projection head, and it never runs at
 inference. The extra forward is why `batch_size_per_gpu` drops to 2400 against the
-baseline's 3200, with `grad_accumulation_steps` raised to 8 to keep the update at the same
-19200 frames.
+baseline's 3200, with `grad_accumulation_steps` set to keep the update at the same 19200
+frames — 8 on one gpu, 4 on two. Moving an in-flight run between gpu counts is safe: the lr
+schedule is rebuilt from `len(dataloader)` on resume and fast-forwarded to the checkpoint's
+update, rather than restored from the checkpoint, because accelerate steps the wrapped
+scheduler once per process per update and so a restored horizon would be stepped at the
+wrong rate.
 
 ```bash
-# mask_block 4 -- WavTTS_selfflow_mb1.yaml is the same run at mask_block 1
+# mask_block 4. The other two arms: WavTTS_selfflow_mb1.yaml is the same run at
+# mask_block 1, and WavTTS_selfflow_rl8_pm12.yaml swaps the block grid for
+# mask_run_len 8 -- the same 80 ms mean run -- at a noisier P_mean of -1.2
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   uv run accelerate launch --mixed_precision bf16 \
   src/wavtts/train/train.py --config-name WavTTS_selfflow.yaml
 ```
 
-The two configs differ in `mask_block` and in `model.name` — and the name matters, because
-the checkpoint directory is `ckpts/${model.name}_${datasets.name}`. Give a new arm the old
-name and it resumes the old arm's weights without a word.
+The three configs are identical apart from those knobs and `model.name` — and the name
+matters, because the checkpoint directory is `ckpts/${model.name}_${datasets.name}`. Give a
+new arm the old name and it resumes the old arm's weights without a word. Forking an arm
+off another one mid-run is the same mechanism in reverse: copy `model_last.pt` into the new
+arm's directory and it picks up there, which is how the `mask_run_len` arm continues from
+`mask_block 4` at update 92500. Copy it, never hard-link it — the new arm's first save
+would otherwise truncate the old arm's checkpoint.
 
 Three things the port had to get right, all of which fail *silently* if done wrong:
 

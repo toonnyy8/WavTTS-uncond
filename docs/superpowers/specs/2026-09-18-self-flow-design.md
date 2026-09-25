@@ -177,6 +177,15 @@ EMA 的更新排程也跟著改：`ema_pytorch` 預設 `update_every=10`（每 1
 
 顯存：多出來的 forward 讓 `batch_size_per_gpu` 從 3200 降到 2400、
 `grad_accumulation_steps` 從 6 升到 8。每次 update 仍是 19200 frames，只是切得更細。
+兩張卡時 `grad_accumulation_steps` 是 4（2 × 4 × 2400 同樣是 19200），速度從約
+0.55 update/s 變成約 1.1，177 epoch 的預算從約 17 天變成約 10 天。
+
+換卡數續訓有個陷阱。accelerate 的 `AcceleratedScheduler` 每個 update 會把底層
+scheduler 走 `num_processes` 步（`scheduler.py` 的 `split_batches=False` 分支），所以
+`SequentialLR` 存進 checkpoint 的 milestone 與兩個 `total_iters` 都是「`num_processes`
+× update」的單位。照原樣還原就是用舊視野配新步速：單卡存的狀態在雙卡續訓，lr 會在
+預定 update 數的一半觸底，後半段以趨近 0 的 lr 訓練。排程是 update 數的純函數，所以
+`trainer.py` 在 resume 時改成重建本輪的排程、再快轉到 checkpoint 的 update。
 
 投影頭 `rep_proj` 是唯一新增的參數：dim=1152 下 10.62M（總參數 664.5M → 675.1M），
 對應論文的「約 10M」。它只在訓練期參與，推論時完全不碰。
@@ -196,8 +205,8 @@ App. A.2 自己說了是「to maintain comparability to previous works」，不�
 
 論文觀察到 Self-Flow 偏好比 baseline **更高**的 shift（音訊 0.75 → 1.0），推測是雙
 時間步加噪把整體 SNR 往平均拉、需要更多低 SNR 覆蓋。本專案的 2.23 已經在那一側，
-方向無誤。要追絕對品質的話，該掃的是把 `P_mean` 再往負推（−1.0 ≈ `α` 2.72），而不是
-換成 uniform——但那會和 `mask_block` 的對照混成兩個變因。
+方向無誤。要追絕對品質的話，該掃的是把 `P_mean` 再往負推，而不是換成 uniform；這件事
+後來做了，見下面〈把 `P_mean` 往負推到 −1.2〉。
 
 **沒有教師就報錯，不靜默退回。** `self_flow=True` 而 `forward()` 沒收到 teacher 時
 丟 `ValueError`。靜默退回 vanilla flow matching 意味著跑一週才發現訓的是別的東西，
@@ -213,11 +222,23 @@ App. A.2 自己說了是「to maintain comparability to previous works」，不�
 指標，因為判讀是在 repo 之外做的。這個結果也把前面「4 比較像下界」的推測降級成尚未
 驗證——已知的只有 4 > 1，4 與 10/20 還沒比過。
 
-**兩條對照線的配置。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
+**把 `P_mean` 往負推到 −1.2。** 對應 `α ≈ e^1.2 ≈ 3.32`，比原本的 2.23 更深入低
+SNR：中位數 `t` 從 0.310 降到 0.232、q25 從 0.208 降到 0.149、`t < 0.1` 的比例從 4%
+升到 11%。上面警告過這會和 `mask_block` 的對照混成兩個變因，避開的方式是把平均遮罩段
+長釘在 80 ms——這條線用 `mask_run_len: 8`，而 `8 = 4/(1−0.5)`，與 `mask_block: 4` 的
+平均段長相同（實際抽樣量到 7.97 token，邊際 0.4998）。沒被釘住的是段長分布的形狀
+（格點與下界消失），所以這條線對 MB4 的差異是「`P_mean` + 段長律的形狀」，而不是單獨
+的 `P_mean`。
+
+**三條對照線的配置。** `WavTTS_selfflow_mb1.yaml`（`mask_block: 1`，ckpt 目錄
 `WavTTS_Uncond_Large_SelfFlow_LibriTTS_460`）與 `WavTTS_selfflow.yaml`
-（`mask_block: 4`，`..._SelfFlow_MB4_LibriTTS_460`）除了這一個參數之外完全相同。分成
-兩份 config 而不是就地改一份，是因為共用一份檔案時兩條線無法各自啟停，而且 ckpt 目錄
-由 `model.name` 決定——名字沒改就會靜默續訓到另一條線的權重上。
+（`mask_block: 4`，`..._SelfFlow_MB4_LibriTTS_460`）除了這一個參數之外完全相同。
+`WavTTS_selfflow_rl8_pm12.yaml`（`mask_run_len: 8` + `P_mean: −1.2`，
+`..._SelfFlow_RL8_PM12_LibriTTS_460`）是第三條，而它不是從頭訓練：MB4 在 update
+92500 的 `model_last.pt` 被複製進這條線自己的 ckpt 目錄後接著跑，所以 92500 之前是
+共用歷史，之後才分叉。複製而不是 hardlink，否則新線存檔會把 MB4 的檔案一起截斷。
+分成三份 config 而不是就地改一份，是因為共用一份檔案時各條線無法各自啟停，而且 ckpt
+目錄由 `model.name` 決定——名字沒改就會靜默續訓到另一條線的權重上。
 
 ## 已知限制
 
@@ -226,12 +247,19 @@ App. A.2 自己說了是「to maintain comparability to previous works」，不�
   得走 `scripts/make_pretrained_init.py` 那條容許缺漏模組的路。
 - **表徵損失飽和得快。** 小模型（24M）在 ~180 個 update 內 cosine 就爬到 0.93；
   664M 模型在 clean-460 上跑到 5 萬多個 update 時 cosine 在 0.91–0.94 徘徊（兩條線
-  皆然）。這是 BYOL 式目標的常態（EMA 教師 + stop-grad 是標準的防塌陷結構，遮罩保證
-  學生仍有實質工作要做）。論文沒有給健康的 cosine 區間，也只用 FID 消融來判斷，所以
-  這個數字本身不構成結論——真正該看的是生成品質，而那還沒有對照數字。
+  皆然）；RL8_PM12 跑到 40 萬 update 後均值仍在那個區間，只是單步的散佈更寬——update
+  35 萬之後的 105k 個值均值 0.938、範圍 0.85–0.98。這是 BYOL 式目標的常態（EMA 教師
+  + stop-grad 是標準的防塌陷結構，遮罩保證學生仍有實質工作要做）。論文沒有給健康的
+  cosine 區間，也只用 FID 消融來判斷，所以這個數字本身不構成結論——真正該看的是生成
+  品質，而那還沒有對照數字。
 - **還沒有與 vanilla flow matching 的同步長對照數字。** 跑過的是 LibriTTS
   clean-100（53.7 h）的迴圈驗證，以及 clean-460（244.6 h、149510 clips）上
   `mask_block` 1 對 4 的兩條線（4 勝）；缺的是 `self_flow: False` 的那一條，所以
   Self-Flow 本身相對於 vanilla 的增益在本專案上仍未驗證。
-- **`mask_run_len` 已實作但沒跑過。** 單元測試涵蓋邊際、兩個段長均值、格點與下界的
-  消失、以及兩個防呆；訓練上的效果沒有數字。
+- **`mask_run_len` 跑過了，但沒有評估數字。** `WavTTS_selfflow_rl8_pm12.yaml` 從 MB4
+  的 update 92500 接到 402500（Epoch 72/177）後停下，177 epoch 的預算沒有跑完。實際
+  抽樣驗過邊際 0.4998（目標 0.5）與平均遮罩段 7.97 token = 80 ms（目標 8），但生成
+  品質還沒和 MB4 對照過。要注意 `flow_loss` 的絕對值在這兩條線之間不可比——`t` 更小
+  使 v-target 更難，同一個 fork 點上 RL8_PM12 讀 0.4–0.75、MB4 讀 0.19–0.32——能比的
+  是固定 seed 的取樣與 mel 指標。而且這條線同時動了 `P_mean`，所以就算有了數字，也分
+  不出 `mask_run_len` 與 `P_mean` 各自的貢獻。
