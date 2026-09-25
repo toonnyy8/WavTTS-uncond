@@ -1,0 +1,170 @@
+# Self-Flow (Chefer, Esser et al. 2026, https://bfl.ai/research/self-flow) on top of the
+# randomized-RoPE baseline. Two additions, both training-time:
+#
+#   Dual-Timestep Scheduling -- two timesteps t, s are drawn per sample and a random half
+#   of the 100 Hz tokens (mask_ratio) takes s while the rest take t, so the input is
+#   heterogeneously noised. The flow loss is unchanged apart from running on that input.
+#
+#   Representation loss -- an EMA copy of the network (the teacher) sees the same clip
+#   noised uniformly at the *cleaner* of the two timesteps. The student must predict the
+#   teacher's layer-k features from its own layer-l features, cosine-aligned through a
+#   small MLP. The information asymmetry is the whole point: a token whose neighbours are
+#   cleaner cannot be recovered by local denoising, so the model is pushed into global
+#   structure. No external encoder anywhere.
+#
+# The teacher IS the checkpoint EMA the trainer already kept -- it costs one extra forward
+# per step (truncated at layer k), not an extra copy of the weights. That forward is why
+# batch_size_per_gpu drops to 2400: the update is still 19200 frames, just split finer to
+# leave room. Two gpus split that update evenly -- 2 x 4 x 2400 -- so grad_accumulation_steps
+# is 4 here; on one gpu it has to be 8.
+#
+# This arm forks the MB4 arm at update 92500 rather than starting over: model_last.pt was
+# copied into this run's ckpt dir, so everything before 92500 is shared history and only the
+# two knobs below differ from here on. Two changes, and they are not independent -- both move
+# the same "can a token be recovered from its neighbours" dial:
+#
+#   mask_run_len 8 replaces mask_block 4. At mask_ratio 0.5 they are the same mean run
+#   (4/(1-0.5) = 8), so the 80 ms time scale is unchanged; what goes away is the 4-token grid
+#   that every boundary had to land on and the floor that made 4 the shortest possible run.
+#
+#   P_mean -1.2 replaces -0.8, moving the timestep distribution toward noise (t=1 is data
+#   here). Median t goes 0.310 -> 0.232 and the fraction of samples below t=0.1 goes 4% ->
+#   11%. Note this also darkens the teacher's view: it sees max(t,s), so a noisier draw
+#   makes the features the student is asked to match a little worse as well.
+#
+#   CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   NUM_PROCESSES=2 nohup scripts/train_loop.sh WavTTS_selfflow_rl8_pm12.yaml >/dev/null 2>&1 &
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 666  # run-level reproducibility: seeds python/torch/cuda and dataset shuffling
+
+datasets:
+  name: LibriTTS_460  # prepared data dir under data/: clean-100 + clean-360, 149510 clips,
+                      # 244.6 h. The arrow also carries a text column; nothing reads it, this
+                      # model is unconditional
+  batch_size_per_gpu: 2400  # per 24 GB GPU (RTX 4090) w/ bf16; lower than the baseline's 3200 to leave room for the teacher forward
+  batch_size_type: frame  # frame | sample
+  max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
+  num_workers: 16
+
+optim:
+  epochs: 177  # the clean-460 budget WavTTS_clean.yaml established, so this arm stays
+               # comparable to it. At 19200 frames/update an epoch is 5663 updates, so the run
+               # is ~1.00M updates against the 20k warmup -- ~17 days on one 4090; ~10 on two,
+               # measured at 1.1 update/s while two other 4090s on the box are busy.
+               # The LR horizon follows len(dataloader), so decay lands its floor on the last
+               # update, and it is rebuilt on resume so a change of gpu count cannot shorten it
+  learning_rate: 7.5e-5
+  num_warmup_updates: 20000  # warmup updates
+  grad_accumulation_steps: 4  # 2 gpus x 4 x 2400 = 19200 frames/update, same as the baseline
+  max_grad_norm: 1.0  # gradient clipping
+  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not (saves ~4 GiB of optimizer state)
+
+model:
+  name: WavTTS_Uncond_Large_SelfFlow_RL8_PM12  # RL8 = mask_run_len 8, PM12 = P_mean -1.2.
+                                               # The MB4 arm it forks from keeps its own
+                                               # ckpt/run dir, so the comparison stays intact
+  backbone: DiT
+  cfm:
+    prediction: x_pred         # flow | x_pred
+    loss_space: v         # flow | v   (v is typical for x_pred mode)
+    t_sampling: logistic_normal      # uniform | logistic_normal
+    P_mean: -1.2  # t = sigmoid(N(P_mean, P_std)) and t=1 is data, so lowering P_mean noises
+                  # training up. Against the -0.8 the other configs use: mean t 0.331 ->
+                  # 0.257, median 0.310 -> 0.232, q25 0.208 -> 0.149, and P(t < 0.1) 4% -> 11%
+    P_std: 0.8
+    t_eps: 0.02
+    latents_scale: 1.0
+    use_aux_mel_loss: True
+    aux_mel_loss_weight: 0.05
+    sample_rate: 16000
+    state_null_prob: 0.5    # prob a sample is labelled null; the rest are clean
+    p_mix: 0.5              # among null samples, prob of the mixing augmentation, so
+                            # p_null = 0.5*p_clean + 0.5*p_mixed. Any p_mix < 1 keeps
+                            # CFG self-extinguishing in the clean region; p_mix sets
+                            # how deep into it the guidance survives
+    p_concat: 0.5           # among mixed: concat (temporal switch) vs overlap
+    mix_lambda_range: [0.3, 0.7]
+    concat_point_range: [0.3, 0.7]
+    concat_xfade_ms: 20
+    # --- self-flow ---
+    self_flow: True
+    mask_ratio: 0.5          # fraction of tokens noised at the second timestep. The
+                             # paper's audio setting; 0.25 for image, 0.1 for video
+    mask_block: 1            # off: mask_run_len below sets the time scale instead, and the
+                             # two cannot both be set
+    mask_run_len: 8          # draw the run lengths from a two-state chain: masked runs ~
+                             # Geom(1/mask_run_len), the unmasked mean derived from mask_ratio
+                             # so the marginal stays at mask_ratio. Our tokens are 10 ms
+                             # raw-waveform frames while the paper's audio tokens are 40 ms
+                             # Songbloom latents, so its i.i.d. draw alternates 4x faster in
+                             # time here (20 ms mean run vs the paper's 80 ms) -- and 20 ms is
+                             # 2-4 pitch periods, which interpolation handles, so the
+                             # "neighbours are cleaner" pressure that drives the method is
+                             # lost. 8 tokens = 80 ms restores the paper's scale. It is the
+                             # same geometric family the i.i.d. draw already produces, just
+                             # with the mean freed from 1/(1-mask_ratio), so unlike mask_block
+                             # there is no grid for boundaries to land on and no minimum run.
+                             # mask_block k == mask_run_len k/(1-mask_ratio), so this is the
+                             # MB4 arm's time scale exactly. HuBERT, on speech, goes further
+                             # still at 10 frames x 20 ms = 200 ms spans, so 8 is a floor not
+                             # a ceiling
+    rep_loss_weight: 0.8     # gamma in L = L_gen + gamma * L_rep
+    student_layer_frac: 0.3  # l = 0.3D -> block 8 of 28
+    teacher_layer_frac: 0.7  # k = 0.7D -> block 20 of 28
+    rep_proj_hidden: null    # null -> 2*dim; ~10.6M params at dim=1152, the paper's "~10M"
+  arch:
+    dim: 1152
+    depth: 28
+    heads: 16
+    dropout: 0.0
+    ff_mult: 4
+    qk_norm: null  # null | rms_norm
+    attn_mask_enabled: True   # keep padded keys out of the softmax; broadcast [b,1,1,n] mask
+    checkpoint_activations: False  # recompute activations and save memory for extra compute
+    use_audio_proj: True
+    audio_proj_dim: 1024
+    audio_proj_hidden: 768
+    # length extrapolation — randomized positional encoding (Ruoss et al. 2023), see
+    # wavtts/model/rope.py. Training data tops out at 2979 frames (29.8 s), so gamma=4
+    # puts the longest clip's positions out to 11916 (119 s). Generating up to that
+    # length therefore uses positions the model trained on, with no inference-time
+    # knob: vanilla RoPE at base=10000 has its slowest dim turning once every 471 s,
+    # so nothing wraps. Reaching past 119 s means raising gamma and retraining.
+    rpe_gamma: 4.0           # per-sample stretch bound: L_t ~ U[n, n*gamma], drawn fresh
+                             # every forward. gamma=1 disables. Not a curriculum: every
+                             # batch spans contiguous through 4x from the first update
+    logn_ref_len: 500        # entropy-invariant scaling reference, clamped at 1 so it only
+                             # sharpens: 1.0 up to 5 s, 1.29 at 30 s, 1.51 at 120 s. At 3000
+                             # every training clip sat below 1 and it never sharpened at all.
+                             # This is the only attention temperature in the model
+  waveform:
+    target_sample_rate: 16000
+    wav_frame_len: 160    # 160 @16k = 100Hz
+    target_rms: 1.0       # per-utterance loudness normalization at load time; 0 disables.
+
+ckpts:
+  # the EMA doubles as the self-flow teacher, so it tracks every update rather than
+  # ema_pytorch's default every-10th; decay is the paper's 0.9999
+  ema:
+    beta: 0.9999
+    update_every: 1
+    update_after_step: 0
+  logger: tensorboard  # wandb | tensorboard | null
+  log_per_updates: 100  # scalar (loss/lr) logging interval in updates
+  log_samples: True  # generate fixed-seed samples per save checkpoint (audio + mel + metrics to tensorboard)
+  log_samples_seeds: [0, 1, 2, 3]  # same seeds every checkpoint, clips comparable across training
+  # one length per seed, fixed across checkpoints. 5s is the bulk of the data, 15s the
+  # p95, 30s the training maximum, and 60s is the first genuine length extrapolation.
+  # 60s sits inside the position range gamma=4 trains on (119 s), so it tests the model
+  # rather than the encoding. Past 119 s is untrained positions either way.
+  log_samples_secs: [5, 15, 30, 60]
+  spk_ckpt_path: null  # ECAPA (wavlm_large) ckpt for gen/spk_sim_self; null disables the metric
+  save_per_updates: 10000  # numbered checkpoint every ~3.5 h on one 4090
+  keep_last_n_checkpoints: 5  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
+  last_per_updates: 2500  # model_last.pt + fixed-seed samples/mel/metrics ride on this interval
+  exp_name: ${model.name}_${datasets.name}
+  save_dir: ckpts/${model.name}_${datasets.name}
