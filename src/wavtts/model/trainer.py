@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import math
 import os
@@ -410,10 +411,27 @@ class Trainer:
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
+        fresh_scheduler_state = copy.deepcopy(self.scheduler.state_dict())
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint()
+        # The checkpoint's scheduler state is not just a counter: SequentialLR serializes its
+        # milestone and both LinearLR total_iters too, and all three are in units of
+        # num_processes x update, because accelerate steps the wrapped scheduler once per
+        # process per update. Resume on a different gpu count -- or a different
+        # grad_accumulation_steps -- and those units change, so restoring the state verbatim
+        # keeps the old horizon while stepping it at the new rate: a 1-gpu run picked up on 2
+        # would reach the lr floor at half the planned updates and train the rest at ~0.
+        # The schedule is a pure function of the update number, so re-impose the one this run
+        # just built and walk it forward to where the checkpoint left off.
+        if start_update > 0:
+            base_scheduler = getattr(self.scheduler, "scheduler", self.scheduler)
+            base_scheduler.load_state_dict(copy.deepcopy(fresh_scheduler_state))
+            for _ in range(start_update * self.accelerator.num_processes):
+                base_scheduler.step()
+            if self.is_main:
+                print(f"Rebuilt lr schedule for this run's geometry, fast-forwarded to update {start_update}")
         global_update = start_update
 
         if exists(resumable_with_seed):
